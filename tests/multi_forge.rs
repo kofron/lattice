@@ -6,7 +6,9 @@
 //! - GitLab stub behavior (when feature enabled)
 //! - Configuration-driven forge selection
 
-use latticework::forge::{create_forge, detect_provider, valid_forge_names, ForgeError, ForgeProvider};
+use latticework::forge::{
+    create_forge, detect_provider, valid_forge_names, ForgeError, ForgeProvider,
+};
 
 mod provider_detection {
     use super::*;
