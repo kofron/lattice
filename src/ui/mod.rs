@@ -6,6 +6,7 @@
 //!
 //! - [`prompts`] - Interactive prompts and confirmations
 //! - [`output`] - Output formatting and display
+//! - [`stack_comment`] - Stack comment generation for PR descriptions
 //!
 //! # Design
 //!
@@ -15,3 +16,4 @@
 
 pub mod output;
 pub mod prompts;
+pub mod stack_comment;

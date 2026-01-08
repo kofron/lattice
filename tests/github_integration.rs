@@ -369,6 +369,7 @@ mod failure_injection_tests {
             base: "main".to_string(),
             title: "PR".to_string(),
             node_id: None,
+            body: None,
         }])
         .fail_on(FailOn::UpdatePr(ForgeError::RateLimited));
 
@@ -410,6 +411,7 @@ mod failure_injection_tests {
             base: "main".to_string(),
             title: "PR".to_string(),
             node_id: None,
+            body: None,
         }])
         .fail_on(FailOn::MergePr(ForgeError::RateLimited));
 
@@ -739,6 +741,7 @@ mod merge_flow_tests {
                 base: "main".to_string(),
                 title: "PR 1".to_string(),
                 node_id: None,
+                body: None,
             },
             PullRequest {
                 number: 2,
@@ -749,6 +752,7 @@ mod merge_flow_tests {
                 base: "feature1".to_string(),
                 title: "PR 2".to_string(),
                 node_id: None,
+                body: None,
             },
         ])
         .fail_on(FailOn::MergePr(ForgeError::RateLimited));
