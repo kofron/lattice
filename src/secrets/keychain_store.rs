@@ -20,7 +20,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::secrets::{KeychainSecretStore, SecretStore};
+//! use latticework::secrets::{KeychainSecretStore, SecretStore};
 //!
 //! let store = KeychainSecretStore::new()?;
 //! store.set("github.pat", "ghp_xxxx...")?;
@@ -45,7 +45,7 @@ use super::traits::{SecretError, SecretStore};
 /// # Example
 ///
 /// ```ignore
-/// use lattice::secrets::{KeychainSecretStore, SecretStore};
+/// use latticework::secrets::{KeychainSecretStore, SecretStore};
 ///
 /// let store = KeychainSecretStore::new()?;
 ///

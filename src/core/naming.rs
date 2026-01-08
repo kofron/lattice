@@ -19,7 +19,7 @@
 /// # Example
 ///
 /// ```
-/// use lattice::core::naming::slugify;
+/// use latticework::core::naming::slugify;
 ///
 /// assert_eq!(slugify("Add user authentication"), "add-user-authentication");
 /// assert_eq!(slugify("Fix bug #123"), "fix-bug-123");

@@ -8,16 +8,16 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-use lattice::cli::{commands, Shell};
-use lattice::core::metadata::schema::{
+use latticework::cli::{commands, Shell};
+use latticework::core::metadata::schema::{
     BaseInfo, BranchInfo, BranchMetadataV1, FreezeScope, FreezeState, ParentInfo, PrState,
     Timestamps, METADATA_KIND, SCHEMA_VERSION,
 };
-use lattice::core::metadata::store::MetadataStore;
-use lattice::core::types::{BranchName, UtcTimestamp};
-use lattice::engine::scan::scan;
-use lattice::engine::Context;
-use lattice::git::Git;
+use latticework::core::metadata::store::MetadataStore;
+use latticework::core::types::{BranchName, UtcTimestamp};
+use latticework::engine::scan::scan;
+use latticework::engine::Context;
+use latticework::git::Git;
 
 // =============================================================================
 // Test Fixtures
@@ -1096,7 +1096,7 @@ fn metadata_cas_prevents_race() {
 
     // Use a fake old OID - should fail
     let fake_oid =
-        lattice::core::types::Oid::new("0000000000000000000000000000000000000000".to_string())
+        latticework::core::types::Oid::new("0000000000000000000000000000000000000000".to_string())
             .unwrap();
     let result = store.write_cas(&branch, Some(&fake_oid), &modified);
     assert!(result.is_err());

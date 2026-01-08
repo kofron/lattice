@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::forge::{create_forge, ForgeProvider};
+//! use latticework::forge::{create_forge, ForgeProvider};
 //!
 //! // Auto-detect from URL
 //! let forge = create_forge(
@@ -65,7 +65,7 @@ impl ForgeProvider {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::ForgeProvider;
+    /// use latticework::forge::ForgeProvider;
     ///
     /// let providers = ForgeProvider::all();
     /// assert!(providers.contains(&ForgeProvider::GitHub));
@@ -99,7 +99,7 @@ impl ForgeProvider {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::ForgeProvider;
+    /// use latticework::forge::ForgeProvider;
     ///
     /// assert_eq!(ForgeProvider::parse("github"), Some(ForgeProvider::GitHub));
     /// assert_eq!(ForgeProvider::parse("unknown"), None);
@@ -135,7 +135,7 @@ impl std::fmt::Display for ForgeProvider {
 /// # Example
 ///
 /// ```
-/// use lattice::forge::{detect_provider, ForgeProvider};
+/// use latticework::forge::{detect_provider, ForgeProvider};
 ///
 /// assert_eq!(
 ///     detect_provider("git@github.com:owner/repo.git"),
@@ -181,7 +181,7 @@ pub fn detect_provider(remote_url: &str) -> Option<ForgeProvider> {
 /// # Example
 ///
 /// ```ignore
-/// use lattice::forge::create_forge;
+/// use latticework::forge::create_forge;
 ///
 /// // Auto-detect from URL
 /// let forge = create_forge(

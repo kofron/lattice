@@ -23,8 +23,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::forge::github::GitHubForge;
-//! use lattice::forge::{Forge, CreatePrRequest};
+//! use latticework::forge::github::GitHubForge;
+//! use latticework::forge::{Forge, CreatePrRequest};
 //!
 //! let forge = GitHubForge::new("ghp_token123", "owner", "repo");
 //! let pr = forge.create_pr(CreatePrRequest {
@@ -141,7 +141,7 @@ impl GitHubForge {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::github::GitHubForge;
+    /// use latticework::forge::github::GitHubForge;
     ///
     /// // SSH format
     /// let forge = GitHubForge::from_remote_url("git@github.com:owner/repo.git", "token");
@@ -591,7 +591,7 @@ impl From<GitHubPullRequest> for PullRequest {
 /// # Example
 ///
 /// ```
-/// use lattice::forge::github::parse_github_url;
+/// use latticework::forge::github::parse_github_url;
 ///
 /// let (owner, repo) = parse_github_url("git@github.com:octocat/hello-world.git").unwrap();
 /// assert_eq!(owner, "octocat");

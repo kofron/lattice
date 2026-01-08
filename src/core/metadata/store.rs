@@ -17,10 +17,10 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::core::metadata::store::MetadataStore;
-//! use lattice::core::metadata::schema::BranchMetadataV1;
-//! use lattice::core::types::{BranchName, Oid};
-//! use lattice::git::Git;
+//! use latticework::core::metadata::store::MetadataStore;
+//! use latticework::core::metadata::schema::BranchMetadataV1;
+//! use latticework::core::types::{BranchName, Oid};
+//! use latticework::git::Git;
 //!
 //! let git = Git::open(Path::new("."))?;
 //! let store = MetadataStore::new(&git);
@@ -136,8 +136,8 @@ impl<'a> MetadataStore<'a> {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::metadata::store::MetadataStore;
-    /// use lattice::core::types::BranchName;
+    /// use latticework::core::metadata::store::MetadataStore;
+    /// use latticework::core::types::BranchName;
     ///
     /// let branch = BranchName::new("feature-a").unwrap();
     /// let refname = MetadataStore::ref_name(&branch);

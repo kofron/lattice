@@ -92,14 +92,13 @@ pub use untrack::untrack;
 
 use crate::cli::args::{Command, ConfigAction};
 use crate::doctor::{Doctor, FixId};
-use crate::engine::{self, Context};
+use crate::engine::Context;
 use crate::git::Git;
 use anyhow::Result;
 
 /// Dispatch a command to its handler.
 pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
     match command {
-        Command::Hello => hello(ctx),
         Command::Doctor {
             fix_ids,
             dry_run,
@@ -273,15 +272,6 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
         Command::Pr { target, stack } => pr::pr(ctx, target.as_deref(), stack),
         Command::Unlink { branch } => unlink::unlink(ctx, branch.as_deref()),
     }
-}
-
-/// Bootstrap validation command.
-///
-/// This command exists only to validate that the engine lifecycle works.
-/// It runs through Scan → Gate → Plan → Execute → Verify with the full engine lifecycle.
-fn hello(ctx: &Context) -> Result<()> {
-    // Run through the engine lifecycle
-    engine::execute_hello(ctx)
 }
 
 /// Doctor command - diagnose and repair repository issues.

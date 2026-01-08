@@ -21,8 +21,8 @@
 //! # Example
 //!
 //! ```
-//! use lattice::core::metadata::schema::{BranchMetadataV1, parse_metadata};
-//! use lattice::core::types::{BranchName, Oid};
+//! use latticework::core::metadata::schema::{BranchMetadataV1, parse_metadata};
+//! use latticework::core::types::{BranchName, Oid};
 //!
 //! let branch = BranchName::new("feature").unwrap();
 //! let parent = BranchName::new("main").unwrap();

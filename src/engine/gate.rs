@@ -22,8 +22,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::engine::gate::{gate, requirements};
-//! use lattice::engine::scan::scan;
+//! use latticework::engine::gate::{gate, requirements};
+//! use latticework::engine::scan::scan;
 //!
 //! let snapshot = scan(&git)?;
 //!
@@ -364,14 +364,6 @@ pub fn gate_with_scope(
     GateResult::Ready(Box::new(ReadyContext { snapshot, data }))
 }
 
-/// Gate the hello command.
-///
-/// The hello command has minimal requirements - it just needs to run.
-/// Used for bootstrap validation.
-pub fn gate_hello(snapshot: RepoSnapshot) -> GateResult {
-    gate(snapshot, &requirements::MINIMAL)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,24 +678,6 @@ mod tests {
                 }
                 _ => panic!("wrong variant"),
             }
-        }
-    }
-
-    mod gate_hello {
-        use super::*;
-
-        #[test]
-        fn passes_with_repo_open() {
-            let snapshot = make_snapshot_with_caps(&[Capability::RepoOpen]);
-            let result = gate_hello(snapshot);
-            assert!(result.is_ready());
-        }
-
-        #[test]
-        fn fails_without_repo_open() {
-            let snapshot = make_snapshot_with_caps(&[]);
-            let result = gate_hello(snapshot);
-            assert!(!result.is_ready());
         }
     }
 }

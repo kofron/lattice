@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::forge::{Forge, CreatePrRequest};
+//! use latticework::forge::{Forge, CreatePrRequest};
 //!
 //! async fn submit_pr(forge: &dyn Forge) -> Result<(), ForgeError> {
 //!     let request = CreatePrRequest {
@@ -206,7 +206,7 @@ impl std::fmt::Display for MergeMethod {
 /// # Example
 ///
 /// ```ignore
-/// use lattice::forge::{Forge, CreatePrRequest, MergeMethod};
+/// use latticework::forge::{Forge, CreatePrRequest, MergeMethod};
 ///
 /// async fn workflow(forge: &dyn Forge) -> Result<(), ForgeError> {
 ///     // Create a PR

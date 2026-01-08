@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::git::Git;
+//! use latticework::git::Git;
 //! use std::path::Path;
 //!
 //! let git = Git::open(Path::new("."))?;
@@ -243,7 +243,7 @@ impl GitState {
     /// # Example
     ///
     /// ```
-    /// use lattice::git::GitState;
+    /// use latticework::git::GitState;
     ///
     /// assert!(!GitState::Clean.is_in_progress());
     /// assert!(GitState::Merge.is_in_progress());
@@ -257,7 +257,7 @@ impl GitState {
     /// # Example
     ///
     /// ```
-    /// use lattice::git::GitState;
+    /// use latticework::git::GitState;
     ///
     /// assert_eq!(GitState::Clean.description(), "clean");
     /// assert_eq!(GitState::Merge.description(), "merge");
@@ -360,7 +360,7 @@ pub struct CommitInfo {
 /// # Example
 ///
 /// ```ignore
-/// use lattice::git::Git;
+/// use latticework::git::Git;
 /// use std::path::Path;
 ///
 /// let git = Git::open(Path::new("."))?;
@@ -408,7 +408,7 @@ impl Git {
     /// # Example
     ///
     /// ```ignore
-    /// use lattice::git::Git;
+    /// use latticework::git::Git;
     /// use std::path::Path;
     ///
     /// let git = Git::open(Path::new("./src"))?;  // Works from subdirectory
@@ -451,7 +451,7 @@ impl Git {
     /// # Example
     ///
     /// ```ignore
-    /// use lattice::git::{Git, GitState};
+    /// use latticework::git::{Git, GitState};
     ///
     /// let git = Git::open(Path::new("."))?;
     /// if git.state().is_in_progress() {
@@ -1212,7 +1212,7 @@ impl Git {
     /// # Example
     ///
     /// ```
-    /// use lattice::git::Git;
+    /// use latticework::git::Git;
     ///
     /// assert_eq!(
     ///     Git::parse_github_remote("https://github.com/owner/repo.git"),

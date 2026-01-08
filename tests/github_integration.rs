@@ -3,8 +3,8 @@
 //! These tests verify the GitHub integration works correctly using MockForge.
 //! Live GitHub API tests are behind the `live_github_tests` feature flag.
 
-use lattice::forge::mock::{FailOn, MockForge, MockOperation};
-use lattice::forge::{
+use latticework::forge::mock::{FailOn, MockForge, MockOperation};
+use latticework::forge::{
     CreatePrRequest, Forge, ForgeError, MergeMethod, PrState as ForgePrState, PullRequest,
     Reviewers, UpdatePrRequest,
 };
@@ -772,7 +772,7 @@ mod merge_flow_tests {
 // =============================================================================
 
 mod github_url_tests {
-    use lattice::forge::github::parse_github_url;
+    use latticework::forge::github::parse_github_url;
 
     #[test]
     fn parse_https_url() {
@@ -820,7 +820,7 @@ mod github_url_tests {
 // =============================================================================
 
 mod auth_tests {
-    use lattice::cli::commands::{get_github_token, has_github_token};
+    use latticework::cli::commands::{get_github_token, has_github_token};
 
     #[test]
     fn has_github_token_returns_bool() {
@@ -846,7 +846,7 @@ mod auth_tests {
 #[cfg(feature = "live_github_tests")]
 mod live_tests {
     use super::*;
-    use lattice::forge::github::GitHubForge;
+    use latticework::forge::github::GitHubForge;
 
     fn get_test_token() -> Option<String> {
         std::env::var("GITHUB_TOKEN").ok()

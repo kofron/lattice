@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::cli::commands::stack_comment_ops::update_pr_stack_comment;
+//! use latticework::cli::commands::stack_comment_ops::update_pr_stack_comment;
 //!
 //! // Update stack comment for a single PR
 //! update_pr_stack_comment(&forge, &snapshot, &branch, quiet).await?;

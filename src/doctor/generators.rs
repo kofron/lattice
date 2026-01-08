@@ -27,8 +27,8 @@ use super::fixes::{ConfigChange, FixId, FixOption, FixPreview, MetadataChange, R
 /// # Example
 ///
 /// ```ignore
-/// use lattice::doctor::generators::generate_fixes;
-/// use lattice::engine::health::Issue;
+/// use latticework::doctor::generators::generate_fixes;
+/// use latticework::engine::health::Issue;
 ///
 /// let issue = Issue::new("trunk-not-configured", Severity::Blocking, "...");
 /// let fixes = generate_fixes(&issue, &snapshot);

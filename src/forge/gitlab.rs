@@ -25,8 +25,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::forge::gitlab::GitLabForge;
-//! use lattice::forge::{Forge, CreatePrRequest};
+//! use latticework::forge::gitlab::GitLabForge;
+//! use latticework::forge::{Forge, CreatePrRequest};
 //!
 //! let forge = GitLabForge::new("token", "owner", "repo");
 //!
@@ -73,7 +73,7 @@ impl GitLabForge {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::gitlab::GitLabForge;
+    /// use latticework::forge::gitlab::GitLabForge;
     ///
     /// let forge = GitLabForge::new("glpat-xxx", "mygroup", "myproject");
     /// ```
@@ -130,7 +130,7 @@ impl GitLabForge {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::gitlab::GitLabForge;
+    /// use latticework::forge::gitlab::GitLabForge;
     ///
     /// // SSH format
     /// let forge = GitLabForge::from_remote_url("git@gitlab.com:owner/project.git", "token");
@@ -260,7 +260,7 @@ impl Forge for GitLabForge {
 /// # Example
 ///
 /// ```
-/// use lattice::forge::gitlab::parse_gitlab_url;
+/// use latticework::forge::gitlab::parse_gitlab_url;
 ///
 /// let (owner, project) = parse_gitlab_url("git@gitlab.com:mygroup/myproject.git").unwrap();
 /// assert_eq!(owner, "mygroup");

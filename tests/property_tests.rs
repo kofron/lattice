@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use lattice::core::graph::StackGraph;
-use lattice::core::metadata::schema::{parse_metadata, BranchMetadataV1};
-use lattice::core::types::{BranchName, Fingerprint, Oid, RefName};
+use latticework::core::graph::StackGraph;
+use latticework::core::metadata::schema::{parse_metadata, BranchMetadataV1};
+use latticework::core::types::{BranchName, Fingerprint, Oid, RefName};
 
 /// Strategy for generating valid branch name characters.
 fn branch_name_char() -> impl Strategy<Value = char> {

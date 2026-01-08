@@ -6,7 +6,9 @@
 //! - GitLab stub behavior (when feature enabled)
 //! - Configuration-driven forge selection
 
-use lattice::forge::{create_forge, detect_provider, valid_forge_names, ForgeError, ForgeProvider};
+use latticework::forge::{
+    create_forge, detect_provider, valid_forge_names, ForgeError, ForgeProvider,
+};
 
 mod provider_detection {
     use super::*;
@@ -172,8 +174,8 @@ mod valid_forges {
 
 #[cfg(feature = "gitlab")]
 mod gitlab_stub {
-    use lattice::forge::gitlab::GitLabForge;
-    use lattice::forge::{
+    use latticework::forge::gitlab::GitLabForge;
+    use latticework::forge::{
         CreatePrRequest, Forge, ForgeError, MergeMethod, Reviewers, UpdatePrRequest,
     };
 
@@ -358,8 +360,8 @@ mod forge_provider_enum {
 /// Tests that verify the architecture boundary:
 /// Commands should work with any forge, not just GitHub
 mod architecture_boundary {
-    use lattice::forge::mock::MockForge;
-    use lattice::forge::{CreatePrRequest, Forge, PrState};
+    use latticework::forge::mock::MockForge;
+    use latticework::forge::{CreatePrRequest, Forge, PrState};
 
     #[tokio::test]
     async fn mock_forge_works_as_trait_object() {

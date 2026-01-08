@@ -27,8 +27,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::engine::verify::fast_verify;
-//! use lattice::engine::scan::scan;
+//! use latticework::engine::verify::fast_verify;
+//! use latticework::engine::scan::scan;
 //!
 //! let snapshot = scan(&git)?;
 //! fast_verify(&git, &snapshot)?;

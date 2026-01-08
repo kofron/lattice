@@ -28,7 +28,7 @@ use crate::engine::plan::Plan;
 /// # Example
 ///
 /// ```
-/// use lattice::doctor::FixId;
+/// use latticework::doctor::FixId;
 ///
 /// let id = FixId::new("trunk-not-configured", "set-trunk", "main");
 /// assert!(id.as_str().contains("set-trunk"));
@@ -354,8 +354,8 @@ impl FixOption {
     /// # Example
     ///
     /// ```
-    /// use lattice::doctor::{FixOption, FixId, FixPreview};
-    /// use lattice::engine::health::IssueId;
+    /// use latticework::doctor::{FixOption, FixId, FixPreview};
+    /// use latticework::engine::health::IssueId;
     ///
     /// let fix = FixOption::new(
     ///     FixId::simple("trunk-not-configured", "set-trunk"),
