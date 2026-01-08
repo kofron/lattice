@@ -175,6 +175,29 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
             }
         };
 
+        // Push branch to remote before creating/updating PR
+        if !ctx.quiet {
+            println!("Pushing '{}'...", branch);
+        }
+        let push_args = if opts.force {
+            vec!["push", "--force-with-lease", "origin", branch.as_str()]
+        } else {
+            vec!["push", "origin", branch.as_str()]
+        };
+        let push_result = std::process::Command::new("git")
+            .args(&push_args)
+            .current_dir(&cwd)
+            .output()?;
+
+        if !push_result.status.success() {
+            let stderr = String::from_utf8_lossy(&push_result.stderr);
+            // Check if it's just "already up to date" which is fine
+            if !stderr.contains("Everything up-to-date") {
+                eprintln!("  Failed to push '{}': {}", branch, stderr.trim());
+                continue;
+            }
+        }
+
         // Determine base (parent branch or trunk)
         let base = scanned.metadata.parent.name().to_string();
 
