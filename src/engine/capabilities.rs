@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```
-//! use lattice::engine::capabilities::{Capability, CapabilitySet};
+//! use latticework::engine::capabilities::{Capability, CapabilitySet};
 //!
 //! let mut caps = CapabilitySet::new();
 //! caps.insert(Capability::RepoOpen);
@@ -86,7 +86,7 @@ impl Capability {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::capabilities::Capability;
+    /// use latticework::engine::capabilities::Capability;
     ///
     /// assert_eq!(Capability::RepoOpen.description(), "repository is accessible");
     /// assert_eq!(Capability::TrunkKnown.description(), "trunk branch is configured");
@@ -121,7 +121,7 @@ impl std::fmt::Display for Capability {
 /// # Example
 ///
 /// ```
-/// use lattice::engine::capabilities::{Capability, CapabilitySet};
+/// use latticework::engine::capabilities::{Capability, CapabilitySet};
 ///
 /// let mut caps = CapabilitySet::new();
 /// caps.insert(Capability::RepoOpen);
@@ -147,7 +147,7 @@ impl CapabilitySet {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::capabilities::{Capability, CapabilitySet};
+    /// use latticework::engine::capabilities::{Capability, CapabilitySet};
     ///
     /// let caps = CapabilitySet::with([Capability::RepoOpen, Capability::TrunkKnown]);
     /// assert!(caps.has(&Capability::RepoOpen));
@@ -188,7 +188,7 @@ impl CapabilitySet {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::capabilities::{Capability, CapabilitySet};
+    /// use latticework::engine::capabilities::{Capability, CapabilitySet};
     ///
     /// let caps = CapabilitySet::with([Capability::RepoOpen]);
     /// let missing = caps.missing(&[

@@ -30,8 +30,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::engine::exec::Executor;
-//! use lattice::engine::plan::Plan;
+//! use latticework::engine::exec::Executor;
+//! use latticework::engine::plan::Plan;
 //!
 //! let executor = Executor::new(&git);
 //! match executor.execute(&plan, &ctx)? {

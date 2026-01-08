@@ -18,8 +18,8 @@
 //! # Example
 //!
 //! ```
-//! use lattice::core::metadata::schema::{BranchMetadataV1, parse_metadata, METADATA_KIND};
-//! use lattice::core::types::{BranchName, Oid};
+//! use latticework::core::metadata::schema::{BranchMetadataV1, parse_metadata, METADATA_KIND};
+//! use latticework::core::types::{BranchName, Oid};
 //!
 //! // Create metadata for a new branch
 //! let branch = BranchName::new("feature-a").unwrap();
@@ -91,7 +91,7 @@ struct MetadataEnvelope {
 /// # Example
 ///
 /// ```
-/// use lattice::core::metadata::schema::parse_metadata;
+/// use latticework::core::metadata::schema::parse_metadata;
 ///
 /// let json = r#"{
 ///     "kind": "lattice.branch-metadata",

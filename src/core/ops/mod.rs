@@ -19,8 +19,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::core::ops::lock::RepoLock;
-//! use lattice::core::ops::journal::{Journal, OpState};
+//! use latticework::core::ops::lock::RepoLock;
+//! use latticework::core::ops::journal::{Journal, OpState};
 //!
 //! // Acquire lock
 //! let lock = RepoLock::acquire(git_dir)?;

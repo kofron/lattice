@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::secrets::{SecretStore, SecretError};
+//! use latticework::secrets::{SecretStore, SecretError};
 //!
 //! fn use_token(store: &dyn SecretStore) -> Result<(), SecretError> {
 //!     if let Some(token) = store.get("github.pat")? {
@@ -74,7 +74,7 @@ pub enum SecretError {
 /// # Example
 ///
 /// ```ignore
-/// use lattice::secrets::{SecretStore, FileSecretStore};
+/// use latticework::secrets::{SecretStore, FileSecretStore};
 ///
 /// let store = FileSecretStore::new()?;
 ///

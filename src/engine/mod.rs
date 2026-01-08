@@ -34,8 +34,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::engine::{scan, gate, execute_command};
-//! use lattice::engine::gate::requirements;
+//! use latticework::engine::{scan, gate, execute_command};
+//! use latticework::engine::gate::requirements;
 //!
 //! let snapshot = scan::scan(&git)?;
 //!
@@ -128,120 +128,6 @@ pub enum EngineError {
     /// Git error.
     #[error("git error: {0}")]
     Git(#[from] crate::git::GitError),
-}
-
-/// Execute the hello command through the full engine lifecycle.
-///
-/// This exercises all lifecycle phases with a minimal no-op command.
-/// Used for bootstrap validation and testing.
-///
-/// # Arguments
-///
-/// * `ctx` - Execution context
-///
-/// # Returns
-///
-/// `Ok(())` if the lifecycle completes successfully.
-pub fn execute_hello(ctx: &Context) -> Result<()> {
-    if ctx.debug {
-        eprintln!("[debug] Starting hello command lifecycle");
-    }
-
-    // Determine working directory
-    let cwd = ctx
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    // Open repository
-    if ctx.debug {
-        eprintln!("[debug] Opening repository at {:?}", cwd);
-    }
-    let git = Git::open(&cwd)?;
-
-    // 1. Scan
-    if ctx.debug {
-        eprintln!("[debug] Phase 1: Scan");
-    }
-    let snapshot = scan::scan(&git)?;
-
-    if ctx.debug {
-        eprintln!(
-            "[debug] Scanned: {} branches, {} tracked",
-            snapshot.branches.len(),
-            snapshot.metadata.len()
-        );
-        eprintln!(
-            "[debug] Capabilities: {} established",
-            snapshot.health.capabilities().len()
-        );
-    }
-
-    // 2. Gate
-    if ctx.debug {
-        eprintln!("[debug] Phase 2: Gate");
-    }
-    let ready = match gate::gate_hello(snapshot) {
-        GateResult::Ready(ctx) => ctx,
-        GateResult::NeedsRepair(bundle) => {
-            // For hello, we just report the issues
-            for issue in &bundle.blocking_issues {
-                eprintln!("Issue: {}", issue.message);
-            }
-            anyhow::bail!(
-                "Hello command blocked by {} issues",
-                bundle.blocking_issues.len()
-            );
-        }
-    };
-
-    // 3. Plan
-    if ctx.debug {
-        eprintln!("[debug] Phase 3: Plan");
-    }
-    let plan = plan::plan_hello(&ready)?;
-
-    if ctx.debug {
-        eprintln!("[debug] Plan: {} steps", plan.step_count());
-    }
-
-    // 4. Execute
-    if ctx.debug {
-        eprintln!("[debug] Phase 4: Execute");
-    }
-    let executor = Executor::new(&git);
-    let result = executor.execute(&plan, ctx)?;
-
-    match result {
-        ExecuteResult::Success { .. } => {
-            if ctx.debug {
-                eprintln!("[debug] Execution successful");
-            }
-        }
-        ExecuteResult::Paused { branch, .. } => {
-            anyhow::bail!("Unexpected pause during hello on branch {}", branch);
-        }
-        ExecuteResult::Aborted { error, .. } => {
-            anyhow::bail!("Hello command aborted: {}", error);
-        }
-    }
-
-    // 5. Verify
-    if ctx.debug {
-        eprintln!("[debug] Phase 5: Verify");
-    }
-    // For hello, we skip verification since we didn't actually change anything
-
-    if ctx.debug {
-        eprintln!("[debug] Hello command lifecycle complete");
-    }
-
-    // Output
-    if !ctx.quiet {
-        println!("Hello from Lattice!");
-    }
-
-    Ok(())
 }
 
 /// Run a full lifecycle for a command.

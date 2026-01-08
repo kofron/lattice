@@ -17,8 +17,8 @@
 //! # Example
 //!
 //! ```
-//! use lattice::engine::health::{Issue, IssueId, Severity, Evidence, RepoHealthReport};
-//! use lattice::engine::capabilities::Capability;
+//! use latticework::engine::health::{Issue, IssueId, Severity, Evidence, RepoHealthReport};
+//! use latticework::engine::capabilities::Capability;
 //!
 //! let issue = Issue::new(
 //!     "metadata-parse-error",
@@ -90,7 +90,7 @@ impl std::fmt::Display for Severity {
 /// # Example
 ///
 /// ```
-/// use lattice::engine::health::IssueId;
+/// use latticework::engine::health::IssueId;
 ///
 /// let id = IssueId::new("metadata-parse-error", "feature");
 /// assert!(id.as_str().starts_with("metadata-parse-error:"));
@@ -242,7 +242,7 @@ impl Issue {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::health::{Issue, Severity};
+    /// use latticework::engine::health::{Issue, Severity};
     ///
     /// let issue = Issue::new(
     ///     "trunk-not-configured",
@@ -339,8 +339,8 @@ impl Hash for Issue {
 /// # Example
 ///
 /// ```
-/// use lattice::engine::health::{RepoHealthReport, Issue, Severity};
-/// use lattice::engine::capabilities::Capability;
+/// use latticework::engine::health::{RepoHealthReport, Issue, Severity};
+/// use latticework::engine::capabilities::Capability;
 ///
 /// let mut report = RepoHealthReport::new();
 /// report.add_capability(Capability::RepoOpen);

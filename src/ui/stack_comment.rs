@@ -97,7 +97,7 @@ pub struct StackCommentInput {
 /// # Example
 ///
 /// ```
-/// use lattice::ui::stack_comment::{generate_stack_comment, StackCommentInput, StackBranchInfo, StackPosition};
+/// use latticework::ui::stack_comment::{generate_stack_comment, StackCommentInput, StackBranchInfo, StackPosition};
 ///
 /// let input = StackCommentInput {
 ///     branches: vec![
@@ -172,7 +172,7 @@ pub fn generate_stack_comment(input: &StackCommentInput) -> String {
 /// # Example
 ///
 /// ```
-/// use lattice::ui::stack_comment::merge_stack_comment;
+/// use latticework::ui::stack_comment::merge_stack_comment;
 ///
 /// // Append to existing description
 /// let result = merge_stack_comment(

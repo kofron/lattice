@@ -23,8 +23,8 @@
 //! # Example
 //!
 //! ```
-//! use lattice::engine::plan::{Plan, PlanStep};
-//! use lattice::core::ops::journal::OpId;
+//! use latticework::engine::plan::{Plan, PlanStep};
+//! use latticework::core::ops::journal::OpId;
 //!
 //! let plan = Plan::new(OpId::new(), "restack")
 //!     .with_step(PlanStep::Checkpoint {
@@ -44,7 +44,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::gate::ReadyContext;
 use crate::core::metadata::schema::BranchMetadataV1;
 use crate::core::ops::journal::OpId;
 
@@ -225,8 +224,8 @@ impl Plan {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::plan::Plan;
-    /// use lattice::core::ops::journal::OpId;
+    /// use latticework::engine::plan::Plan;
+    /// use latticework::core::ops::journal::OpId;
     ///
     /// let plan = Plan::new(OpId::new(), "restack");
     /// assert!(plan.is_empty());
@@ -270,8 +269,8 @@ impl Plan {
     /// # Example
     ///
     /// ```
-    /// use lattice::engine::plan::{Plan, PlanStep};
-    /// use lattice::core::ops::journal::OpId;
+    /// use latticework::engine::plan::{Plan, PlanStep};
+    /// use latticework::core::ops::journal::OpId;
     ///
     /// let plan = Plan::new(OpId::new(), "test")
     ///     .with_step(PlanStep::Checkpoint { name: "start".to_string() });
@@ -361,15 +360,6 @@ pub enum PlanError {
     /// Conflict with frozen branch.
     #[error("cannot modify frozen branch: {0}")]
     FrozenBranch(String),
-}
-
-/// Plan the hello command.
-///
-/// The hello command has no actual steps - it's just a lifecycle validation.
-/// This is kept for Milestone 0 compatibility.
-pub fn plan_hello(ready: &ReadyContext) -> Result<Plan, PlanError> {
-    let _ = ready; // Not used for hello
-    Ok(Plan::new(OpId::new(), "hello"))
 }
 
 #[cfg(test)]
@@ -664,53 +654,6 @@ mod tests {
 
             let err = PlanError::FrozenBranch("feature".to_string());
             assert!(err.to_string().contains("frozen"));
-        }
-    }
-
-    mod plan_hello {
-        use super::*;
-        use crate::core::types::Fingerprint;
-        use crate::engine::capabilities::Capability;
-        use crate::engine::gate::{ReadyContext, ValidatedData};
-        use crate::engine::health::RepoHealthReport;
-        use crate::engine::scan::RepoSnapshot;
-        use crate::git::{GitState, RepoInfo, WorktreeStatus};
-        use std::collections::HashMap;
-        use std::path::PathBuf;
-
-        fn make_ready_context() -> ReadyContext {
-            let mut health = RepoHealthReport::new();
-            health.add_capability(Capability::RepoOpen);
-
-            let snapshot = RepoSnapshot {
-                info: RepoInfo {
-                    git_dir: PathBuf::from("/repo/.git"),
-                    work_dir: PathBuf::from("/repo"),
-                },
-                git_state: GitState::Clean,
-                worktree_status: WorktreeStatus::default(),
-                current_branch: None,
-                branches: HashMap::new(),
-                metadata: HashMap::new(),
-                repo_config: None,
-                trunk: None,
-                graph: crate::core::graph::StackGraph::new(),
-                fingerprint: Fingerprint::compute(&[]),
-                health,
-            };
-
-            ReadyContext {
-                snapshot,
-                data: ValidatedData::None,
-            }
-        }
-
-        #[test]
-        fn produces_empty_plan() {
-            let ctx = make_ready_context();
-            let plan = plan_hello(&ctx).unwrap();
-            assert!(plan.is_empty());
-            assert_eq!(plan.command, "hello");
         }
     }
 }

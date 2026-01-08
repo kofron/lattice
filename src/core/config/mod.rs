@@ -33,7 +33,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use lattice::core::config::Config;
+//! use latticework::core::config::Config;
 //! use std::path::Path;
 //!
 //! // Load config for a repository

@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::core::ops::lock::RepoLock;
+//! use latticework::core::ops::lock::RepoLock;
 //! use std::path::Path;
 //!
 //! let git_dir = Path::new(".git");
@@ -72,7 +72,7 @@ pub enum LockError {
 /// # Example
 ///
 /// ```ignore
-/// use lattice::core::ops::lock::RepoLock;
+/// use latticework::core::ops::lock::RepoLock;
 ///
 /// let lock = RepoLock::acquire(git_dir)?;
 /// assert!(lock.is_held());

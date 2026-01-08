@@ -110,8 +110,8 @@ impl StackGraph {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::graph::StackGraph;
-    /// use lattice::core::types::BranchName;
+    /// use latticework::core::graph::StackGraph;
+    /// use latticework::core::types::BranchName;
     ///
     /// let mut graph = StackGraph::new();
     /// let main = BranchName::new("main").unwrap();
@@ -151,8 +151,8 @@ impl StackGraph {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::graph::StackGraph;
-    /// use lattice::core::types::BranchName;
+    /// use latticework::core::graph::StackGraph;
+    /// use latticework::core::types::BranchName;
     ///
     /// let mut graph = StackGraph::new();
     /// let main = BranchName::new("main").unwrap();
@@ -186,8 +186,8 @@ impl StackGraph {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::graph::StackGraph;
-    /// use lattice::core::types::BranchName;
+    /// use latticework::core::graph::StackGraph;
+    /// use latticework::core::types::BranchName;
     ///
     /// let mut graph = StackGraph::new();
     /// let main = BranchName::new("main").unwrap();

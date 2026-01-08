@@ -18,7 +18,7 @@
 //! # Examples
 //!
 //! ```
-//! use lattice::core::types::{BranchName, Oid, RefName};
+//! use latticework::core::types::{BranchName, Oid, RefName};
 //!
 //! // Valid constructions
 //! let branch = BranchName::new("feature/my-branch").unwrap();
@@ -60,7 +60,7 @@ pub enum TypeError {
 /// # Example
 ///
 /// ```
-/// use lattice::core::types::BranchName;
+/// use latticework::core::types::BranchName;
 ///
 /// // Valid branch names
 /// let name = BranchName::new("feature/my-branch").unwrap();
@@ -228,7 +228,7 @@ impl std::fmt::Display for BranchName {
 /// # Example
 ///
 /// ```
-/// use lattice::core::types::Oid;
+/// use latticework::core::types::Oid;
 ///
 /// // Create from hex string (normalized to lowercase)
 /// let oid = Oid::new("ABC123DEF4567890ABC123DEF4567890ABC12345").unwrap();
@@ -269,7 +269,7 @@ impl Oid {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::Oid;
+    /// use latticework::core::types::Oid;
     ///
     /// let zero = Oid::zero();
     /// assert!(zero.is_zero());
@@ -284,7 +284,7 @@ impl Oid {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::Oid;
+    /// use latticework::core::types::Oid;
     ///
     /// let zero = Oid::zero();
     /// assert!(zero.is_zero());
@@ -304,7 +304,7 @@ impl Oid {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::Oid;
+    /// use latticework::core::types::Oid;
     ///
     /// let oid = Oid::new("abc123def4567890abc123def4567890abc12345").unwrap();
     /// assert_eq!(oid.short(7), "abc123d");
@@ -371,7 +371,7 @@ impl std::fmt::Display for Oid {
 /// # Example
 ///
 /// ```
-/// use lattice::core::types::{BranchName, RefName};
+/// use latticework::core::types::{BranchName, RefName};
 ///
 /// // Create ref for a branch
 /// let branch = BranchName::new("feature/foo").unwrap();
@@ -403,7 +403,7 @@ impl RefName {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::{BranchName, RefName};
+    /// use latticework::core::types::{BranchName, RefName};
     ///
     /// let branch = BranchName::new("main").unwrap();
     /// let refname = RefName::for_branch(&branch);
@@ -419,7 +419,7 @@ impl RefName {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::{BranchName, RefName};
+    /// use latticework::core::types::{BranchName, RefName};
     ///
     /// let branch = BranchName::new("feature/foo").unwrap();
     /// let refname = RefName::for_metadata(&branch);
@@ -437,7 +437,7 @@ impl RefName {
     /// # Example
     ///
     /// ```
-    /// use lattice::core::types::RefName;
+    /// use latticework::core::types::RefName;
     ///
     /// let refname = RefName::new("refs/heads/feature/foo").unwrap();
     /// assert_eq!(refname.strip_prefix("refs/heads/"), Some("feature/foo"));
@@ -576,7 +576,7 @@ impl std::fmt::Display for RefName {
 /// # Example
 ///
 /// ```
-/// use lattice::core::types::UtcTimestamp;
+/// use latticework::core::types::UtcTimestamp;
 ///
 /// let now = UtcTimestamp::now();
 /// println!("Current time: {}", now);
@@ -615,7 +615,7 @@ impl std::fmt::Display for UtcTimestamp {
 /// # Example
 ///
 /// ```
-/// use lattice::core::types::{Fingerprint, RefName, Oid};
+/// use latticework::core::types::{Fingerprint, RefName, Oid};
 ///
 /// let refs = vec![
 ///     (RefName::new("refs/heads/main").unwrap(),

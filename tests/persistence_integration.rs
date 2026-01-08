@@ -8,12 +8,12 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-use lattice::core::metadata::schema::{BranchMetadataV1, FreezeScope, FreezeState, PrState};
-use lattice::core::metadata::store::{MetadataStore, StoreError};
-use lattice::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
-use lattice::core::ops::lock::{LockError, RepoLock};
-use lattice::core::types::{BranchName, Oid};
-use lattice::git::Git;
+use latticework::core::metadata::schema::{BranchMetadataV1, FreezeScope, FreezeState, PrState};
+use latticework::core::metadata::store::{MetadataStore, StoreError};
+use latticework::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
+use latticework::core::ops::lock::{LockError, RepoLock};
+use latticework::core::types::{BranchName, Oid};
+use latticework::git::Git;
 
 // =============================================================================
 // Test Helpers

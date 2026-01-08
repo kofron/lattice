@@ -19,15 +19,15 @@ use rand::Rng;
 use rand::SeedableRng;
 use tempfile::TempDir;
 
-use lattice::cli::commands;
-use lattice::core::metadata::store::MetadataStore;
-use lattice::core::types::BranchName;
-use lattice::doctor::Doctor;
-use lattice::engine::gate::{gate, requirements};
-use lattice::engine::scan::scan;
+use latticework::cli::commands;
+use latticework::core::metadata::store::MetadataStore;
+use latticework::core::types::BranchName;
+use latticework::doctor::Doctor;
+use latticework::engine::gate::{gate, requirements};
+use latticework::engine::scan::scan;
 
-use lattice::engine::Context;
-use lattice::git::Git;
+use latticework::engine::Context;
+use latticework::git::Git;
 
 // =============================================================================
 // Operation Types
@@ -807,7 +807,7 @@ fn executor_respects_cas_semantics() {
 
     // Now try to use stale OID - this should fail
     let fake_oid =
-        lattice::core::types::Oid::new("0000000000000000000000000000000000000000").unwrap();
+        latticework::core::types::Oid::new("0000000000000000000000000000000000000000").unwrap();
     let result = store.write_cas(&branch, Some(&fake_oid), &original.metadata);
 
     assert!(result.is_err(), "CAS should fail with stale OID");

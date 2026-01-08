@@ -29,7 +29,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::engine::ledger::{Event, EventLedger};
+//! use latticework::engine::ledger::{Event, EventLedger};
 //!
 //! let ledger = EventLedger::new(&git);
 //!

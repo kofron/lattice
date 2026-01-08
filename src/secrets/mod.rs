@@ -23,7 +23,7 @@
 //! Use [`create_store`] to create a secret store based on configuration:
 //!
 //! ```ignore
-//! use lattice::secrets::create_store;
+//! use latticework::secrets::create_store;
 //!
 //! // Default file-based store
 //! let store = create_store("file")?;
@@ -35,7 +35,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::secrets::{FileSecretStore, SecretStore};
+//! use latticework::secrets::{FileSecretStore, SecretStore};
 //!
 //! let store = FileSecretStore::new()?;
 //!
@@ -75,7 +75,7 @@ pub use traits::{SecretError, SecretStore};
 /// # Example
 ///
 /// ```ignore
-/// use lattice::secrets::create_store;
+/// use latticework::secrets::create_store;
 ///
 /// // From configuration
 /// let provider = config.secrets.provider.as_deref().unwrap_or("file");

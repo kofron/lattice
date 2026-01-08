@@ -34,8 +34,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::doctor::{Doctor, DiagnosisReport};
-//! use lattice::engine::scan::scan;
+//! use latticework::doctor::{Doctor, DiagnosisReport};
+//! use latticework::engine::scan::scan;
 //!
 //! // Diagnose repository issues
 //! let snapshot = scan(&git)?;

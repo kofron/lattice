@@ -29,7 +29,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::git::Git;
+//! use latticework::git::Git;
 //! use std::path::Path;
 //!
 //! let git = Git::open(Path::new("."))?;

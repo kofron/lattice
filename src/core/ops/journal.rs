@@ -23,7 +23,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::core::ops::journal::{Journal, StepKind};
+//! use latticework::core::ops::journal::{Journal, StepKind};
 //!
 //! // Create a new journal for an operation
 //! let mut journal = Journal::new("restack");

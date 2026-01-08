@@ -1,6 +1,6 @@
 //! Lattice CLI entry point.
 
-use lattice::cli;
+use latticework::cli;
 
 fn main() -> anyhow::Result<()> {
     cli::run()

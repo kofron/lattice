@@ -11,8 +11,8 @@
 //! # Example
 //!
 //! ```
-//! use lattice::forge::mock::MockForge;
-//! use lattice::forge::{Forge, CreatePrRequest, PullRequest, PrState};
+//! use latticework::forge::mock::MockForge;
+//! use latticework::forge::{Forge, CreatePrRequest, PullRequest, PrState};
 //!
 //! # tokio_test::block_on(async {
 //! let forge = MockForge::new();
@@ -139,8 +139,8 @@ impl MockForge {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::mock::MockForge;
-    /// use lattice::forge::{PullRequest, PrState};
+    /// use latticework::forge::mock::MockForge;
+    /// use latticework::forge::{PullRequest, PrState};
     ///
     /// let pr = PullRequest {
     ///     number: 42,
@@ -175,8 +175,8 @@ impl MockForge {
     /// # Example
     ///
     /// ```
-    /// use lattice::forge::mock::{MockForge, FailOn};
-    /// use lattice::forge::ForgeError;
+    /// use latticework::forge::mock::{MockForge, FailOn};
+    /// use latticework::forge::ForgeError;
     ///
     /// let forge = MockForge::new()
     ///     .fail_on(FailOn::CreatePr(ForgeError::RateLimited));

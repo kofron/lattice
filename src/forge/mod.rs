@@ -24,7 +24,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use lattice::forge::{create_forge, Forge, CreatePrRequest};
+//! use latticework::forge::{create_forge, Forge, CreatePrRequest};
 //!
 //! // Create a forge from remote URL (auto-detects provider)
 //! let forge = create_forge(

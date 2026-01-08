@@ -8,8 +8,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
-use lattice::core::types::Oid;
-use lattice::git::{Git, GitError, GitState};
+use latticework::core::types::Oid;
+use latticework::git::{Git, GitError, GitState};
 
 /// Test fixture that creates a real git repository.
 struct TestRepo {
