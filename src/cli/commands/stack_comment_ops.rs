@@ -113,9 +113,95 @@ fn get_pr_info(snapshot: &RepoSnapshot, branch: &BranchName) -> (Option<u64>, Op
         .unwrap_or((None, None))
 }
 
+/// Build stack comment input by fetching PR info from the forge.
+///
+/// This variant fetches PR info directly from the forge API instead of
+/// relying on metadata. Use this after creating PRs when metadata hasn't
+/// been persisted yet.
+///
+/// # Arguments
+///
+/// * `forge` - The forge to fetch PR info from
+/// * `snapshot` - Repository snapshot with graph structure
+/// * `current_branch` - The branch to build the stack for
+///
+/// # Returns
+///
+/// A `StackCommentInput` with PR info fetched from the forge.
+pub async fn build_stack_comment_input_from_forge(
+    forge: &dyn Forge,
+    snapshot: &RepoSnapshot,
+    current_branch: &BranchName,
+) -> StackCommentInput {
+    // Get ancestors (from current toward trunk, then reverse for display order)
+    let mut ancestors = snapshot.graph.ancestors(current_branch);
+    ancestors.reverse(); // Now ordered from trunk toward current
+
+    // Get descendants
+    let descendants = snapshot.graph.descendants(current_branch);
+
+    // Build ordered list: ancestors, current, descendants
+    let mut branches = Vec::new();
+
+    // Add ancestors (skip trunk - it's not part of the tracked stack)
+    for ancestor in &ancestors {
+        // Skip if this is not tracked (likely trunk)
+        if !snapshot.is_tracked(ancestor) {
+            continue;
+        }
+
+        let (pr_number, pr_url) = get_pr_info_from_forge(forge, ancestor).await;
+        branches.push(StackBranchInfo {
+            name: ancestor.to_string(),
+            pr_number,
+            pr_url,
+            position: StackPosition::Ancestor,
+        });
+    }
+
+    // Add current branch
+    let (pr_number, pr_url) = get_pr_info_from_forge(forge, current_branch).await;
+    branches.push(StackBranchInfo {
+        name: current_branch.to_string(),
+        pr_number,
+        pr_url,
+        position: StackPosition::Current,
+    });
+
+    // Add descendants (ordered by depth from current)
+    let mut desc_ordered: Vec<_> = descendants.into_iter().collect();
+    // Sort by depth (number of ancestors) to get consistent ordering
+    desc_ordered.sort_by_key(|b| snapshot.graph.ancestors(b).len());
+
+    for descendant in desc_ordered {
+        let (pr_number, pr_url) = get_pr_info_from_forge(forge, &descendant).await;
+        branches.push(StackBranchInfo {
+            name: descendant.to_string(),
+            pr_number,
+            pr_url,
+            position: StackPosition::Descendant,
+        });
+    }
+
+    StackCommentInput { branches }
+}
+
+/// Fetch PR info for a branch from the forge.
+async fn get_pr_info_from_forge(
+    forge: &dyn Forge,
+    branch: &BranchName,
+) -> (Option<u64>, Option<String>) {
+    match forge.find_pr_by_head(branch.as_str()).await {
+        Ok(Some(pr)) => (Some(pr.number), Some(pr.url)),
+        _ => (None, None),
+    }
+}
+
 /// Generate a stack comment body for a branch.
 ///
 /// This is a convenience function that combines building input and generating output.
+/// Uses metadata for PR info - prefer `generate_stack_comment_for_branch_from_forge`
+/// when metadata may be stale.
 ///
 /// # Arguments
 ///
@@ -127,6 +213,28 @@ fn get_pr_info(snapshot: &RepoSnapshot, branch: &BranchName) -> (Option<u64>, Op
 /// The generated stack comment string (including markers).
 pub fn generate_stack_comment_for_branch(snapshot: &RepoSnapshot, branch: &BranchName) -> String {
     let input = build_stack_comment_input(snapshot, branch);
+    generate_stack_comment(&input)
+}
+
+/// Generate a stack comment body for a branch, fetching PR info from forge.
+///
+/// Use this variant after creating PRs when metadata hasn't been persisted yet.
+///
+/// # Arguments
+///
+/// * `forge` - The forge to fetch PR info from
+/// * `snapshot` - Repository snapshot
+/// * `branch` - The branch to generate the stack comment for
+///
+/// # Returns
+///
+/// The generated stack comment string (including markers).
+pub async fn generate_stack_comment_for_branch_from_forge(
+    forge: &dyn Forge,
+    snapshot: &RepoSnapshot,
+    branch: &BranchName,
+) -> String {
+    let input = build_stack_comment_input_from_forge(forge, snapshot, branch).await;
     generate_stack_comment(&input)
 }
 
@@ -150,6 +258,30 @@ pub fn generate_merged_body(
     branch: &BranchName,
 ) -> String {
     let stack_comment = generate_stack_comment_for_branch(snapshot, branch);
+    merge_stack_comment(existing_body, &stack_comment)
+}
+
+/// Generate a merged PR body with updated stack comment, fetching PR info from forge.
+///
+/// Use this variant after creating PRs when metadata hasn't been persisted yet.
+///
+/// # Arguments
+///
+/// * `forge` - The forge to fetch PR info from
+/// * `existing_body` - The current PR body (may be None)
+/// * `snapshot` - Repository snapshot
+/// * `branch` - The branch this PR is for
+///
+/// # Returns
+///
+/// The merged body string with updated stack comment.
+pub async fn generate_merged_body_from_forge(
+    forge: &dyn Forge,
+    existing_body: Option<&str>,
+    snapshot: &RepoSnapshot,
+    branch: &BranchName,
+) -> String {
+    let stack_comment = generate_stack_comment_for_branch_from_forge(forge, snapshot, branch).await;
     merge_stack_comment(existing_body, &stack_comment)
 }
 
@@ -231,6 +363,7 @@ pub async fn update_pr_stack_comment(
 /// Update stack comments for all PRs in a set of branches.
 ///
 /// This is used by `sync` to refresh stack comments after detecting changes.
+/// Uses metadata for PR info.
 ///
 /// # Arguments
 ///
@@ -253,6 +386,90 @@ pub async fn update_stack_comments_for_branches(
     for branch in branches {
         if update_pr_stack_comment(forge, snapshot, branch, quiet).await? {
             updated_count += 1;
+        }
+    }
+
+    Ok(updated_count)
+}
+
+/// Update stack comments for all PRs in a set of branches, fetching PR info from forge.
+///
+/// Use this after creating PRs when metadata hasn't been persisted yet.
+/// This variant looks up PR info directly from the forge API.
+///
+/// # Arguments
+///
+/// * `forge` - The forge implementation to use
+/// * `snapshot` - Repository snapshot with graph structure
+/// * `branches` - The branches whose PRs should be updated
+/// * `quiet` - If true, suppress progress output
+///
+/// # Returns
+///
+/// The number of PRs that were successfully updated.
+pub async fn update_stack_comments_for_branches_from_forge(
+    forge: &dyn Forge,
+    snapshot: &RepoSnapshot,
+    branches: &[BranchName],
+    quiet: bool,
+) -> Result<usize> {
+    let mut updated_count = 0;
+
+    for branch in branches {
+        // Look up PR by head branch name
+        let pr = match forge.find_pr_by_head(branch.as_str()).await {
+            Ok(Some(pr)) => pr,
+            Ok(None) => continue, // No PR for this branch
+            Err(e) => {
+                if !quiet {
+                    eprintln!("  Warning: Could not find PR for '{}': {}", branch, e);
+                }
+                continue;
+            }
+        };
+
+        // Fetch current PR body
+        let existing_body = match forge.get_pr(pr.number).await {
+            Ok(fetched_pr) => fetched_pr.body,
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "  Warning: Could not fetch PR #{} for '{}': {}",
+                        pr.number, branch, e
+                    );
+                }
+                continue;
+            }
+        };
+
+        // Generate merged body using forge-based lookup
+        let new_body =
+            generate_merged_body_from_forge(forge, existing_body.as_deref(), snapshot, branch)
+                .await;
+
+        // Update PR
+        let update_req = UpdatePrRequest {
+            number: pr.number,
+            title: None,
+            body: Some(new_body),
+            base: None,
+        };
+
+        match forge.update_pr(update_req).await {
+            Ok(_) => {
+                if !quiet {
+                    println!("  Updated stack comment for PR #{} ({})", pr.number, branch);
+                }
+                updated_count += 1;
+            }
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "  Warning: Could not update stack comment for PR #{}: {}",
+                        pr.number, e
+                    );
+                }
+            }
         }
     }
 
