@@ -2,8 +2,13 @@
 name = "lattice"
 version = "0.1.1"
 edition = "2021"
-description = "A Rust-native CLI for stacked branches and PRs"
+description = "CLI for stacked branches and PRs"
 license = "MIT"
+repository = "https://github.com/kofron/lattice"
+homepage = "https://github.com/kofron/lattice"
+readme = "README.md"
+keywords = ["git", "stacked-branches", "cli", "github", "workflow"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "lt"
