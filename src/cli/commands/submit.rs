@@ -43,7 +43,9 @@
 use crate::engine::Context;
 use anyhow::{bail, Result};
 
-use super::stack_comment_ops::{generate_merged_body, update_stack_comments_for_branches};
+use super::stack_comment_ops::{
+    generate_merged_body, update_stack_comments_for_branches_from_forge,
+};
 
 /// Submit options parsed from CLI arguments.
 #[derive(Debug)]
@@ -275,14 +277,13 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                         // Get commit message for title
                         let title = format!("{}", branch);
 
-                        // Generate stack comment for PR body
-                        let body = generate_merged_body(None, &snapshot, branch);
-
+                        // Create PR initially without stack comment body
+                        // (we'll update it immediately after to include correct PR number)
                         let create_req = CreatePrRequest {
                             head: branch.as_str().to_string(),
                             base,
                             title,
-                            body: Some(body),
+                            body: None,
                             draft: opts.draft,
                         };
 
@@ -329,30 +330,15 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
     // After all PRs are created/updated, refresh stack comments for all PRs
     // This ensures newly created PRs are reflected in existing PR descriptions
     if !opts.dry_run {
-        // Re-scan to get updated PR linkage state
-        let updated_snapshot = scan(&git)?;
-
-        // Get all branches that have PRs
-        let branches_with_prs: Vec<_> = branches
-            .iter()
-            .filter(|b| {
-                updated_snapshot
-                    .metadata
-                    .get(*b)
-                    .map(|m| !matches!(m.metadata.pr, crate::core::metadata::schema::PrState::None))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        if !branches_with_prs.is_empty() && !ctx.quiet {
+        if !ctx.quiet {
             println!("Refreshing stack comments...");
         }
 
-        let updated = update_stack_comments_for_branches(
+        // Use forge-based lookup since metadata may not have been persisted yet
+        let updated = update_stack_comments_for_branches_from_forge(
             forge.as_ref(),
-            &updated_snapshot,
-            &branches_with_prs,
+            &snapshot,
+            &branches,
             ctx.quiet,
         )
         .await?;
