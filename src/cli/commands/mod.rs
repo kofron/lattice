@@ -45,6 +45,7 @@ mod restack;
 mod revert;
 mod split;
 mod squash;
+pub mod stack_comment_ops;
 mod submit;
 mod sync;
 mod track;

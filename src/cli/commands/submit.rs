@@ -9,6 +9,7 @@
 //! - Creates or updates PRs via GitHub API
 //! - Links PRs in branch metadata
 //! - Optionally restacks before submitting
+//! - Generates stack comments in PR descriptions
 //!
 //! # Algorithm
 //!
@@ -17,10 +18,11 @@
 //! 3. For each branch in stack order:
 //!    - Determine PR base (parent branch or trunk)
 //!    - Push if changed (or --always)
-//!    - Create/update PR via forge
+//!    - Create/update PR via forge (with stack comment)
 //!    - Handle draft toggle
 //!    - Request reviewers if specified
 //! 4. Update metadata with PR linkage
+//! 5. Update stack comments for all PRs in stack
 //!
 //! # Example
 //!
@@ -40,6 +42,10 @@
 
 use crate::engine::Context;
 use anyhow::{bail, Result};
+
+use super::stack_comment_ops::{
+    generate_merged_body, update_stack_comments_for_branches_from_forge,
+};
 
 /// Submit options parsed from CLI arguments.
 #[derive(Debug)]
@@ -210,11 +216,15 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                     println!("Updating PR #{} for '{}'...", number, branch);
                 }
 
+                // Fetch existing PR body and merge with updated stack comment
+                let existing_body = forge.get_pr(*number).await.ok().and_then(|pr| pr.body);
+                let body = generate_merged_body(existing_body.as_deref(), &snapshot, branch);
+
                 let update_req = crate::forge::UpdatePrRequest {
                     number: *number,
                     base: Some(base),
                     title: None,
-                    body: None,
+                    body: Some(body),
                 };
 
                 match forge.update_pr(update_req).await {
@@ -267,6 +277,8 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                         // Get commit message for title
                         let title = format!("{}", branch);
 
+                        // Create PR initially without stack comment body
+                        // (we'll update it immediately after to include correct PR number)
                         let create_req = CreatePrRequest {
                             head: branch.as_str().to_string(),
                             base,
@@ -312,6 +324,27 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                     }
                 }
             }
+        }
+    }
+
+    // After all PRs are created/updated, refresh stack comments for all PRs
+    // This ensures newly created PRs are reflected in existing PR descriptions
+    if !opts.dry_run {
+        if !ctx.quiet {
+            println!("Refreshing stack comments...");
+        }
+
+        // Use forge-based lookup since metadata may not have been persisted yet
+        let updated = update_stack_comments_for_branches_from_forge(
+            forge.as_ref(),
+            &snapshot,
+            &branches,
+            ctx.quiet,
+        )
+        .await?;
+
+        if updated > 0 && !ctx.quiet {
+            println!("  Updated {} PR description(s)", updated);
         }
     }
 

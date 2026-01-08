@@ -8,6 +8,7 @@
 //! - Fetches from remote
 //! - Fast-forwards trunk (or errors if diverged without --force)
 //! - Detects merged/closed PRs and prompts to delete local branches
+//! - Updates stack comments in PR descriptions
 //! - Optionally restacks after syncing
 //!
 //! # Example
@@ -25,6 +26,8 @@
 
 use crate::engine::Context;
 use anyhow::{bail, Result};
+
+use super::stack_comment_ops::update_stack_comments_for_branches;
 
 /// Run the sync command.
 ///
@@ -148,21 +151,30 @@ async fn sync_async(ctx: &Context, force: bool, restack: bool) -> Result<()> {
         println!("Trunk '{}' is up to date.", trunk);
     }
 
-    // Check PR states for tracked branches (requires auth)
+    // Check PR states for tracked branches and update stack comments (requires auth)
     if let Ok(token) = get_github_token() {
         let remote_url = git.remote_url("origin")?;
         if let Some(url) = remote_url {
             if let Ok(forge) = crate::forge::create_forge(&url, &token, None) {
+                let mut open_branches = Vec::new();
+
                 for (branch, scanned) in &snapshot.metadata {
                     if let PrState::Linked { number, .. } = &scanned.metadata.pr {
                         match forge.get_pr(*number).await {
                             Ok(pr) => {
-                                if (pr.state == ForgePrState::Merged
-                                    || pr.state == ForgePrState::Closed)
-                                    && !ctx.quiet
+                                if pr.state == ForgePrState::Merged
+                                    || pr.state == ForgePrState::Closed
                                 {
-                                    println!("PR #{} for '{}' is {}.", number, branch, pr.state);
-                                    // Would prompt to delete in interactive mode
+                                    if !ctx.quiet {
+                                        println!(
+                                            "PR #{} for '{}' is {}.",
+                                            number, branch, pr.state
+                                        );
+                                        // Would prompt to delete in interactive mode
+                                    }
+                                } else {
+                                    // PR is still open, track for stack comment update
+                                    open_branches.push(branch.clone());
                                 }
                             }
                             Err(e) => {
@@ -174,6 +186,26 @@ async fn sync_async(ctx: &Context, force: bool, restack: bool) -> Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Update stack comments for all open PRs
+                // This keeps PR descriptions in sync after merges/changes
+                if !open_branches.is_empty() {
+                    if !ctx.quiet {
+                        println!("Updating stack comments...");
+                    }
+
+                    let updated = update_stack_comments_for_branches(
+                        forge.as_ref(),
+                        &snapshot,
+                        &open_branches,
+                        ctx.quiet,
+                    )
+                    .await?;
+
+                    if updated > 0 && !ctx.quiet {
+                        println!("  Updated {} PR description(s)", updated);
                     }
                 }
             }

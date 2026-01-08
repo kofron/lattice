@@ -119,6 +119,8 @@ pub struct PullRequest {
     pub base: String,
     /// PR title
     pub title: String,
+    /// PR body/description
+    pub body: Option<String>,
     /// GraphQL node ID (for draft toggle mutations)
     pub node_id: Option<String>,
 }

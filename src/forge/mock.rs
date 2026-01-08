@@ -150,6 +150,7 @@ impl MockForge {
     ///     head: "feature".to_string(),
     ///     base: "main".to_string(),
     ///     title: "Existing PR".to_string(),
+    ///     body: Some("PR description".to_string()),
     ///     node_id: Some("PR_123".to_string()),
     /// };
     ///
@@ -304,6 +305,7 @@ impl Forge for MockForge {
             head: request.head,
             base: request.base,
             title: request.title,
+            body: request.body,
             node_id: Some(format!("PR_{}", number)),
         };
 
@@ -331,6 +333,9 @@ impl Forge for MockForge {
 
         if let Some(title) = request.title {
             pr.title = title;
+        }
+        if let Some(body) = request.body {
+            pr.body = Some(body);
         }
         if let Some(base) = request.base {
             pr.base = base;
@@ -714,6 +719,7 @@ mod tests {
             head: "existing".into(),
             base: "main".into(),
             title: "Existing PR".into(),
+            body: Some("Description".into()),
             node_id: Some("PR_42".into()),
         };
 
@@ -754,6 +760,7 @@ mod tests {
                 head: "a".into(),
                 base: "main".into(),
                 title: "A".into(),
+                body: None,
                 node_id: None,
             },
             PullRequest {
@@ -764,6 +771,7 @@ mod tests {
                 head: "b".into(),
                 base: "main".into(),
                 title: "B".into(),
+                body: None,
                 node_id: None,
             },
         ]);

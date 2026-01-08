@@ -523,6 +523,7 @@ struct GitHubPullRequest {
     head: GitHubRef,
     base: GitHubRef,
     title: String,
+    body: Option<String>,
     node_id: String,
     merged: Option<bool>,
 }
@@ -566,6 +567,7 @@ impl From<GitHubPullRequest> for PullRequest {
             head: pr.head.ref_name,
             base: pr.base.ref_name,
             title: pr.title,
+            body: pr.body,
             node_id: Some(pr.node_id),
         }
     }
@@ -777,6 +779,7 @@ mod tests {
                     ref_name: "main".to_string(),
                 },
                 title: "Add feature".to_string(),
+                body: Some("PR description".to_string()),
                 node_id: "PR_123".to_string(),
                 merged: Some(false),
             };
@@ -789,6 +792,7 @@ mod tests {
             assert_eq!(pr.head, "feature");
             assert_eq!(pr.base, "main");
             assert_eq!(pr.title, "Add feature");
+            assert_eq!(pr.body, Some("PR description".to_string()));
             assert_eq!(pr.node_id, Some("PR_123".to_string()));
         }
 
@@ -806,6 +810,7 @@ mod tests {
                     ref_name: "main".to_string(),
                 },
                 title: "WIP: Add feature".to_string(),
+                body: None,
                 node_id: "PR_123".to_string(),
                 merged: None,
             };
@@ -813,6 +818,7 @@ mod tests {
             let pr: PullRequest = gh_pr.into();
             assert!(pr.is_draft);
             assert_eq!(pr.state, PrState::Open);
+            assert!(pr.body.is_none());
         }
 
         #[test]
@@ -829,6 +835,7 @@ mod tests {
                     ref_name: "main".to_string(),
                 },
                 title: "Add feature".to_string(),
+                body: Some("Merged!".to_string()),
                 node_id: "PR_123".to_string(),
                 merged: Some(true),
             };
@@ -851,6 +858,7 @@ mod tests {
                     ref_name: "main".to_string(),
                 },
                 title: "Add feature".to_string(),
+                body: None,
                 node_id: "PR_123".to_string(),
                 merged: Some(false),
             };
