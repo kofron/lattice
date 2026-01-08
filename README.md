@@ -30,7 +30,7 @@ I'm using this day-to-day, and I love it.  YMMV.
 
 ```bash
 # Install from crates.io
-cargo install lattice
+cargo install latticework
 
 # Or build from source
 cargo install --path .
