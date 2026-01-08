@@ -29,7 +29,10 @@ I'm using this day-to-day, and I love it.  YMMV.
 ## Quick Start
 
 ```bash
-# Install (from source for now)
+# Install from crates.io
+cargo install lattice
+
+# Or build from source
 cargo install --path .
 
 # Initialize in your repo

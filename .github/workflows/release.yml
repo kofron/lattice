@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Need full history for tag check
+          fetch-depth: 0 # Need full history for tag check
 
       - name: Get version from Cargo.toml
         id: version
@@ -85,10 +85,25 @@ jobs:
           name: lt-${{ matrix.target }}
           path: lt-${{ matrix.target }}.tar.gz
 
+  # Publish to crates.io
+  publish:
+    name: Publish to crates.io
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   # Create release and upload binaries
   release:
     name: Create Release
-    needs: [check-version, build]
+    needs: [check-version, build, publish]
     if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
