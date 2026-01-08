@@ -1,0 +1,68 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust-native CLI for stacked branches and PRs"
+license = "MIT"
+
+[[bin]]
+name = "lt"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Git (via git2 per ROADMAP reconciliation 0.4)
+# Using vendored-openssl to avoid system OpenSSL dependency
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10.9"
+hex = "0.4.3"
+dirs = "6.0.0"
+
+# File locking for RepoLock
+fs2 = "0.4"
+
+# Async runtime and HTTP (for GitHub integration)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+
+# Password input (for auth command)
+rpassword = "7"
+
+# Keychain access (optional)
+keyring = { version = "3", optional = true }
+
+[dev-dependencies]
+# Testing
+assert_cmd = "2"
+assert_fs = "1"
+tempfile = "3"
+insta = "1"
+proptest = "1"
+predicates = "3"
+rand = "0.9.2"
+tokio-test = "0.4"
+wiremock = "0.6"
+
+[features]
+default = []
+keychain = ["dep:keyring"]  # Enable keychain secret storage
+fault_injection = []    # Enable fault injection for testing
+live_github_tests = []  # Enable live GitHub API tests
+gitlab = []             # Enable GitLab forge (stub for multi-forge scaffolding)
