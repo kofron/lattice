@@ -277,6 +277,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .expect("create lock file");
 
@@ -302,6 +303,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .expect("open 1");
         file1.try_lock_exclusive().expect("lock 1");
@@ -340,6 +342,7 @@ mod tests {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&path)
                 .expect("open");
             file.try_lock_exclusive().expect("lock");
