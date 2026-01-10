@@ -13,6 +13,7 @@
 //! - [`core`] - Domain types, schemas, verification, and operations
 //! - [`git`] - Single interface for all Git operations
 //! - [`forge`] - Abstraction for remote forges (GitHub v1)
+//! - [`auth`] - GitHub App OAuth authentication
 //! - [`secrets`] - Secret storage abstraction
 //! - [`doctor`] - Explicit repair framework
 //! - [`ui`] - User interaction utilities
@@ -26,6 +27,7 @@
 //! 3. Repository state is never silently corrupted
 //! 4. Repairs are explicit and require user confirmation
 
+pub mod auth;
 pub mod cli;
 pub mod core;
 pub mod doctor;

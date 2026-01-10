@@ -285,10 +285,17 @@ Representative capabilities:
 * `ScopeResolved`
 * `FrozenPolicySatisfied`
 * `WorkingCopyStateKnown`
-* `AuthAvailable`
-* `RemoteResolved`
+* `AuthAvailable(host)` – A valid GitHub App user access token exists for the specified host OR can be refreshed
+* `RemoteResolved(owner, repo)` – The git remote can be parsed to identify the owner and repository
+* `RepoAuthorized(owner, repo)` – The authenticated user's token has access to the specified repository via an installed GitHub App
 
 A capability either exists or does not. “Partial” capability is represented as absence plus an issue in the health report.
+
+**Capability derivation for GitHub auth:**
+
+* `AuthAvailable(host)`: Check SecretStore for a valid token bundle. If access token is expired but refresh token is valid, the capability is satisfied (refresh will occur on demand).
+* `RemoteResolved(owner, repo)`: Parse the git remote URL (typically `origin`) to extract the GitHub owner and repository name.
+* `RepoAuthorized(owner, repo)`: Query the GitHub installations API (`GET /user/installations` and `GET /user/installations/{id}/repositories`) to verify the GitHub App is installed and authorized for the repository. Cache the result for a short TTL (e.g., 10 minutes).
 
 ### 5.3 Command requirement sets
 
@@ -375,6 +382,14 @@ Architecturally prohibited:
 
 Reviewers MUST treat violations as correctness bugs.
 
+**Scope clarification for SecretStore writes:**
+
+The single transactional write path applies to **repository state** (refs, metadata, config). SecretStore writes (token storage, token refresh) are outside repository invariants but must be guarded by:
+
+* Auth-scoped file locking (one refresh at a time per host)
+* Strict redaction policies (tokens never in logs, errors, or outputs)
+* Atomic write semantics (temp file + rename)
+
 ---
 
 ## 7. Out-of-band divergence detection
@@ -452,6 +467,25 @@ A `FixOption` contains:
 * a concrete repair plan
 
 Doctor MUST always present fix options as choices. Doctor MUST never apply a fix without explicit confirmation.
+
+**Authentication-related issues:**
+
+Some blocking issues require **user actions** rather than repository mutations. These issues produce fix options that direct the user to perform an external action rather than generating an Executor plan:
+
+* `AuthenticationRequired` (Blocking)
+  * Condition: No valid token exists for the required host
+  * Fix: User action – run `lattice auth login`
+  * Message: "Not authenticated. Run `lattice auth login`."
+
+* `AppNotInstalled` (Blocking)
+  * Condition: GitHub App is not installed or not authorized for the repository
+  * Fix: User action – install the GitHub App
+  * Message: "GitHub App not installed for {owner}/{repo}. Install at: https://github.com/apps/lattice/installations/new"
+
+* `TokenExpired` (Blocking)
+  * Condition: Both access token and refresh token have expired
+  * Fix: User action – re-authenticate
+  * Message: "Authentication expired. Run `lattice auth login` again."
 
 ### 8.3 Confirmation model
 
@@ -573,6 +607,45 @@ PR linkage and status are cached fields:
 * absence is not a structural error
 * staleness is not a structural error
 * commands that require PR linkage (like `pr`) gate on availability of cached linkage or on the ability to resolve it via adapter query
+
+### 11.3 Authentication Manager
+
+The AuthManager is responsible for providing valid authentication credentials to host adapters.
+
+**Responsibilities:**
+
+* Load token bundle from SecretStore
+* Refresh tokens when expired (with auth-scoped locking)
+* Redact secrets in all logs, errors, and outputs
+* Never participate in repository mutation plans
+
+**Interface shape:**
+
+```rust
+#[async_trait::async_trait]
+pub trait TokenProvider: Send + Sync {
+    /// Returns a valid bearer token, refreshing if necessary.
+    /// Acquires auth lock during refresh to prevent race conditions.
+    async fn bearer_token(&self) -> Result<String, AuthError>;
+    
+    /// Check if authentication is available without refreshing.
+    fn is_authenticated(&self) -> bool;
+}
+```
+
+**Locking contract:**
+
+* Auth refresh lock at `~/.lattice/auth/lock.<host>`
+* Must be acquired before any token refresh operation
+* Read operations may proceed without lock but must re-check after acquiring lock if refresh needed
+
+**Error handling:**
+
+* `AuthError::NotAuthenticated` – No token exists for the host
+* `AuthError::RefreshFailed` – Refresh token is invalid or expired
+* `AuthError::LockContention` – Could not acquire auth lock (retry with backoff)
+
+The AuthManager is invoked by host adapters (e.g., GitHubForge) on each API request. It is responsible for ensuring that the bearer token is valid at the time of the request, refreshing transparently if needed.
 
 ---
 

@@ -125,11 +125,11 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
 
         // Phase B: Setup Commands
         Command::Auth {
-            token,
+            no_browser,
             host,
             status,
             logout,
-        } => auth::auth(ctx, token.as_deref(), &host, status, logout),
+        } => auth::auth(ctx, &host, no_browser, status, logout),
         Command::Init {
             trunk,
             reset,

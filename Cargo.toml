@@ -52,6 +52,7 @@ rpassword = "7"
 
 # Keychain access (optional)
 keyring = { version = "3", optional = true }
+open = "5.3.3"
 
 [dev-dependencies]
 # Testing

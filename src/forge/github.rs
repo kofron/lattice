@@ -220,6 +220,22 @@ impl GitHubForge {
         response: Response,
         status: StatusCode,
     ) -> Result<T, ForgeError> {
+        // Extract permission headers before consuming response body.
+        // GitHub Apps use X-Accepted-GitHub-Permissions, classic OAuth uses X-Accepted-OAuth-Scopes.
+        let headers = response.headers();
+        let required_permissions = headers
+            .get("X-Accepted-GitHub-Permissions")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let required_scopes = headers
+            .get("X-Accepted-OAuth-Scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let granted_scopes = headers
+            .get("X-OAuth-Scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         // Try to get error message from body
         let message = match response.json::<GitHubErrorResponse>().await {
             Ok(err) => err.message,
@@ -229,7 +245,25 @@ impl GitHubForge {
         Err(match status {
             StatusCode::UNAUTHORIZED => ForgeError::AuthFailed("Invalid or expired token".into()),
             StatusCode::FORBIDDEN => {
-                ForgeError::AuthFailed(format!("Permission denied: {}", message))
+                let mut err_msg = format!("Permission denied: {}", message);
+
+                // For GitHub Apps, show the fine-grained permissions required
+                if let Some(perms) = required_permissions {
+                    if !perms.is_empty() {
+                        err_msg.push_str(&format!(" [required: {}]", perms));
+                    }
+                }
+                // For classic OAuth, show scopes
+                else if let Some(scopes) = required_scopes {
+                    if !scopes.is_empty() {
+                        err_msg.push_str(&format!(" [required scopes: {}]", scopes));
+                        if let Some(granted) = granted_scopes {
+                            err_msg.push_str(&format!(" [granted: {}]", granted));
+                        }
+                    }
+                }
+
+                ForgeError::AuthFailed(err_msg)
             }
             StatusCode::NOT_FOUND => ForgeError::NotFound(message),
             StatusCode::UNPROCESSABLE_ENTITY => ForgeError::ApiError {

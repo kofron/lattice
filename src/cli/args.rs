@@ -273,21 +273,20 @@ WORKFLOW EXAMPLES:
     },
 
     // ========== Phase B: Setup Commands ==========
-    /// Authenticate with a remote forge (GitHub)
+    /// Authenticate with GitHub using OAuth device flow
     #[command(
         name = "auth",
-        long_about = "Authenticate with GitHub to enable PR creation and management.\n\n\
-            Lattice needs a GitHub personal access token to create PRs, update PR \
-            descriptions, and merge PRs on your behalf. The token is stored securely \
-            in your system keychain.",
+        long_about = "Authenticate with GitHub using OAuth device flow.\n\n\
+            Lattice uses GitHub App OAuth to authenticate. This is more secure than \
+            personal access tokens and supports automatic token refresh. Your browser \
+            will open to authorize the Lattice GitHub App.",
         after_help = "\
 WORKFLOW EXAMPLES:
-    # Interactive authentication (recommended)
+    # Authenticate (opens browser automatically)
     lt auth
-    # Opens browser for GitHub token creation, then prompts for token
 
-    # Non-interactive (for CI/scripts)
-    lt auth --token ghp_xxxxxxxxxxxx
+    # Authenticate without opening browser
+    lt auth --no-browser
 
     # Check if you're authenticated
     lt auth --status
@@ -295,19 +294,20 @@ WORKFLOW EXAMPLES:
     # Remove stored credentials
     lt auth --logout
 
-GETTING STARTED:
-    1. Run 'lt auth' and follow the prompts
-    2. Create a token at GitHub with 'repo' scope
-    3. Paste the token when prompted
-    4. You're ready to use 'lt submit' and 'lt merge'"
+HOW IT WORKS:
+    1. Run 'lt auth' to start the device flow
+    2. Your browser opens to GitHub's authorization page
+    3. Enter the code displayed in your terminal
+    4. Authorize the Lattice app
+    5. You're ready to use 'lt submit' and 'lt merge'"
     )]
     Auth {
-        /// Provide token non-interactively
+        /// Do not attempt to open browser automatically
         #[arg(long)]
-        token: Option<String>,
+        no_browser: bool,
 
-        /// Host to authenticate with
-        #[arg(long, default_value = "github")]
+        /// GitHub host to authenticate with
+        #[arg(long, default_value = "github.com")]
         host: String,
 
         /// Show current authentication status
