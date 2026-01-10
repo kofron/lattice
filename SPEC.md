@@ -295,7 +295,7 @@ All GitHub App auth secrets are keyed by host. v1 supports `github.com` by defau
   "schema_version": 1,
 
   "host": "github.com",
-  "client_id": "Iv23liIqb9vJ8kaRyZaU",
+  "client_id": "<GITHUB_APP_CLIENT_ID>",
 
   "user": {
     "id": 1234567,
@@ -595,7 +595,7 @@ Each command section includes:
 `lattice auth login`:
 
 1. Resolves GitHub host (default `github.com`).
-2. Starts device flow using the canonical client ID (`Iv23liIqb9vJ8kaRyZaU`):
+2. Starts device flow using the canonical client ID (see `GITHUB_APP_CLIENT_ID` in source):
    * requests a device code via `POST https://github.com/login/device/code`
    * prints the verification URL and user code to the terminal
    * optionally opens a browser to the verification URL (unless `--no-browser`)
