@@ -234,8 +234,7 @@ Global config search order:
 
 Repo config location:
 
-* `.git/lattice/repo.toml` (canonical)
-* Optional compatibility read-only: `.lattice/repo.toml` if present (warn and prefer `.git/lattice/repo.toml`)
+* `.git/lattice/config.toml` (canonical)
 
 Precedence:
 
@@ -262,14 +261,96 @@ Repo config includes:
 
 ---
 
-### 4.4 Secret storage abstraction
+### 4.4 Secret storage abstraction – GitHub App OAuth tokens
 
-Lattice must not hardcode token storage into config parsing.
+Lattice authenticates to GitHub using **GitHub App OAuth device flow**. This section defines how authentication tokens are stored and managed.
+
+#### 4.4.1 What we store
+
+Lattice stores **GitHub App user auth** for API access:
+
+* `access_token` (short-lived bearer token, starts with `ghu_`)
+* `refresh_token` (rotating, single-use on refresh, starts with `ghr_`)
+* expiration timestamps for both
+* a minimal identity cache for display (durable GitHub user id + login)
+
+Tokens are stored via `SecretStore` and MUST never be written into:
+
+* repo config
+* metadata refs
+* event ledger
+* journal/op-state markers
+
+#### 4.4.2 Secret keys and formats
+
+All GitHub App auth secrets are keyed by host. v1 supports `github.com` by default.
+
+**SecretStore key pattern:** `github_app.oauth.<host>`
+
+**Stored value (JSON, UTF-8, schema-versioned):**
+
+```json
+{
+  "kind": "lattice.github-app-oauth",
+  "schema_version": 1,
+
+  "host": "github.com",
+  "client_id": "Iv23liIqb9vJ8kaRyZaU",
+
+  "user": {
+    "id": 1234567,
+    "login": "octocat"
+  },
+
+  "tokens": {
+    "access_token": "ghu_...",
+    "access_token_expires_at": "2026-01-10T12:34:56Z",
+
+    "refresh_token": "ghr_...",
+    "refresh_token_expires_at": "2026-07-10T12:34:56Z"
+  },
+
+  "timestamps": {
+    "created_at": "2026-01-10T12:00:00Z",
+    "updated_at": "2026-01-10T12:34:56Z"
+  }
+}
+```
+
+#### 4.4.3 Concurrency and refresh safety
+
+Refresh tokens are **single-use** and rotate on each refresh. To prevent double-refresh races across concurrent `lattice` invocations, Lattice MUST use an auth-scoped lock:
+
+* Lock path: `~/.lattice/auth/lock.<host>` (advisory file lock)
+
+Rules:
+
+* Any code path that may refresh tokens MUST hold this lock.
+* Reads may proceed without the lock, but if the access token is expired or near-expiry, the refresher must acquire the lock and re-check before refreshing.
+* The lock is held only for the duration of the refresh operation, not the entire command.
+
+#### 4.4.4 Redaction hard rule
+
+Tokens MUST never appear in:
+
+* logs (including `--debug` output)
+* JSON outputs
+* journal/op-state markers
+* doctor explanations
+* error messages
+
+All error reporting must redact:
+
+* values that match `ghu_*` and `ghr_*` patterns
+* `Authorization` headers
+* request/response bodies from OAuth token endpoints
+
+#### 4.4.5 SecretStore trait
 
 Define trait:
 
 ```rust
-/// Stores and retrieves secrets like PATs.
+/// Stores and retrieves secrets like GitHub App OAuth tokens.
 /// Swappable so we can move from plaintext file to keychain later.
 pub trait SecretStore: Send + Sync {
     fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
@@ -280,7 +361,7 @@ pub trait SecretStore: Send + Sync {
 
 v1 MUST include:
 
-1. **FileSecretStore** (early compromise):
+1. **FileSecretStore** (default):
 
    * stores secrets in `~/.lattice/secrets.toml`
    * enforces file permissions `0600` on Unix
@@ -291,6 +372,36 @@ v1 MUST include:
    * enabled by config: `secrets.provider = "keychain"`
 
 **Important:** Even if keychain support is feature-gated initially, the core architecture must route through `SecretStore` so swapping providers does not rewrite command code.
+
+---
+
+### 4.5 Repo config additions – GitHub owner/repo context
+
+To manage authorization at the owner/repo level, Lattice stores **repo identity and authorization cache** in repo config.
+
+Repo config file location:
+
+* `.git/lattice/config.toml` (canonical)
+
+Add the following table to repo config:
+
+```toml
+[forge.github]
+host = "github.com"
+owner = "ORG_OR_USER"
+repo = "REPO_NAME"
+
+# Optional caches (may be missing/stale; never correctness-critical):
+installation_id = 12345
+repository_id = 67890
+authorized_at = "2026-01-10T12:00:00Z"
+```
+
+Notes:
+
+* `owner`/`repo` default to parsing the git remote URL; config acts as an override.
+* Cached ids (`installation_id`, `repository_id`) speed up "is the app installed for this repo?" checks but are not required for correctness.
+* `authorized_at` is a timestamp for cache invalidation (recommended TTL: 10 minutes).
 
 ---
 
@@ -461,38 +572,90 @@ Each command section includes:
 
 # 8A. Setup and configuration
 
-## 8A.1 `lattice auth`
+## 8A.1 `lattice auth` (GitHub App device flow)
 
 **Docs:** `docs/commands/auth.md`
 
 ### Synopsis
 
-* `lattice auth`
-* `lattice auth --token <TOKEN>`
-* `lattice auth --provider file|keychain` (optional)
+* `lattice auth` (alias for `lattice auth login`)
+* `lattice auth login`
+* `lattice auth status`
+* `lattice auth logout`
+* `lattice auth login --host github.com` (future-proofing; v1 default is github.com)
+* `lattice auth login --no-browser` (do not attempt to open a browser)
 
 ### Flags
 
-* `--token <token>`: provide token non-interactively
-* `--host github` (reserved for future multi-forge)
-* `--provider <provider>`: override config provider for this run
+* `--host <host>`: GitHub host (default: `github.com`, reserved for future enterprise support)
+* `--no-browser`: do not attempt to open the verification URL in a browser
 
-### Behavior
+### Behavior: login (device flow)
 
-* Stores GitHub token using `SecretStore` under key: `github.pat`.
-* If interactive and `--token` absent, prompt with masked input.
-* Never prints token. Never logs token even in debug.
+`lattice auth login`:
+
+1. Resolves GitHub host (default `github.com`).
+2. Starts device flow using the canonical client ID (`Iv23liIqb9vJ8kaRyZaU`):
+   * requests a device code via `POST https://github.com/login/device/code`
+   * prints the verification URL and user code to the terminal
+   * optionally opens a browser to the verification URL (unless `--no-browser`)
+3. Polls `POST https://github.com/login/oauth/access_token` until success, cancellation, or expiration.
+   * handles `authorization_pending` by continuing to poll
+   * handles `slow_down` by increasing the polling interval
+4. On success:
+   * stores tokens (access + refresh + expirations) via `SecretStore` under key `github_app.oauth.<host>`
+   * calls `GET /user` to cache durable identity (id + login) for `auth status`
+5. Never prints tokens.
+
+### Behavior: status
+
+`lattice auth status` prints (non-secret):
+
+* host(s) logged in
+* GitHub user login + id
+* access token expiry (timestamp only, not the token)
+* whether current repo appears authorized for the GitHub App (best-effort check)
+
+### Behavior: logout
+
+`lattice auth logout`:
+
+* deletes `github_app.oauth.<host>` from `SecretStore`
+* clears any cached authorization fields in repo config for that host (best-effort)
+
+### Non-interactive rules
+
+* `lattice auth login` may be run in non-interactive mode.
+  * It will print the device URL and code and poll for completion.
+  * If additional choices are required (future multi-host), it must error with instructions.
 
 ### Integrity contract
 
-* Does not touch repo state. No lock required.
+* Auth does not mutate repository refs and requires no repo lock.
+* Auth writes MUST be atomic with respect to token refresh locking (see Section 4.4.3).
+
+### Errors (stable)
+
+| Condition | Exit Code | Message |
+|-----------|-----------|---------|
+| Missing auth for host | 1 | "Not authenticated. Run `lattice auth login`." |
+| Device flow disabled | 1 | "Device flow is disabled for this GitHub App. Enable 'Device Flow' in the app settings." |
+| Expired refresh token | 1 | "Authentication expired. Run `lattice auth login` again." |
+| User cancelled | 1 | "Authentication cancelled." |
+| Polling timeout | 1 | "Device flow expired. Please try again." |
 
 ### Behavioral tests
 
-* Store token via `--token` and verify retrievable by `SecretStore::get` (mocked).
-* Interactive prompt path works (stdin simulation).
-* Permissions enforced for file store (Unix test).
-* Token never appears in stdout/stderr snapshots.
+* Device flow happy path:
+  * mock `POST /login/device/code`
+  * mock repeated `POST /login/oauth/access_token` returning `authorization_pending` then success
+  * verify secret store write occurred and tokens never appear in stdout/stderr
+* `slow_down` handling increases polling interval correctly
+* Refresh flow:
+  * mock refresh response that rotates refresh_token
+  * verify single refresh under concurrent calls using lock (spawn two tasks; one refresh must win)
+* Logout removes secret key and does not leak token
+* Status displays user info without exposing tokens
 
 ---
 
@@ -513,7 +676,7 @@ Each command section includes:
 
 ### Behavior
 
-* Creates `.git/lattice/repo.toml` if missing.
+* Creates `.git/lattice/config.toml` if missing.
 * If trunk not specified and interactive: prompt to pick from local branches.
 * Writes trunk name to repo config.
 * On `--reset`:
@@ -1146,6 +1309,46 @@ Frozen rules:
 
 # 8E. Remote and PR integration (GitHub v1)
 
+## 8E.0 Auth gating for GitHub remote commands
+
+Commands that call GitHub APIs (`submit`, `sync`, `get`, `merge`, `pr` resolution when querying, etc.) require the following capabilities to be satisfied:
+
+* `AuthAvailable(host)` – A valid GitHub App user access token exists for the host OR can be refreshed
+* `RemoteResolved(owner, repo)` – The git remote can be parsed to identify the GitHub owner and repository
+* `RepoAuthorized(owner, repo)` – The GitHub App is installed and authorized for this repository (best-effort preflight)
+
+If `RepoAuthorized` cannot be established, the command MUST refuse with:
+
+* a clear explanation of why authorization failed
+* an install link for the GitHub App: `https://github.com/apps/lattice/installations/new`
+* exit code 1
+
+The command must not attempt destructive remote operations without verified authorization.
+
+### 8E.0.1 Determining "RepoAuthorized" (owner/repo level)
+
+Given `host`, `owner`, `repo`:
+
+1. Using the stored user access token, query installations accessible to the user token:
+   * `GET /user/installations`
+2. For each installation, query repositories accessible to the user token for that installation:
+   * `GET /user/installations/{installation_id}/repositories`
+   * Continue until the repo is found or all installations are exhausted.
+3. If found:
+   * Cache `installation_id` and `repository_id` in repo config (best-effort)
+   * Return `RepoAuthorized` capability
+4. If not found:
+   * Treat as "app not installed or not authorized for this repo"
+   * Output install instructions: `https://github.com/apps/lattice/installations/new`
+   * Exit code 1
+
+**Caching:**
+
+* Cache authorization checks for a short TTL (e.g., 10 minutes) in `.git/lattice/cache/github_auth.json`.
+* Repo config caches (`installation_id`, `repository_id`) are allowed to be stale and must never be trusted without validation.
+
+---
+
 ## 8E.1 Forge abstraction
 
 Define:
@@ -1165,6 +1368,23 @@ pub trait Forge: Send + Sync {
 ```
 
 v1 implements `GitHubForge`. Other adapters are stubs behind feature flags, but core must depend only on `Forge`.
+
+### TokenProvider integration
+
+Authentication is handled inside the GitHub adapter implementation by attaching a valid bearer token to each request. The adapter depends on a `TokenProvider` that yields a valid access token and refreshes when needed:
+
+```rust
+#[async_trait::async_trait]
+pub trait TokenProvider: Send + Sync {
+    /// Returns a valid bearer token, refreshing if necessary.
+    async fn bearer_token(&self) -> anyhow::Result<String>;
+}
+```
+
+The GitHub adapter MUST:
+
+* call `bearer_token()` per request (or per short-lived cached client)
+* retry once on 401/403 if the token is refreshable, then surface a stable auth error
 
 ---
 
@@ -1736,7 +1956,18 @@ Git:
 - git rebase documentation
 - git push --force-with-lease documentation
 
-GitHub:
+GitHub Auth (GitHub App device flow):
+- https://docs.github.com/en/apps/creating-github-apps/writing-code-for-a-github-app/building-a-cli-with-a-github-app
+- https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
+- https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens
+
+GitHub App Installation:
+- https://docs.github.com/en/apps/using-github-apps/installing-a-github-app-from-a-third-party
+
+GitHub App Installation/Repo Access Discovery:
+- https://docs.github.com/en/rest/apps/installations
+
+GitHub API:
 - REST Pull Requests API docs
 - REST Reviewers API docs
 - REST Merge API docs
