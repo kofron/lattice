@@ -78,6 +78,17 @@ pub enum Capability {
     ///
     /// This means no frozen branches will be modified by the operation.
     FrozenPolicySatisfied,
+
+    /// Working directory is available.
+    ///
+    /// Per SPEC.md §4.6.6, bare repositories lack a working directory,
+    /// which blocks commands that require checkout, staging, or working
+    /// tree operations. Commands are categorized as:
+    /// - Category A: Read-only (works everywhere)
+    /// - Category B: Metadata-only mutations (works in bare)
+    /// - Category C: Working-copy mutations (require this capability)
+    /// - Category D: Remote/API-only (may work in bare with restrictions)
+    WorkingDirectoryAvailable,
 }
 
 impl Capability {
@@ -103,6 +114,7 @@ impl Capability {
             Capability::AuthAvailable => "authentication is available",
             Capability::RemoteResolved => "remote is configured",
             Capability::FrozenPolicySatisfied => "frozen policy is satisfied",
+            Capability::WorkingDirectoryAvailable => "working directory is available",
         }
     }
 }
@@ -259,6 +271,7 @@ mod tests {
                 Capability::AuthAvailable,
                 Capability::RemoteResolved,
                 Capability::FrozenPolicySatisfied,
+                Capability::WorkingDirectoryAvailable,
             ];
 
             for cap in caps {

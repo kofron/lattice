@@ -38,6 +38,7 @@ use crate::core::graph::StackGraph;
 use crate::core::metadata::schema::BranchMetadataV1;
 use crate::core::metadata::store::{MetadataStore, StoreError};
 use crate::core::ops::journal::OpState;
+use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Fingerprint, Oid, RefName};
 use crate::git::{Git, GitError, GitState, RepoInfo, WorktreeStatus};
 
@@ -203,13 +204,22 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
     }
 
     // Check for Lattice op in progress
-    if let Some(op_state) = OpState::read(&info.git_dir).unwrap_or(None) {
+    let paths = LatticePaths::from_repo_info(&info);
+    if let Some(op_state) = OpState::read(&paths).unwrap_or(None) {
         health.add_issue(issues::lattice_operation_in_progress(
             &op_state.command,
             op_state.op_id.as_str(),
         ));
     } else {
         health.add_capability(Capability::NoLatticeOpInProgress);
+    }
+
+    // Check for working directory availability
+    // Per SPEC.md §4.6.6, bare repositories lack a working directory
+    if info.work_dir.is_some() {
+        health.add_capability(Capability::WorkingDirectoryAvailable);
+    } else {
+        health.add_issue(issues::no_working_directory());
     }
 
     // Get worktree status
@@ -219,9 +229,11 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
     // Get current branch
     let current_branch = git.current_branch().unwrap_or(None);
 
-    // Load repo config
-    let repo_config = Config::load(Some(&info.work_dir))
-        .ok()
+    // Load repo config (using work_dir if available, otherwise None for bare repos)
+    let repo_config = info
+        .work_dir
+        .as_ref()
+        .and_then(|wd| Config::load(Some(wd)).ok())
         .and_then(|r| r.config.repo);
 
     // Get trunk from config
@@ -584,7 +596,9 @@ mod tests {
             RepoSnapshot {
                 info: RepoInfo {
                     git_dir: std::path::PathBuf::from("/repo/.git"),
-                    work_dir: std::path::PathBuf::from("/repo"),
+                    common_dir: std::path::PathBuf::from("/repo/.git"),
+                    work_dir: Some(std::path::PathBuf::from("/repo")),
+                    context: crate::git::RepoContext::Normal,
                 },
                 git_state: GitState::Clean,
                 worktree_status: WorktreeStatus::default(),

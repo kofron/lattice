@@ -1,6 +1,8 @@
-# Milestone 12: Bare Repository and Worktree Support
+# Milestone 2: Bare Repository and Worktree Support
 
-## Status: PLANNED
+## Status: COMPLETE
+
+See `implementation_notes.md` for details on implementation decisions.
 
 ---
 
@@ -399,6 +401,16 @@ pub fn branches_checked_out_elsewhere(conflicts: Vec<(BranchName, PathBuf)>) -> 
   * [ ] `restack_refuses_if_target_branch_checked_out_elsewhere`
   * [ ] `modify_refuses_if_descendant_checked_out_elsewhere`
   * [ ] `rewrite_allowed_when_conflicts_absent`
+  * [ ] `checkout_refuses_if_branch_checked_out_elsewhere`
+  * [ ] `delete_refuses_if_branch_checked_out_elsewhere`
+  * [ ] `rename_refuses_if_branch_checked_out_elsewhere`
+  * [ ] `executor_revalidates_occupancy_under_lock`
+
+**Additional Implementation Notes**
+
+* Extend touched-branches gating to include `checkout`, `delete`, and `rename` (not just rewrite commands)
+* Executor MUST re-check worktree occupancy **after acquiring lock, before ref mutation**
+* If constraint violated post-lock, abort with "precondition failed, re-run command"
 
 ---
 
@@ -444,8 +456,29 @@ This keeps “submit from bare” possible, but never silently downgrades correc
 
 * [ ] `metadata_only_commands_run_in_bare_repo`
 * [ ] `navigation_commands_refuse_in_bare_repo`
-* [ ] `submit_from_bare_refuses_if_restack_needed` (or equivalent)
-* [ ] `submit_from_bare_succeeds_if_no_restack_needed` (fixture where aligned)
+* [ ] `submit_without_no_restack_refuses_in_bare`
+* [ ] `submit_with_no_restack_normalizes_stale_base_metadata`
+* [ ] `submit_with_no_restack_refuses_if_not_ancestry_aligned`
+* [ ] `sync_without_no_restack_refuses_in_bare`
+* [ ] `get_without_no_checkout_refuses_in_bare`
+* [ ] `get_with_no_checkout_tracks_branch_in_bare`
+
+**Bare Repo Policy Details (Amended)**
+
+**`submit` in bare repos:**
+* MUST refuse unless `--no-restack` is provided
+* Alignment check is **ancestry-based**: `p.tip` must be ancestor of `b.tip`
+* If ancestry holds but `b.base != p.tip`: normalize base to `p.tip` (metadata-only), proceed
+* Print: "Updated base metadata for N branches (no history changes)."
+* If ancestry fails: refuse with "Restack required. Run from a worktree."
+
+**`sync` in bare repos:**
+* MUST refuse unless `--no-restack` is provided
+* With `--no-restack`: may fetch, fast-forward trunk, check PR state, prompt branch deletion
+
+**`get` in bare repos:**
+* MUST refuse unless `--no-checkout` is provided (new flag)
+* With `--no-checkout`: fetch, track branch (metadata with parent inference), compute base as `merge-base(branch_tip, parent_tip)`, default frozen unless `--unfrozen`, print worktree creation guidance
 
 ---
 
@@ -464,6 +497,26 @@ When `create` is gated only by missing `WorkingDirectoryAvailable`, show a tailo
 * states the reason (bare repo has no working directory)
 * provides an actionable `git worktree add` example
 * lists a few commands that do work from bare
+
+**WorktreeStatus enum update:**
+
+Add an explicit `Unavailable` variant (not `Option`):
+
+```rust
+pub enum WorktreeStatus {
+    Clean,
+    Dirty { staged: u32, unstaged: u32, conflicts: u32 },
+    Unavailable { reason: WorktreeUnavailableReason },
+}
+
+pub enum WorktreeUnavailableReason {
+    BareRepository,
+    NoWorkDir,
+    ProbeFailed,
+}
+```
+
+Rule: `RepoInfo.work_dir.is_none()` → `WorktreeStatus::Unavailable { reason: BareRepository }`
 
 **Acceptance Criteria (Step 7)**
 
@@ -543,13 +596,19 @@ When `create` is gated only by missing `WorkingDirectoryAvailable`, show a tailo
 
 * `docs/commands/create.md`
 * `docs/commands/log.md`
-* `docs/commands/submit.md` (if bare-mode limitations exist)
+* `docs/commands/get.md` - document `--no-checkout` and bare behavior
+* `docs/commands/submit.md` - document bare behavior, alignment check, metadata normalization
+* `docs/commands/sync.md` - document bare behavior
 * `docs/commands/doctor.md` (optional notes on worktrees)
+* `docs/references.md` - add `git worktree list --porcelain` reference
 
 **Acceptance Criteria (Step 9)**
 
 * [ ] Docs explicitly state which commands work from bare repos
 * [ ] Docs explain worktree recommendation and show a canonical command
+* [ ] `docs/commands/get.md` documents `--no-checkout` and bare behavior
+* [ ] `docs/commands/submit.md` documents bare-mode gating rules and alignment checks
+* [ ] `docs/commands/sync.md` documents bare-mode gating rules
 * [ ] Any “submit from bare” constraints are documented clearly
 
 **Tests Required**

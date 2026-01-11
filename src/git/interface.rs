@@ -195,13 +195,81 @@ impl From<TypeError> for GitError {
     }
 }
 
+/// The type of repository context.
+///
+/// Lattice needs to know what kind of repository it's operating in to:
+/// - Route storage to the correct location (common_dir vs git_dir)
+/// - Gate commands that require a working directory
+/// - Handle worktree-specific constraints
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoContext {
+    /// A normal repository (not bare, not a linked worktree).
+    /// In this case, git_dir == common_dir.
+    Normal,
+
+    /// A bare repository (no working directory).
+    /// Remote operations may work, but checkout/restack/etc cannot.
+    Bare,
+
+    /// A linked worktree created via `git worktree add`.
+    /// The git_dir is per-worktree, common_dir is shared with parent.
+    Worktree,
+}
+
+impl RepoContext {
+    /// Check if this context has a working directory.
+    pub fn has_workdir(&self) -> bool {
+        !matches!(self, RepoContext::Bare)
+    }
+
+    /// Check if this is a bare repository.
+    pub fn is_bare(&self) -> bool {
+        matches!(self, RepoContext::Bare)
+    }
+
+    /// Check if this is a linked worktree.
+    pub fn is_worktree(&self) -> bool {
+        matches!(self, RepoContext::Worktree)
+    }
+}
+
+impl std::fmt::Display for RepoContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepoContext::Normal => write!(f, "normal"),
+            RepoContext::Bare => write!(f, "bare"),
+            RepoContext::Worktree => write!(f, "worktree"),
+        }
+    }
+}
+
 /// Information about a Git repository.
+///
+/// This struct captures the three key paths for Git repository contexts:
+/// - `git_dir`: The per-worktree `.git` directory (or gitdir for linked worktrees)
+/// - `common_dir`: The shared directory for refs, objects, and config
+/// - `work_dir`: The working directory (None for bare repos)
+///
+/// For normal repositories, `git_dir == common_dir`.
+/// For linked worktrees, `common_dir` points to the parent repo's git dir.
+/// For bare repos, `work_dir` is None.
 #[derive(Debug, Clone)]
 pub struct RepoInfo {
-    /// Path to .git directory
+    /// Path to the per-worktree .git directory.
+    /// For normal repos, this is `.git/`.
+    /// For linked worktrees, this is `.git/worktrees/<name>/`.
     pub git_dir: PathBuf,
-    /// Path to working directory
-    pub work_dir: PathBuf,
+
+    /// Path to the shared git directory (refs, objects, config).
+    /// For normal repos, this equals git_dir.
+    /// For linked worktrees, this is the parent repo's git dir.
+    pub common_dir: PathBuf,
+
+    /// Path to working directory (None for bare repos).
+    pub work_dir: Option<PathBuf>,
+
+    /// The type of repository context.
+    pub context: RepoContext,
 }
 
 /// State of in-progress Git operations.
@@ -298,31 +366,127 @@ pub struct RefEntry {
     pub oid: Oid,
 }
 
-/// Summary of working tree status.
+/// Reason why a working directory is unavailable.
 ///
-/// Provides counts of different types of changes in the working tree,
-/// useful for pre-command checks.
+/// Per SPEC.md §4.6.9, this enum provides specific context for why
+/// worktree status cannot be determined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeUnavailableReason {
+    /// Repository is a bare clone with no working directory.
+    BareRepository,
+    /// Git dir exists but work_dir is None (unusual configuration).
+    NoWorkDir,
+    /// Failed to probe worktree status (git command failed).
+    ProbeFailed,
+}
+
+impl std::fmt::Display for WorktreeUnavailableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BareRepository => write!(f, "bare repository has no working directory"),
+            Self::NoWorkDir => write!(f, "no working directory configured"),
+            Self::ProbeFailed => write!(f, "failed to probe worktree status"),
+        }
+    }
+}
+
+/// Status of the working directory.
+///
+/// Per SPEC.md §4.6.9, this enum distinguishes between clean, dirty,
+/// and unavailable worktree states. The `Unavailable` variant explicitly
+/// captures why status cannot be determined rather than using `Option`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorktreeStatus {
-    /// Number of staged changes
-    pub staged: usize,
-    /// Number of unstaged changes to tracked files
-    pub unstaged: usize,
-    /// Number of untracked files (if requested)
-    pub untracked: usize,
-    /// Whether there are unresolved conflicts
-    pub has_conflicts: bool,
+pub enum WorktreeStatus {
+    /// Working directory has no uncommitted changes.
+    #[default]
+    Clean,
+    /// Working directory has uncommitted changes.
+    Dirty {
+        /// Number of staged changes.
+        staged: u32,
+        /// Number of unstaged changes to tracked files.
+        unstaged: u32,
+        /// Number of merge conflicts.
+        conflicts: u32,
+    },
+    /// Working directory is not available.
+    Unavailable {
+        /// Reason why the worktree is unavailable.
+        reason: WorktreeUnavailableReason,
+    },
 }
 
 impl WorktreeStatus {
     /// Check if the worktree is completely clean (no changes at all).
     pub fn is_clean(&self) -> bool {
-        self.staged == 0 && self.unstaged == 0 && !self.has_conflicts
+        matches!(self, Self::Clean)
+    }
+
+    /// Check if the worktree is dirty (has uncommitted changes).
+    pub fn is_dirty(&self) -> bool {
+        matches!(self, Self::Dirty { .. })
+    }
+
+    /// Check if the worktree is unavailable.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
     }
 
     /// Check if there are any staged changes ready to commit.
     pub fn has_staged(&self) -> bool {
-        self.staged > 0
+        matches!(self, Self::Dirty { staged, .. } if *staged > 0)
+    }
+
+    /// Check if there are merge conflicts.
+    pub fn has_conflicts(&self) -> bool {
+        matches!(self, Self::Dirty { conflicts, .. } if *conflicts > 0)
+    }
+
+    /// Create an unavailable status for a bare repository.
+    pub fn bare_repository() -> Self {
+        Self::Unavailable {
+            reason: WorktreeUnavailableReason::BareRepository,
+        }
+    }
+
+    /// Create an unavailable status when there's no work dir.
+    pub fn no_work_dir() -> Self {
+        Self::Unavailable {
+            reason: WorktreeUnavailableReason::NoWorkDir,
+        }
+    }
+
+    /// Create an unavailable status when probing failed.
+    pub fn probe_failed() -> Self {
+        Self::Unavailable {
+            reason: WorktreeUnavailableReason::ProbeFailed,
+        }
+    }
+}
+
+/// Information about a linked worktree.
+///
+/// Per SPEC.md §4.6.8, Lattice needs to detect when a branch is checked out
+/// in another worktree to prevent operations that would fail or cause confusion.
+///
+/// This struct represents a single worktree entry as returned by
+/// `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Path to the worktree directory.
+    pub path: PathBuf,
+    /// HEAD commit of the worktree, if available.
+    pub head: Option<Oid>,
+    /// Branch checked out in this worktree (None if detached HEAD).
+    pub branch: Option<BranchName>,
+    /// Whether this is the bare repository entry.
+    pub is_bare: bool,
+}
+
+impl WorktreeEntry {
+    /// Check if this worktree has a specific branch checked out.
+    pub fn has_branch(&self, name: &BranchName) -> bool {
+        self.branch.as_ref() == Some(name)
     }
 }
 
@@ -400,10 +564,14 @@ impl Git {
     /// Uses `git2::Repository::discover` to find the repository root,
     /// so `path` can be any directory within the repository.
     ///
+    /// This method supports all repository types:
+    /// - Normal repositories (with working directory)
+    /// - Bare repositories (no working directory)
+    /// - Linked worktrees (created via `git worktree add`)
+    ///
     /// # Errors
     ///
     /// - [`GitError::NotARepo`] if no repository is found
-    /// - [`GitError::BareRepo`] if the repository has no working directory
     ///
     /// # Example
     ///
@@ -412,26 +580,76 @@ impl Git {
     /// use std::path::Path;
     ///
     /// let git = Git::open(Path::new("./src"))?;  // Works from subdirectory
+    /// let info = git.info()?;
+    /// if info.context.is_bare() {
+    ///     println!("This is a bare repository");
+    /// }
     /// ```
     pub fn open(path: &Path) -> Result<Self, GitError> {
         let repo = git2::Repository::discover(path).map_err(|_| GitError::NotARepo {
             path: path.to_path_buf(),
         })?;
 
-        // Ensure it's not a bare repository
-        if repo.is_bare() {
-            return Err(GitError::BareRepo);
-        }
-
         Ok(Self { repo })
     }
 
-    /// Get repository information (git_dir and work_dir paths).
+    /// Get repository information (git_dir, common_dir, work_dir, context).
+    ///
+    /// This method detects the repository context and populates all path fields:
+    /// - For normal repos: git_dir == common_dir, work_dir is Some
+    /// - For bare repos: git_dir == common_dir, work_dir is None
+    /// - For worktrees: git_dir != common_dir, work_dir is Some
     pub fn info(&self) -> Result<RepoInfo, GitError> {
         let git_dir = self.repo.path().to_path_buf();
-        let work_dir = self.repo.workdir().ok_or(GitError::BareRepo)?.to_path_buf();
+        let work_dir = self.repo.workdir().map(|p| p.to_path_buf());
 
-        Ok(RepoInfo { git_dir, work_dir })
+        // Get the common directory (shared across worktrees).
+        // For normal and bare repos, this equals git_dir.
+        // For linked worktrees, this is the parent repo's git dir.
+        let common_dir = self.repo.commondir().to_path_buf();
+
+        // Determine the repository context
+        let context = if self.repo.is_bare() {
+            RepoContext::Bare
+        } else if self.is_linked_worktree() {
+            RepoContext::Worktree
+        } else {
+            RepoContext::Normal
+        };
+
+        Ok(RepoInfo {
+            git_dir,
+            common_dir,
+            work_dir,
+            context,
+        })
+    }
+
+    /// Check if this repository is a linked worktree.
+    ///
+    /// A linked worktree is created via `git worktree add` and has its
+    /// git_dir inside the parent repo's `.git/worktrees/` directory.
+    fn is_linked_worktree(&self) -> bool {
+        // A linked worktree has commondir != path (git_dir)
+        self.repo.commondir() != self.repo.path()
+    }
+
+    /// Check if the repository has a working directory.
+    pub fn has_workdir(&self) -> bool {
+        self.repo.workdir().is_some()
+    }
+
+    /// Check if the repository is bare.
+    pub fn is_bare(&self) -> bool {
+        self.repo.is_bare()
+    }
+
+    /// Get the common directory (shared across worktrees).
+    ///
+    /// For normal repos, this equals git_dir.
+    /// For linked worktrees, this is the parent repo's git dir.
+    pub fn common_dir(&self) -> PathBuf {
+        self.repo.commondir().to_path_buf()
     }
 
     /// Get direct access to the .git directory path.
@@ -538,26 +756,32 @@ impl Git {
     ///     println!("Working tree has changes");
     /// }
     /// ```
-    pub fn worktree_status(&self, include_untracked: bool) -> Result<WorktreeStatus, GitError> {
+    pub fn worktree_status(&self, _include_untracked: bool) -> Result<WorktreeStatus, GitError> {
+        // Check if we have a working directory
+        if self.repo.is_bare() {
+            return Ok(WorktreeStatus::bare_repository());
+        }
+
         let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(include_untracked)
-            .include_ignored(false);
+        opts.include_untracked(false).include_ignored(false);
 
         let statuses = self
             .repo
             .statuses(Some(&mut opts))
             .map_err(|e| GitError::Internal {
-                message: e.message().to_string(),
+                message: format!("Failed to probe worktree status: {}", e.message()),
             })?;
 
-        let mut result = WorktreeStatus::default();
+        let mut staged: u32 = 0;
+        let mut unstaged: u32 = 0;
+        let mut conflicts: u32 = 0;
 
         for entry in statuses.iter() {
             let status = entry.status();
 
             // Check for conflicts
             if status.is_conflicted() {
-                result.has_conflicts = true;
+                conflicts += 1;
             }
 
             // Count staged changes
@@ -567,7 +791,7 @@ impl Git {
                 || status.is_index_renamed()
                 || status.is_index_typechange()
             {
-                result.staged += 1;
+                staged += 1;
             }
 
             // Count unstaged changes
@@ -576,16 +800,19 @@ impl Git {
                 || status.is_wt_renamed()
                 || status.is_wt_typechange()
             {
-                result.unstaged += 1;
-            }
-
-            // Count untracked
-            if status.is_wt_new() {
-                result.untracked += 1;
+                unstaged += 1;
             }
         }
 
-        Ok(result)
+        if staged == 0 && unstaged == 0 && conflicts == 0 {
+            Ok(WorktreeStatus::Clean)
+        } else {
+            Ok(WorktreeStatus::Dirty {
+                staged,
+                unstaged,
+                conflicts,
+            })
+        }
     }
 
     /// Check if working tree is clean (no staged or unstaged changes).
@@ -796,6 +1023,116 @@ impl Git {
                 if let Ok(branch_name) = BranchName::new(name) {
                     result.push((branch_name, entry.oid));
                 }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// List all worktrees associated with this repository.
+    ///
+    /// Per SPEC.md §4.6.8, this is used to detect when a branch is checked out
+    /// in another worktree. Operations that would rewrite such a branch must
+    /// be refused with a clear error message.
+    ///
+    /// Uses `git worktree list --porcelain` for reliable parsing.
+    ///
+    /// # Returns
+    ///
+    /// A list of `WorktreeEntry` structs describing each worktree.
+    /// The main worktree is always included (possibly as bare if it's a bare repo).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let worktrees = git.list_worktrees()?;
+    /// for wt in &worktrees {
+    ///     if let Some(branch) = &wt.branch {
+    ///         println!("{} has {} checked out", wt.path.display(), branch);
+    ///     }
+    /// }
+    /// ```
+    pub fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>, GitError> {
+        use std::process::Command;
+
+        let git_dir = self.git_dir();
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(git_dir)
+            .output()
+            .map_err(|e| GitError::Internal {
+                message: format!("failed to run git worktree list: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::Internal {
+                message: format!("git worktree list failed: {}", stderr),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_worktree_list_porcelain(&stdout)
+    }
+
+    /// Find which worktree (if any) has a branch checked out.
+    ///
+    /// Returns the path to the worktree that has the branch checked out,
+    /// or None if the branch is not checked out anywhere.
+    ///
+    /// This excludes the current worktree from the search, since we're
+    /// looking for *other* worktrees that would block an operation.
+    pub fn branch_checked_out_elsewhere(
+        &self,
+        branch: &BranchName,
+    ) -> Result<Option<PathBuf>, GitError> {
+        let worktrees = self.list_worktrees()?;
+        let current_work_dir = self.info().ok().and_then(|i| i.work_dir);
+
+        for wt in worktrees {
+            // Skip bare entries
+            if wt.is_bare {
+                continue;
+            }
+
+            // Skip current worktree
+            if current_work_dir.as_ref() == Some(&wt.path) {
+                continue;
+            }
+
+            if wt.has_branch(branch) {
+                return Ok(Some(wt.path));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Find all branches that are checked out in worktrees other than the current one.
+    ///
+    /// Returns a map from branch name to the worktree path where it's checked out.
+    /// This is useful for gating operations that touch multiple branches.
+    pub fn branches_checked_out_elsewhere(
+        &self,
+    ) -> Result<std::collections::HashMap<BranchName, PathBuf>, GitError> {
+        let worktrees = self.list_worktrees()?;
+        let current_work_dir = self.info().ok().and_then(|i| i.work_dir);
+
+        let mut result = std::collections::HashMap::new();
+
+        for wt in worktrees {
+            // Skip bare entries
+            if wt.is_bare {
+                continue;
+            }
+
+            // Skip current worktree
+            if current_work_dir.as_ref() == Some(&wt.path) {
+                continue;
+            }
+
+            if let Some(branch) = wt.branch {
+                result.insert(branch, wt.path);
             }
         }
 
@@ -1254,6 +1591,78 @@ impl Git {
     }
 }
 
+/// Parse the output of `git worktree list --porcelain`.
+///
+/// The porcelain format outputs one worktree per block, separated by blank lines.
+/// Each block contains lines like:
+/// ```text
+/// worktree /path/to/worktree
+/// HEAD abcd1234...
+/// branch refs/heads/main
+/// ```
+///
+/// For bare repos, the block looks like:
+/// ```text
+/// worktree /path/to/bare.git
+/// bare
+/// ```
+///
+/// For detached HEAD:
+/// ```text
+/// worktree /path/to/worktree
+/// HEAD abcd1234...
+/// detached
+/// ```
+fn parse_worktree_list_porcelain(output: &str) -> Result<Vec<WorktreeEntry>, GitError> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_head: Option<Oid> = None;
+    let mut current_branch: Option<BranchName> = None;
+    let mut is_bare = false;
+
+    for line in output.lines() {
+        if line.is_empty() {
+            // End of a worktree block
+            if let Some(path) = current_path.take() {
+                entries.push(WorktreeEntry {
+                    path,
+                    head: current_head.take(),
+                    branch: current_branch.take(),
+                    is_bare,
+                });
+                is_bare = false;
+            }
+            continue;
+        }
+
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path_str));
+        } else if let Some(head_str) = line.strip_prefix("HEAD ") {
+            current_head = Oid::new(head_str).ok();
+        } else if let Some(branch_str) = line.strip_prefix("branch ") {
+            // Branch is in full ref form: refs/heads/name
+            if let Some(name) = branch_str.strip_prefix("refs/heads/") {
+                current_branch = BranchName::new(name).ok();
+            }
+        } else if line == "bare" {
+            is_bare = true;
+        }
+        // "detached" line is ignored - we just won't have a branch
+    }
+
+    // Handle last block if output doesn't end with blank line
+    if let Some(path) = current_path {
+        entries.push(WorktreeEntry {
+            path,
+            head: current_head,
+            branch: current_branch,
+            is_bare,
+        });
+    }
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,44 +1783,110 @@ mod tests {
             let status = WorktreeStatus::default();
             assert!(status.is_clean());
             assert!(!status.has_staged());
+            assert!(!status.is_dirty());
+            assert!(!status.is_unavailable());
+        }
+
+        #[test]
+        fn clean_variant() {
+            let status = WorktreeStatus::Clean;
+            assert!(status.is_clean());
+            assert!(!status.is_dirty());
+            assert!(!status.has_staged());
+            assert!(!status.has_conflicts());
         }
 
         #[test]
         fn staged_changes() {
-            let status = WorktreeStatus {
+            let status = WorktreeStatus::Dirty {
                 staged: 3,
-                ..Default::default()
+                unstaged: 0,
+                conflicts: 0,
             };
             assert!(!status.is_clean());
+            assert!(status.is_dirty());
             assert!(status.has_staged());
+            assert!(!status.has_conflicts());
         }
 
         #[test]
         fn unstaged_changes() {
-            let status = WorktreeStatus {
+            let status = WorktreeStatus::Dirty {
+                staged: 0,
                 unstaged: 2,
-                ..Default::default()
+                conflicts: 0,
             };
             assert!(!status.is_clean());
+            assert!(status.is_dirty());
+            assert!(!status.has_staged());
         }
 
         #[test]
         fn conflicts_make_dirty() {
-            let status = WorktreeStatus {
-                has_conflicts: true,
-                ..Default::default()
+            let status = WorktreeStatus::Dirty {
+                staged: 0,
+                unstaged: 0,
+                conflicts: 1,
             };
             assert!(!status.is_clean());
+            assert!(status.is_dirty());
+            assert!(status.has_conflicts());
         }
 
         #[test]
-        fn untracked_not_dirty() {
-            // Untracked files don't make the worktree "dirty"
-            let status = WorktreeStatus {
-                untracked: 5,
-                ..Default::default()
-            };
-            assert!(status.is_clean());
+        fn unavailable_bare_repository() {
+            let status = WorktreeStatus::bare_repository();
+            assert!(!status.is_clean());
+            assert!(!status.is_dirty());
+            assert!(status.is_unavailable());
+            assert!(!status.has_staged());
+            assert!(!status.has_conflicts());
+            assert!(matches!(
+                status,
+                WorktreeStatus::Unavailable {
+                    reason: WorktreeUnavailableReason::BareRepository
+                }
+            ));
+        }
+
+        #[test]
+        fn unavailable_no_work_dir() {
+            let status = WorktreeStatus::no_work_dir();
+            assert!(status.is_unavailable());
+            assert!(matches!(
+                status,
+                WorktreeStatus::Unavailable {
+                    reason: WorktreeUnavailableReason::NoWorkDir
+                }
+            ));
+        }
+
+        #[test]
+        fn unavailable_probe_failed() {
+            let status = WorktreeStatus::probe_failed();
+            assert!(status.is_unavailable());
+            assert!(matches!(
+                status,
+                WorktreeStatus::Unavailable {
+                    reason: WorktreeUnavailableReason::ProbeFailed
+                }
+            ));
+        }
+
+        #[test]
+        fn reason_display() {
+            assert_eq!(
+                WorktreeUnavailableReason::BareRepository.to_string(),
+                "bare repository has no working directory"
+            );
+            assert_eq!(
+                WorktreeUnavailableReason::NoWorkDir.to_string(),
+                "no working directory configured"
+            );
+            assert_eq!(
+                WorktreeUnavailableReason::ProbeFailed.to_string(),
+                "failed to probe worktree status"
+            );
         }
     }
 
@@ -1467,6 +1942,218 @@ mod tests {
             assert_eq!(Git::parse_github_remote("not-a-url"), None);
             assert_eq!(Git::parse_github_remote("https://github.com/"), None);
             assert_eq!(Git::parse_github_remote("https://github.com/owner"), None);
+        }
+    }
+
+    mod repo_context {
+        use super::*;
+
+        #[test]
+        fn normal_has_workdir() {
+            assert!(RepoContext::Normal.has_workdir());
+        }
+
+        #[test]
+        fn bare_has_no_workdir() {
+            assert!(!RepoContext::Bare.has_workdir());
+        }
+
+        #[test]
+        fn worktree_has_workdir() {
+            assert!(RepoContext::Worktree.has_workdir());
+        }
+
+        #[test]
+        fn is_bare() {
+            assert!(!RepoContext::Normal.is_bare());
+            assert!(RepoContext::Bare.is_bare());
+            assert!(!RepoContext::Worktree.is_bare());
+        }
+
+        #[test]
+        fn is_worktree() {
+            assert!(!RepoContext::Normal.is_worktree());
+            assert!(!RepoContext::Bare.is_worktree());
+            assert!(RepoContext::Worktree.is_worktree());
+        }
+
+        #[test]
+        fn display_formatting() {
+            assert_eq!(format!("{}", RepoContext::Normal), "normal");
+            assert_eq!(format!("{}", RepoContext::Bare), "bare");
+            assert_eq!(format!("{}", RepoContext::Worktree), "worktree");
+        }
+
+        #[test]
+        fn equality() {
+            assert_eq!(RepoContext::Normal, RepoContext::Normal);
+            assert_eq!(RepoContext::Bare, RepoContext::Bare);
+            assert_eq!(RepoContext::Worktree, RepoContext::Worktree);
+            assert_ne!(RepoContext::Normal, RepoContext::Bare);
+            assert_ne!(RepoContext::Normal, RepoContext::Worktree);
+            assert_ne!(RepoContext::Bare, RepoContext::Worktree);
+        }
+
+        #[test]
+        fn copy_semantics() {
+            let ctx = RepoContext::Normal;
+            let ctx2 = ctx; // Copy
+            assert_eq!(ctx, ctx2);
+        }
+    }
+
+    mod repo_info {
+        use super::*;
+
+        #[test]
+        fn normal_repo_info() {
+            let info = RepoInfo {
+                git_dir: PathBuf::from("/repo/.git"),
+                common_dir: PathBuf::from("/repo/.git"),
+                work_dir: Some(PathBuf::from("/repo")),
+                context: RepoContext::Normal,
+            };
+
+            assert_eq!(info.git_dir, info.common_dir);
+            assert!(info.work_dir.is_some());
+            assert_eq!(info.context, RepoContext::Normal);
+        }
+
+        #[test]
+        fn bare_repo_info() {
+            let info = RepoInfo {
+                git_dir: PathBuf::from("/repo.git"),
+                common_dir: PathBuf::from("/repo.git"),
+                work_dir: None,
+                context: RepoContext::Bare,
+            };
+
+            assert_eq!(info.git_dir, info.common_dir);
+            assert!(info.work_dir.is_none());
+            assert_eq!(info.context, RepoContext::Bare);
+        }
+
+        #[test]
+        fn worktree_repo_info() {
+            let info = RepoInfo {
+                git_dir: PathBuf::from("/main-repo/.git/worktrees/feature"),
+                common_dir: PathBuf::from("/main-repo/.git"),
+                work_dir: Some(PathBuf::from("/worktrees/feature")),
+                context: RepoContext::Worktree,
+            };
+
+            assert_ne!(info.git_dir, info.common_dir);
+            assert!(info.work_dir.is_some());
+            assert_eq!(info.context, RepoContext::Worktree);
+        }
+    }
+
+    mod worktree_parsing {
+        use super::*;
+
+        #[test]
+        fn parse_single_worktree() {
+            let output = "worktree /path/to/repo\n\
+                          HEAD abc123def4567890abc123def4567890abc12345\n\
+                          branch refs/heads/main\n\
+                          \n";
+
+            let entries = parse_worktree_list_porcelain(output).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, PathBuf::from("/path/to/repo"));
+            assert!(entries[0].head.is_some());
+            assert_eq!(entries[0].branch.as_ref().map(|b| b.as_str()), Some("main"));
+            assert!(!entries[0].is_bare);
+        }
+
+        #[test]
+        fn parse_bare_worktree() {
+            let output = "worktree /path/to/repo.git\n\
+                          bare\n\
+                          \n";
+
+            let entries = parse_worktree_list_porcelain(output).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, PathBuf::from("/path/to/repo.git"));
+            assert!(entries[0].head.is_none());
+            assert!(entries[0].branch.is_none());
+            assert!(entries[0].is_bare);
+        }
+
+        #[test]
+        fn parse_detached_head() {
+            let output = "worktree /path/to/worktree\n\
+                          HEAD abc123def4567890abc123def4567890abc12345\n\
+                          detached\n\
+                          \n";
+
+            let entries = parse_worktree_list_porcelain(output).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, PathBuf::from("/path/to/worktree"));
+            assert!(entries[0].head.is_some());
+            assert!(entries[0].branch.is_none()); // Detached = no branch
+            assert!(!entries[0].is_bare);
+        }
+
+        #[test]
+        fn parse_multiple_worktrees() {
+            let output = "worktree /main/repo\n\
+                          HEAD abc123def4567890abc123def4567890abc12345\n\
+                          branch refs/heads/main\n\
+                          \n\
+                          worktree /worktrees/feature\n\
+                          HEAD def456abc7890123def456abc7890123def45678\n\
+                          branch refs/heads/feature\n\
+                          \n";
+
+            let entries = parse_worktree_list_porcelain(output).unwrap();
+            assert_eq!(entries.len(), 2);
+
+            assert_eq!(entries[0].path, PathBuf::from("/main/repo"));
+            assert_eq!(entries[0].branch.as_ref().map(|b| b.as_str()), Some("main"));
+
+            assert_eq!(entries[1].path, PathBuf::from("/worktrees/feature"));
+            assert_eq!(
+                entries[1].branch.as_ref().map(|b| b.as_str()),
+                Some("feature")
+            );
+        }
+
+        #[test]
+        fn parse_without_trailing_newline() {
+            // Some git versions might not include trailing blank line
+            let output = "worktree /path/to/repo\n\
+                          HEAD abc123def4567890abc123def4567890abc12345\n\
+                          branch refs/heads/main";
+
+            let entries = parse_worktree_list_porcelain(output).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, PathBuf::from("/path/to/repo"));
+        }
+
+        #[test]
+        fn worktree_entry_has_branch() {
+            let entry = WorktreeEntry {
+                path: PathBuf::from("/test"),
+                head: None,
+                branch: Some(BranchName::new("feature").unwrap()),
+                is_bare: false,
+            };
+
+            assert!(entry.has_branch(&BranchName::new("feature").unwrap()));
+            assert!(!entry.has_branch(&BranchName::new("other").unwrap()));
+        }
+
+        #[test]
+        fn worktree_entry_has_branch_none() {
+            let entry = WorktreeEntry {
+                path: PathBuf::from("/test"),
+                head: None,
+                branch: None, // Detached
+                is_bare: false,
+            };
+
+            assert!(!entry.has_branch(&BranchName::new("any").unwrap()));
         }
     }
 }

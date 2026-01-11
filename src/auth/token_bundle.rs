@@ -473,7 +473,11 @@ mod tests {
 
     #[test]
     fn with_refreshed_tokens_preserves_metadata() {
-        let bundle = make_test_bundle();
+        let mut bundle = make_test_bundle();
+        // Set updated_at to the past to ensure the refreshed version is newer
+        bundle.timestamps.updated_at = Utc::now() - Duration::seconds(1);
+        let original_updated_at = bundle.timestamps.updated_at;
+
         let new_tokens = TokenInfo::new(
             "ghu_new_access".to_string(),
             7200,
@@ -489,7 +493,7 @@ mod tests {
             refreshed.timestamps.created_at,
             bundle.timestamps.created_at
         );
-        assert!(refreshed.timestamps.updated_at > bundle.timestamps.updated_at);
+        assert!(refreshed.timestamps.updated_at > original_updated_at);
         assert_eq!(refreshed.tokens.access_token, "ghu_new_access");
     }
 

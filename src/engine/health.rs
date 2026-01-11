@@ -627,6 +627,76 @@ pub mod issues {
             problem: format!("not a GitHub URL: {}", url),
         })
     }
+
+    /// Create an issue for no working directory available (bare repository).
+    ///
+    /// Per SPEC.md §4.6.6, bare repositories lack a working directory,
+    /// which blocks commands that require checkout, staging, or working
+    /// tree operations.
+    ///
+    /// Per SPEC.md §4.6.9, the message must be high-signal and include:
+    /// - Why it failed (bare repo has no working directory)
+    /// - How to proceed (create a worktree or use appropriate flags)
+    pub fn no_working_directory() -> Issue {
+        Issue::new(
+            "no-working-directory",
+            Severity::Blocking,
+            "This command requires a working directory, but this is a bare repository.\n\
+             \n\
+             To proceed, either:\n\
+             • Create a worktree: git worktree add <path> <branch>\n\
+             • Run from an existing worktree linked to this repository\n\
+             • Use --no-checkout or --no-restack flags if available for this command",
+        )
+        .blocks(Capability::WorkingDirectoryAvailable)
+    }
+
+    /// Create an issue for branches checked out in other worktrees.
+    ///
+    /// Per SPEC.md §4.6.8, operations that would rewrite a branch checked out
+    /// in another worktree must be refused with a clear error message.
+    ///
+    /// # Arguments
+    ///
+    /// * `conflicts` - List of (branch name, worktree path) pairs for branches
+    ///   that are checked out elsewhere
+    pub fn branches_checked_out_elsewhere(
+        conflicts: Vec<(crate::core::types::BranchName, std::path::PathBuf)>,
+    ) -> Issue {
+        let branch_list: Vec<String> = conflicts
+            .iter()
+            .map(|(b, p)| format!("'{}' (in {})", b, p.display()))
+            .collect();
+
+        let message = if conflicts.len() == 1 {
+            format!(
+                "Branch {} is checked out in another worktree",
+                branch_list[0]
+            )
+        } else {
+            format!(
+                "Branches checked out in other worktrees: {}",
+                branch_list.join(", ")
+            )
+        };
+
+        let mut issue = Issue::new("branch-checked-out-elsewhere", Severity::Blocking, message);
+
+        // Add evidence for each conflict
+        for (branch, path) in &conflicts {
+            issue = issue.with_evidence(Evidence::Ref {
+                name: format!("refs/heads/{}", branch),
+                oid: None,
+            });
+            // We could add a new Evidence variant for worktree path, but Ref works
+            issue = issue.with_evidence(Evidence::Config {
+                key: format!("worktree:{}", branch),
+                problem: format!("checked out at {}", path.display()),
+            });
+        }
+
+        issue
+    }
 }
 
 #[cfg(test)]
@@ -999,6 +1069,54 @@ mod tests {
             assert!(!issue.is_blocking()); // Warning severity
             assert!(issue.message.contains("gitlab.com"));
             assert_eq!(issue.evidence.len(), 1);
+        }
+
+        #[test]
+        fn no_working_directory() {
+            let issue = issues::no_working_directory();
+            assert!(issue.is_blocking());
+            assert!(issue.blocks_capability(&Capability::WorkingDirectoryAvailable));
+            assert!(issue.message.contains("bare repository"));
+        }
+
+        #[test]
+        fn branches_checked_out_elsewhere_single() {
+            use crate::core::types::BranchName;
+            use std::path::PathBuf;
+
+            let conflicts = vec![(
+                BranchName::new("feature").unwrap(),
+                PathBuf::from("/worktrees/feature"),
+            )];
+
+            let issue = issues::branches_checked_out_elsewhere(conflicts);
+            assert!(issue.is_blocking());
+            assert!(issue.message.contains("feature"));
+            assert!(issue.message.contains("another worktree"));
+            assert!(!issue.evidence.is_empty());
+        }
+
+        #[test]
+        fn branches_checked_out_elsewhere_multiple() {
+            use crate::core::types::BranchName;
+            use std::path::PathBuf;
+
+            let conflicts = vec![
+                (
+                    BranchName::new("feature-a").unwrap(),
+                    PathBuf::from("/worktrees/a"),
+                ),
+                (
+                    BranchName::new("feature-b").unwrap(),
+                    PathBuf::from("/worktrees/b"),
+                ),
+            ];
+
+            let issue = issues::branches_checked_out_elsewhere(conflicts);
+            assert!(issue.is_blocking());
+            assert!(issue.message.contains("feature-a"));
+            assert!(issue.message.contains("feature-b"));
+            assert!(issue.message.contains("other worktrees"));
         }
     }
 }

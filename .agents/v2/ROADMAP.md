@@ -33,9 +33,19 @@ v2 focuses on enhanced authentication, additional forge support, and advanced re
 
 **Status:** Not started
 
-**Goal:** Support workflows where the Lattice repository is a bare clone (no working directory).
+**Goal:** Enable Lattice to run safely in bare repositories and linked worktrees.
 
-**Details:** TBD (migrated from v1 milestone 12)
+**Key deliverables:**
+
+- `RepoContext` enum (Normal/Bare/Worktree) and `common_dir` path handling
+- `WorkingDirectoryAvailable` capability and command gating
+- Repo-scoped lock, op-state, and journals (shared across worktrees)
+- Worktree occupancy detection ("checked out elsewhere" blocker)
+- `--no-restack` for submit/sync in bare repos (ancestry-based alignment)
+- `--no-checkout` for get in bare repos (still tracks with metadata)
+- Continue/abort worktree ownership enforcement
+
+**Details:** See [milestone-2-bare-repo-support/PLAN.md](milestones/milestone-2-bare-repo-support/PLAN.md)
 
 ---
 

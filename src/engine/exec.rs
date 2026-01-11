@@ -56,6 +56,7 @@ use super::Context;
 use crate::core::metadata::store::{MetadataStore, StoreError};
 use crate::core::ops::journal::{Journal, JournalError, OpPhase, OpState};
 use crate::core::ops::lock::{LockError, RepoLock};
+use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Fingerprint, Oid};
 use crate::git::{Git, GitError, GitState};
 
@@ -186,10 +187,14 @@ impl<'a> Executor<'a> {
     /// - `ExecuteResult::Paused` if waiting for conflict resolution
     /// - `ExecuteResult::Aborted` if an error occurred
     pub fn execute(&self, plan: &Plan, ctx: &Context) -> Result<ExecuteResult, ExecuteError> {
-        let git_dir = self.git.git_dir();
+        let info = self
+            .git
+            .info()
+            .map_err(|e| ExecuteError::Internal(e.to_string()))?;
+        let paths = LatticePaths::from_repo_info(&info);
 
         // Check for in-progress operation
-        if let Some(op_state) = OpState::read(git_dir)? {
+        if let Some(op_state) = OpState::read(&paths)? {
             return Err(ExecuteError::OperationInProgress {
                 command: op_state.command,
                 op_id: op_state.op_id.to_string(),
@@ -210,7 +215,7 @@ impl<'a> Executor<'a> {
         if ctx.debug {
             eprintln!("[debug] Acquiring repository lock");
         }
-        let _lock = RepoLock::acquire(git_dir)?;
+        let _lock = RepoLock::acquire(&paths)?;
 
         // Create journal
         let mut journal = Journal::new(&plan.command);
@@ -219,8 +224,8 @@ impl<'a> Executor<'a> {
         if ctx.debug {
             eprintln!("[debug] Writing op-state marker");
         }
-        let op_state = OpState::from_journal(&journal);
-        op_state.write(git_dir)?;
+        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        op_state.write(&paths)?;
 
         // Record IntentRecorded event
         if ctx.debug {
@@ -249,7 +254,7 @@ impl<'a> Executor<'a> {
                     applied_steps.push(step.clone());
                     // Write journal after each mutation
                     if step.is_mutation() {
-                        journal.write(git_dir)?;
+                        journal.write(&paths)?;
                     }
                 }
                 StepResult::Pause { branch, git_state } => {
@@ -272,12 +277,13 @@ impl<'a> Executor<'a> {
                         remaining_names,
                     );
                     journal.pause();
-                    journal.write(git_dir)?;
+                    journal.write(&paths)?;
 
                     // Update op-state to paused
-                    let mut op_state = OpState::from_journal(&journal);
+                    let mut op_state =
+                        OpState::from_journal(&journal, &paths, info.work_dir.clone());
                     op_state.phase = OpPhase::Paused;
-                    op_state.write(git_dir)?;
+                    op_state.write(&paths)?;
 
                     return Ok(ExecuteResult::Paused {
                         branch,
@@ -288,13 +294,13 @@ impl<'a> Executor<'a> {
                 StepResult::Abort { error } => {
                     // Record abort in journal
                     journal.rollback();
-                    journal.write(git_dir)?;
+                    journal.write(&paths)?;
 
                     // Record Aborted event
                     let _ = ledger.append(Event::aborted(plan.op_id.as_str(), &error));
 
                     // Clear op-state
-                    OpState::remove(git_dir)?;
+                    OpState::remove(&paths)?;
 
                     return Ok(ExecuteResult::Aborted {
                         error,
@@ -315,13 +321,13 @@ impl<'a> Executor<'a> {
 
         // Mark journal as committed
         journal.commit();
-        journal.write(git_dir)?;
+        journal.write(&paths)?;
 
         // Clear op-state
         if ctx.debug {
             eprintln!("[debug] Clearing op-state marker");
         }
-        OpState::remove(git_dir)?;
+        OpState::remove(&paths)?;
 
         Ok(ExecuteResult::Success {
             fingerprint: new_fp,

@@ -81,12 +81,16 @@ pub mod requirements {
     /// Requirements for read-only commands (log, info, parent, children).
     ///
     /// These commands only need the repository to be accessible.
+    /// Works in bare repositories.
     pub const READ_ONLY: RequirementSet = RequirementSet::new("read-only", &[Capability::RepoOpen]);
 
     /// Requirements for commands that read stack structure (checkout, up, down).
     ///
     /// These need metadata and graph to be valid but don't require
     /// absence of in-progress operations.
+    ///
+    /// Per SPEC.md §4.6.6 Category C, navigation commands require a working
+    /// directory and do NOT work in bare repositories.
     pub const NAVIGATION: RequirementSet = RequirementSet::new(
         "navigation",
         &[
@@ -94,12 +98,17 @@ pub mod requirements {
             Capability::TrunkKnown,
             Capability::MetadataReadable,
             Capability::GraphValid,
+            Capability::WorkingDirectoryAvailable,
         ],
     );
 
-    /// Requirements for mutating commands (create, track, restack, etc.).
+    /// Requirements for mutating commands (create, restack, modify, fold, etc.).
     ///
-    /// These require no in-progress operations and a valid graph.
+    /// These require no in-progress operations, a valid graph, and a working
+    /// directory (since they modify the working tree).
+    ///
+    /// Per SPEC.md §4.6.6 Category C, these commands do NOT work in bare
+    /// repositories.
     pub const MUTATING: RequirementSet = RequirementSet::new(
         "mutating",
         &[
@@ -110,12 +119,36 @@ pub mod requirements {
             Capability::MetadataReadable,
             Capability::GraphValid,
             Capability::FrozenPolicySatisfied,
+            Capability::WorkingDirectoryAvailable,
+        ],
+    );
+
+    /// Requirements for metadata-only mutating commands (track, untrack, freeze, unfreeze).
+    ///
+    /// These modify only metadata refs, not the working tree or branch tips.
+    ///
+    /// Per SPEC.md §4.6.6 Category B, these commands work in bare repositories.
+    pub const MUTATING_METADATA_ONLY: RequirementSet = RequirementSet::new(
+        "mutating-metadata-only",
+        &[
+            Capability::RepoOpen,
+            Capability::TrunkKnown,
+            Capability::NoLatticeOpInProgress,
+            Capability::NoExternalGitOpInProgress,
+            Capability::MetadataReadable,
+            Capability::GraphValid,
+            Capability::FrozenPolicySatisfied,
+            // Note: WorkingDirectoryAvailable NOT required
         ],
     );
 
     /// Requirements for remote commands (submit, sync, get).
     ///
     /// All of MUTATING plus remote and auth requirements.
+    ///
+    /// Per SPEC.md §4.6.6, submit/sync/get may work in bare repos with
+    /// restrictions (e.g., `--no-restack`, `--no-checkout`), but by default
+    /// they require a working directory.
     pub const REMOTE: RequirementSet = RequirementSet::new(
         "remote",
         &[
@@ -126,6 +159,28 @@ pub mod requirements {
             Capability::MetadataReadable,
             Capability::GraphValid,
             Capability::FrozenPolicySatisfied,
+            Capability::WorkingDirectoryAvailable,
+            Capability::RemoteResolved,
+            Capability::AuthAvailable,
+        ],
+    );
+
+    /// Requirements for remote commands in bare repo mode.
+    ///
+    /// Per SPEC.md §4.6.6, remote commands can work in bare repos
+    /// when used with flags like `--no-restack` or `--no-checkout`.
+    /// This requirement set is for those restricted modes.
+    pub const REMOTE_BARE_ALLOWED: RequirementSet = RequirementSet::new(
+        "remote-bare-allowed",
+        &[
+            Capability::RepoOpen,
+            Capability::TrunkKnown,
+            Capability::NoLatticeOpInProgress,
+            Capability::NoExternalGitOpInProgress,
+            Capability::MetadataReadable,
+            Capability::GraphValid,
+            Capability::FrozenPolicySatisfied,
+            // Note: WorkingDirectoryAvailable NOT required
             Capability::RemoteResolved,
             Capability::AuthAvailable,
         ],
@@ -382,7 +437,9 @@ mod tests {
         RepoSnapshot {
             info: RepoInfo {
                 git_dir: PathBuf::from("/repo/.git"),
-                work_dir: PathBuf::from("/repo"),
+                common_dir: PathBuf::from("/repo/.git"),
+                work_dir: Some(PathBuf::from("/repo")),
+                context: crate::git::RepoContext::Normal,
             },
             git_state: GitState::Clean,
             worktree_status: WorktreeStatus::default(),
@@ -448,30 +505,56 @@ mod tests {
                 .capabilities
                 .contains(&Capability::RepoOpen));
             assert_eq!(requirements::READ_ONLY.capabilities.len(), 1);
+            // Read-only does NOT require working directory (works in bare repos)
+            assert!(!requirements::READ_ONLY
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
         }
 
         #[test]
-        fn navigation_requires_graph() {
+        fn navigation_requires_graph_and_workdir() {
             assert!(requirements::NAVIGATION
                 .capabilities
                 .contains(&Capability::GraphValid));
             assert!(requirements::NAVIGATION
                 .capabilities
                 .contains(&Capability::MetadataReadable));
+            // Navigation requires working directory
+            assert!(requirements::NAVIGATION
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
         }
 
         #[test]
-        fn mutating_requires_no_ops_in_progress() {
+        fn mutating_requires_no_ops_in_progress_and_workdir() {
             assert!(requirements::MUTATING
                 .capabilities
                 .contains(&Capability::NoLatticeOpInProgress));
             assert!(requirements::MUTATING
                 .capabilities
                 .contains(&Capability::NoExternalGitOpInProgress));
+            // Mutating requires working directory
+            assert!(requirements::MUTATING
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
         }
 
         #[test]
-        fn remote_extends_mutating() {
+        fn mutating_metadata_only_does_not_require_workdir() {
+            assert!(requirements::MUTATING_METADATA_ONLY
+                .capabilities
+                .contains(&Capability::NoLatticeOpInProgress));
+            assert!(requirements::MUTATING_METADATA_ONLY
+                .capabilities
+                .contains(&Capability::NoExternalGitOpInProgress));
+            // Metadata-only does NOT require working directory (works in bare repos)
+            assert!(!requirements::MUTATING_METADATA_ONLY
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
+        }
+
+        #[test]
+        fn remote_extends_mutating_with_workdir() {
             assert!(requirements::REMOTE
                 .capabilities
                 .contains(&Capability::AuthAvailable));
@@ -482,6 +565,24 @@ mod tests {
             assert!(requirements::REMOTE
                 .capabilities
                 .contains(&Capability::NoLatticeOpInProgress));
+            // Remote requires working directory by default
+            assert!(requirements::REMOTE
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
+        }
+
+        #[test]
+        fn remote_bare_allowed_does_not_require_workdir() {
+            assert!(requirements::REMOTE_BARE_ALLOWED
+                .capabilities
+                .contains(&Capability::AuthAvailable));
+            assert!(requirements::REMOTE_BARE_ALLOWED
+                .capabilities
+                .contains(&Capability::RemoteResolved));
+            // Does NOT require working directory (for bare repo operations)
+            assert!(!requirements::REMOTE_BARE_ALLOWED
+                .capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
         }
     }
 
@@ -530,6 +631,7 @@ mod tests {
                 Capability::TrunkKnown,
                 Capability::MetadataReadable,
                 Capability::GraphValid,
+                Capability::WorkingDirectoryAvailable,
             ]);
 
             let result = gate(snapshot, &requirements::NAVIGATION);
@@ -541,7 +643,7 @@ mod tests {
             let snapshot = make_snapshot_with_caps(&[
                 Capability::RepoOpen,
                 Capability::TrunkKnown,
-                // Missing MetadataReadable and GraphValid
+                // Missing MetadataReadable, GraphValid, and WorkingDirectoryAvailable
             ]);
 
             let result = gate(snapshot, &requirements::NAVIGATION);
@@ -554,6 +656,9 @@ mod tests {
             assert!(bundle
                 .missing_capabilities
                 .contains(&Capability::GraphValid));
+            assert!(bundle
+                .missing_capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
         }
 
         #[test]
@@ -562,6 +667,56 @@ mod tests {
             let result = gate(snapshot, &requirements::MUTATING);
             let bundle = result.unwrap_repair();
             assert_eq!(bundle.command, "mutating");
+        }
+
+        #[test]
+        fn bare_repo_fails_navigation() {
+            // Simulates a bare repo (no WorkingDirectoryAvailable)
+            let snapshot = make_snapshot_with_caps(&[
+                Capability::RepoOpen,
+                Capability::TrunkKnown,
+                Capability::MetadataReadable,
+                Capability::GraphValid,
+                // Missing WorkingDirectoryAvailable
+            ]);
+
+            let result = gate(snapshot, &requirements::NAVIGATION);
+            assert!(!result.is_ready());
+
+            let bundle = result.unwrap_repair();
+            assert!(bundle
+                .missing_capabilities
+                .contains(&Capability::WorkingDirectoryAvailable));
+        }
+
+        #[test]
+        fn bare_repo_passes_read_only() {
+            // Bare repo should pass read-only requirements
+            let snapshot = make_snapshot_with_caps(&[
+                Capability::RepoOpen,
+                // No WorkingDirectoryAvailable - bare repo
+            ]);
+
+            let result = gate(snapshot, &requirements::READ_ONLY);
+            assert!(result.is_ready());
+        }
+
+        #[test]
+        fn bare_repo_passes_metadata_only() {
+            // Bare repo should pass metadata-only requirements
+            let snapshot = make_snapshot_with_caps(&[
+                Capability::RepoOpen,
+                Capability::TrunkKnown,
+                Capability::NoLatticeOpInProgress,
+                Capability::NoExternalGitOpInProgress,
+                Capability::MetadataReadable,
+                Capability::GraphValid,
+                Capability::FrozenPolicySatisfied,
+                // No WorkingDirectoryAvailable - bare repo
+            ]);
+
+            let result = gate(snapshot, &requirements::MUTATING_METADATA_ONLY);
+            assert!(result.is_ready());
         }
     }
 

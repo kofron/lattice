@@ -23,6 +23,7 @@ use crate::core::metadata::schema::{BaseInfo, ParentInfo};
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
+use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
 use crate::engine::scan::scan;
 use crate::engine::Context;
@@ -41,10 +42,11 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
@@ -143,14 +145,14 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
     }
 
     // Acquire lock
-    let _lock = RepoLock::acquire(git_dir).context("Failed to acquire repository lock")?;
+    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
 
     // Create journal
     let mut journal = Journal::new("move");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal);
-    op_state.write(git_dir)?;
+    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    op_state.write(&paths)?;
 
     // Rebase source onto new parent
     let remaining_descendants: Vec<String> = descendants
@@ -167,7 +169,7 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
         onto_tip,
         &mut journal,
         remaining_descendants.clone(),
-        git_dir,
+        &paths,
         ctx,
     )?;
 
@@ -306,7 +308,7 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
                 &parent_tip,
                 &mut journal,
                 remaining,
-                git_dir,
+                &paths,
                 ctx,
             )?;
 
@@ -353,10 +355,10 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
 
     // Commit journal
     journal.commit();
-    journal.write(git_dir)?;
+    journal.write(&paths)?;
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(&paths)?;
 
     if !ctx.quiet {
         println!("Move complete.");

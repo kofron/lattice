@@ -1,6 +1,6 @@
 [package]
 name = "latticework"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 description = "CLI for stacked branches and PRs"
 license = "MIT"
@@ -30,7 +30,7 @@ thiserror = "1"
 
 # Git (via git2 per ROADMAP reconciliation 0.4)
 # Using vendored-openssl to avoid system OpenSSL dependency
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

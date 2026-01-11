@@ -25,6 +25,7 @@ use crate::core::metadata::schema::{
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
+use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Oid, UtcTimestamp};
 use crate::engine::scan::scan;
 use crate::engine::Context;
@@ -43,10 +44,11 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
@@ -107,7 +109,7 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
             ctx,
             &git,
             &cwd,
-            git_dir,
+            &paths,
             &snapshot,
             &current,
             &base_oid,
@@ -119,7 +121,7 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
             ctx,
             &git,
             &cwd,
-            git_dir,
+            &paths,
             &snapshot,
             &current,
             &base_oid,
@@ -136,7 +138,7 @@ fn split_by_commit(
     ctx: &Context,
     git: &Git,
     cwd: &std::path::Path,
-    git_dir: &std::path::Path,
+    paths: &LatticePaths,
     snapshot: &crate::engine::scan::RepoSnapshot,
     current: &BranchName,
     base_oid: &Oid,
@@ -165,14 +167,14 @@ fn split_by_commit(
     }
 
     // Acquire lock
-    let _lock = RepoLock::acquire(git_dir).context("Failed to acquire repository lock")?;
+    let _lock = RepoLock::acquire(paths).context("Failed to acquire repository lock")?;
 
     // Create journal
     let mut journal = Journal::new("split");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal);
-    op_state.write(git_dir)?;
+    let op_state = OpState::from_journal(&journal, paths, None);
+    op_state.write(paths)?;
 
     let store = MetadataStore::new(git);
 
@@ -202,7 +204,7 @@ fn split_by_commit(
         .context("Failed to detach HEAD")?;
 
     if !status.success() {
-        OpState::remove(git_dir)?;
+        OpState::remove(paths)?;
         bail!("git checkout --detach failed");
     }
 
@@ -231,7 +233,7 @@ fn split_by_commit(
             .with_context(|| format!("Failed to create branch '{}'", branch_name))?;
 
         if !status.success() {
-            OpState::remove(git_dir)?;
+            OpState::remove(paths)?;
             bail!("git branch -f failed for '{}'", branch_name);
         }
 
@@ -311,10 +313,10 @@ fn split_by_commit(
 
     // Commit journal
     journal.commit();
-    journal.write(git_dir)?;
+    journal.write(paths)?;
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(paths)?;
 
     if !ctx.quiet {
         println!(
@@ -344,7 +346,7 @@ fn split_by_file(
     ctx: &Context,
     git: &Git,
     cwd: &std::path::Path,
-    git_dir: &std::path::Path,
+    paths: &LatticePaths,
     snapshot: &crate::engine::scan::RepoSnapshot,
     current: &BranchName,
     base_oid: &Oid,
@@ -403,14 +405,14 @@ fn split_by_file(
     let remaining_diff = String::from_utf8_lossy(&output.stdout).to_string();
 
     // Acquire lock
-    let _lock = RepoLock::acquire(git_dir).context("Failed to acquire repository lock")?;
+    let _lock = RepoLock::acquire(paths).context("Failed to acquire repository lock")?;
 
     // Create journal
     let mut journal = Journal::new("split");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal);
-    op_state.write(git_dir)?;
+    let op_state = OpState::from_journal(&journal, paths, None);
+    op_state.write(paths)?;
 
     let store = MetadataStore::new(git);
 
@@ -419,7 +421,7 @@ fn split_by_file(
 
     // Check if new branch name already exists
     if snapshot.branches.contains_key(&new_branch_name) {
-        OpState::remove(git_dir)?;
+        OpState::remove(paths)?;
         bail!("Branch '{}' already exists", new_branch_name);
     }
 
@@ -443,7 +445,7 @@ fn split_by_file(
         .context("Failed to create new branch")?;
 
     if !status.success() {
-        OpState::remove(git_dir)?;
+        OpState::remove(paths)?;
         bail!("git checkout -b failed");
     }
 
@@ -485,7 +487,7 @@ fn split_by_file(
             .args(["branch", "-D", new_branch_name.as_str()])
             .current_dir(cwd)
             .status();
-        OpState::remove(git_dir)?;
+        OpState::remove(paths)?;
         bail!("Failed to apply file changes: {}", stderr);
     }
 
@@ -501,7 +503,7 @@ fn split_by_file(
         .context("Failed to commit")?;
 
     if !status.success() {
-        OpState::remove(git_dir)?;
+        OpState::remove(paths)?;
         bail!("git commit failed");
     }
 
@@ -635,10 +637,10 @@ fn split_by_file(
 
     // Commit journal
     journal.commit();
-    journal.write(git_dir)?;
+    journal.write(paths)?;
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(paths)?;
 
     if !ctx.quiet {
         println!("Split complete.");

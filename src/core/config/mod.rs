@@ -52,6 +52,8 @@ pub mod schema;
 
 pub use schema::{GlobalConfig, RepoConfig};
 
+use crate::core::paths::LatticePaths;
+use crate::git::Git;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -189,35 +191,50 @@ impl Config {
     }
 
     /// Load repository configuration from standard locations.
+    ///
+    /// Uses Git discovery to find the repository and `LatticePaths` to locate
+    /// the config file. This works correctly for normal repos, bare repos,
+    /// and linked worktrees.
     fn load_repo(
         repo_path: &Path,
         warnings: &mut Vec<ConfigWarning>,
     ) -> Result<(Option<RepoConfig>, Option<PathBuf>), ConfigError> {
-        // Find the .git directory
-        let git_dir = repo_path.join(".git");
-        if !git_dir.exists() {
-            return Ok((None, None));
-        }
+        // Use Git to discover the repository (handles bare repos and worktrees)
+        let git = match Git::open(repo_path) {
+            Ok(g) => g,
+            Err(_) => return Ok((None, None)), // Not a git repo
+        };
 
-        // 1. Check .git/lattice/config.toml (canonical)
-        let canonical = git_dir.join("lattice/config.toml");
+        let info = match git.info() {
+            Ok(i) => i,
+            Err(_) => return Ok((None, None)),
+        };
+
+        let paths = LatticePaths::from_repo_info(&info);
+
+        // 1. Check canonical location via LatticePaths
+        let canonical = paths.repo_config_path();
         if canonical.exists() {
             let config = Self::read_repo_config(&canonical)?;
             return Ok((Some(config), Some(canonical)));
         }
 
-        // 2. Check .git/lattice/repo.toml (compatibility)
-        let compat_git = git_dir.join("lattice/repo.toml");
-        if compat_git.exists() {
-            warnings.push(ConfigWarning {
-                message: format!(
-                    "Using deprecated config location. Please rename to '{}'",
-                    canonical.display()
-                ),
-                path: compat_git.clone(),
-            });
-            let config = Self::read_repo_config(&compat_git)?;
-            return Ok((Some(config), Some(compat_git)));
+        // 2. Check compatibility locations (only for non-bare repos with .git directory)
+        let git_dir_compat = repo_path.join(".git");
+        if git_dir_compat.exists() && git_dir_compat.is_dir() {
+            // Check .git/lattice/repo.toml (compatibility)
+            let compat_git = git_dir_compat.join("lattice/repo.toml");
+            if compat_git.exists() {
+                warnings.push(ConfigWarning {
+                    message: format!(
+                        "Using deprecated config location. Please rename to '{}'",
+                        canonical.display()
+                    ),
+                    path: compat_git.clone(),
+                });
+                let config = Self::read_repo_config(&compat_git)?;
+                return Ok((Some(config), Some(compat_git)));
+            }
         }
 
         // 3. Check .lattice/repo.toml (compatibility)
@@ -273,9 +290,26 @@ impl Config {
 
     /// Get the canonical path for repo config.
     ///
-    /// Returns `.git/lattice/config.toml` relative to the given repo path.
-    pub fn repo_config_path(repo_path: &Path) -> PathBuf {
-        repo_path.join(".git/lattice/config.toml")
+    /// Uses Git discovery to find the correct location. This handles:
+    /// - Normal repos: `<repo>/.git/lattice/config.toml`
+    /// - Bare repos: `<repo>/lattice/config.toml`
+    /// - Worktrees: `<common_dir>/lattice/config.toml`
+    ///
+    /// Returns `None` if the path is not a git repository.
+    pub fn repo_config_path(repo_path: &Path) -> Option<PathBuf> {
+        let git = Git::open(repo_path).ok()?;
+        let info = git.info().ok()?;
+        let paths = LatticePaths::from_repo_info(&info);
+        Some(paths.repo_config_path())
+    }
+
+    /// Get the canonical path for repo config, falling back to the legacy path.
+    ///
+    /// This is for compatibility with code that expects a path even if
+    /// git discovery fails.
+    pub fn repo_config_path_legacy(repo_path: &Path) -> PathBuf {
+        Self::repo_config_path(repo_path)
+            .unwrap_or_else(|| repo_path.join(".git/lattice/config.toml"))
     }
 
     /// Write global config atomically.
@@ -290,10 +324,22 @@ impl Config {
 
     /// Write repo config atomically.
     ///
+    /// Uses Git discovery to find the correct location. This handles:
+    /// - Normal repos: `<repo>/.git/lattice/config.toml`
+    /// - Bare repos: `<repo>/lattice/config.toml`
+    /// - Worktrees: `<common_dir>/lattice/config.toml`
+    ///
     /// Creates parent directories if needed. Uses atomic write
     /// (write to temp file, then rename) to prevent corruption.
     pub fn write_repo(repo_path: &Path, config: &RepoConfig) -> Result<PathBuf, ConfigError> {
-        let path = Self::repo_config_path(repo_path);
+        let git = Git::open(repo_path).map_err(|e| {
+            ConfigError::InvalidValue(format!("Failed to open git repository: {}", e))
+        })?;
+        let info = git.info().map_err(|e| {
+            ConfigError::InvalidValue(format!("Failed to get repository info: {}", e))
+        })?;
+        let paths = LatticePaths::from_repo_info(&info);
+        let path = paths.repo_config_path();
         Self::write_config_atomic(&path, config)?;
         Ok(path)
     }
@@ -441,7 +487,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    /// Create a real git repo in a temp directory for testing
+    fn init_git_repo(path: &Path) {
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .expect("git init failed");
+    }
 
     #[test]
     fn load_empty_defaults() {
@@ -491,10 +547,12 @@ mod tests {
     #[test]
     fn load_repo_config() {
         let temp = TempDir::new().unwrap();
-        let git_dir = temp.path().join(".git/lattice");
-        fs::create_dir_all(&git_dir).unwrap();
+        init_git_repo(temp.path());
 
-        let config_path = git_dir.join("config.toml");
+        let lattice_dir = temp.path().join(".git/lattice");
+        fs::create_dir_all(&lattice_dir).unwrap();
+
+        let config_path = lattice_dir.join("config.toml");
         fs::write(
             &config_path,
             r#"
@@ -515,11 +573,13 @@ mod tests {
     #[test]
     fn load_repo_compat_warns() {
         let temp = TempDir::new().unwrap();
-        let git_dir = temp.path().join(".git/lattice");
-        fs::create_dir_all(&git_dir).unwrap();
+        init_git_repo(temp.path());
+
+        let lattice_dir = temp.path().join(".git/lattice");
+        fs::create_dir_all(&lattice_dir).unwrap();
 
         // Use deprecated path
-        let config_path = git_dir.join("repo.toml");
+        let config_path = lattice_dir.join("repo.toml");
         fs::write(&config_path, "trunk = \"main\"").unwrap();
 
         let result = Config::load(Some(temp.path())).unwrap();
@@ -532,8 +592,7 @@ mod tests {
     #[test]
     fn write_repo_config_atomic() {
         let temp = TempDir::new().unwrap();
-        let git_dir = temp.path().join(".git");
-        fs::create_dir_all(&git_dir).unwrap();
+        init_git_repo(temp.path());
 
         let config = RepoConfig {
             trunk: Some("develop".to_string()),
@@ -551,10 +610,12 @@ mod tests {
     #[test]
     fn invalid_trunk_rejected() {
         let temp = TempDir::new().unwrap();
-        let git_dir = temp.path().join(".git/lattice");
-        fs::create_dir_all(&git_dir).unwrap();
+        init_git_repo(temp.path());
 
-        let config_path = git_dir.join("config.toml");
+        let lattice_dir = temp.path().join(".git/lattice");
+        fs::create_dir_all(&lattice_dir).unwrap();
+
+        let config_path = lattice_dir.join("config.toml");
         fs::write(&config_path, "trunk = \"invalid..name\"").unwrap();
 
         let result = Config::load(Some(temp.path()));
@@ -564,10 +625,12 @@ mod tests {
     #[test]
     fn unknown_fields_rejected() {
         let temp = TempDir::new().unwrap();
-        let git_dir = temp.path().join(".git/lattice");
-        fs::create_dir_all(&git_dir).unwrap();
+        init_git_repo(temp.path());
 
-        let config_path = git_dir.join("config.toml");
+        let lattice_dir = temp.path().join(".git/lattice");
+        fs::create_dir_all(&lattice_dir).unwrap();
+
+        let config_path = lattice_dir.join("config.toml");
         fs::write(
             &config_path,
             r#"
