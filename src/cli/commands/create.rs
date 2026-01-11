@@ -6,6 +6,7 @@ use crate::core::metadata::schema::{
 };
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::OpState;
+use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
 use crate::engine::scan::scan;
 use crate::engine::Context;
@@ -39,10 +40,11 @@ pub fn create(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,

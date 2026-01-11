@@ -25,6 +25,7 @@ use anyhow::{bail, Context as _, Result};
 
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpPhase, OpState};
+use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Oid};
 use crate::engine::scan::RepoSnapshot;
 use crate::engine::Context;
@@ -111,7 +112,7 @@ pub fn check_freeze(branch: &BranchName, snapshot: &RepoSnapshot) -> Result<()> 
 /// * `new_base` - New base commit (--onto target)
 /// * `journal` - Journal for recording state
 /// * `remaining_branches` - Branches remaining to process after this one
-/// * `git_dir` - Path to .git directory
+/// * `paths` - LatticePaths for repository paths
 /// * `_ctx` - Execution context (for quiet/debug flags)
 ///
 /// # Returns
@@ -128,7 +129,7 @@ pub fn rebase_onto_with_journal(
     new_base: &Oid,
     journal: &mut Journal,
     remaining_branches: Vec<String>,
-    git_dir: &Path,
+    paths: &LatticePaths,
     _ctx: &Context,
 ) -> Result<RebaseOutcome> {
     // Record checkpoint before rebase
@@ -182,11 +183,11 @@ pub fn rebase_onto_with_journal(
             // Conflict - pause operation
             journal.record_conflict_paused(branch.as_str(), "rebase", remaining_branches);
             journal.pause();
-            journal.write(git_dir)?;
+            journal.write(paths)?;
 
-            let mut op_state = OpState::from_journal(journal);
+            let mut op_state = OpState::from_journal(journal, paths, None);
             op_state.phase = OpPhase::Paused;
-            op_state.write(git_dir)?;
+            op_state.write(paths)?;
 
             Ok(RebaseOutcome::Conflict)
         } else {

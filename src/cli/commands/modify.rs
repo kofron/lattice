@@ -25,6 +25,7 @@ use crate::core::metadata::schema::BaseInfo;
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
+use crate::core::paths::LatticePaths;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -54,10 +55,11 @@ pub fn modify(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
@@ -188,14 +190,14 @@ pub fn modify(
     }
 
     // Acquire lock before mutating
-    let _lock = RepoLock::acquire(git_dir).context("Failed to acquire repository lock")?;
+    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
 
     // Create journal
     let mut journal = Journal::new("modify");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal);
-    op_state.write(git_dir)?;
+    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    op_state.write(&paths)?;
 
     // Record old tip for journal
     journal.record_ref_update(
@@ -213,7 +215,7 @@ pub fn modify(
 
     if !status.success() {
         // Clean up op-state on failure
-        OpState::remove(git_dir)?;
+        OpState::remove(&paths)?;
 
         if !has_staged && !commit_args.contains(&"--amend") {
             bail!("No staged changes to commit");
@@ -310,7 +312,7 @@ pub fn modify(
                 &parent_tip,
                 &mut journal,
                 remaining,
-                git_dir,
+                &paths,
                 ctx,
             )?;
 
@@ -365,10 +367,10 @@ pub fn modify(
 
     // Mark journal as committed
     journal.commit();
-    journal.write(git_dir)?;
+    journal.write(&paths)?;
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(&paths)?;
 
     if !ctx.quiet {
         println!("Modify complete.");

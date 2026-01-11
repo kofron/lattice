@@ -11,6 +11,7 @@
 //! - [`ops`] - Operation journaling and locking
 //! - [`metadata`] - Branch metadata schema and storage
 //! - [`config`] - Configuration schema and loading
+//! - [`paths`] - Centralized path routing for Lattice storage
 //!
 //! # Design Principles
 //!
@@ -23,5 +24,6 @@ pub mod graph;
 pub mod metadata;
 pub mod naming;
 pub mod ops;
+pub mod paths;
 pub mod types;
 pub mod verify;

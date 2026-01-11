@@ -9,21 +9,27 @@
 //! - Resume (`continue`) - complete a paused operation
 //! - Undo last completed operation
 //!
+//! Per SPEC.md Section 4.6.5, journals and op-state are **repo-scoped**
+//! (stored in `<common_dir>/lattice/`), which is shared across all worktrees.
+//!
 //! # Storage
 //!
-//! - `.git/lattice/ops/<op_id>.json` - Journal files (append-only with fsync)
-//! - `.git/lattice/op-state.json` - Current operation marker
+//! - `<common_dir>/lattice/ops/<op_id>.json` - Journal files (append-only with fsync)
+//! - `<common_dir>/lattice/op-state.json` - Current operation marker
 //!
 //! # Invariants
 //!
 //! - Journals must be written with fsync at each step boundary
 //! - Interrupted commands must be recoverable via the journal
 //! - All ref changes must be recorded with before/after OIDs
+//! - Op-state is repo-scoped (shared across worktrees)
+//! - Continue/abort must be run from the originating worktree when paused
 //!
 //! # Example
 //!
 //! ```ignore
 //! use latticework::core::ops::journal::{Journal, StepKind};
+//! use latticework::core::paths::LatticePaths;
 //!
 //! // Create a new journal for an operation
 //! let mut journal = Journal::new("restack");
@@ -36,11 +42,11 @@
 //! );
 //!
 //! // Write to disk with fsync
-//! journal.write(git_dir)?;
+//! journal.write(&paths)?;
 //!
 //! // Mark as committed when done
 //! journal.commit();
-//! journal.write(git_dir)?;
+//! journal.write(&paths)?;
 //! ```
 
 use std::fs::{self, OpenOptions};
@@ -51,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::core::paths::LatticePaths;
 use crate::core::types::UtcTimestamp;
 
 /// Errors from journal operations.
@@ -252,13 +259,15 @@ impl Journal {
     }
 
     /// Get the directory where journals are stored.
-    pub fn ops_dir(git_dir: &Path) -> PathBuf {
-        git_dir.join("lattice").join("ops")
+    ///
+    /// Per SPEC.md §4.6.5, journals are repo-scoped and stored in `<common_dir>/lattice/ops/`.
+    pub fn ops_dir(paths: &LatticePaths) -> PathBuf {
+        paths.repo_ops_dir()
     }
 
     /// Get the path to this journal's file.
-    pub fn file_path(&self, git_dir: &Path) -> PathBuf {
-        Self::ops_dir(git_dir).join(format!("{}.json", self.op_id))
+    pub fn file_path(&self, paths: &LatticePaths) -> PathBuf {
+        paths.repo_op_journal_path(self.op_id.as_str())
     }
 
     /// Add a step to the journal.
@@ -356,11 +365,12 @@ impl Journal {
     /// Write the journal to disk with fsync.
     ///
     /// This should be called after each step to ensure crash safety.
-    pub fn write(&self, git_dir: &Path) -> Result<(), JournalError> {
-        let dir = Self::ops_dir(git_dir);
+    /// Per SPEC.md §4.6.5, journals are written to `<common_dir>/lattice/ops/`.
+    pub fn write(&self, paths: &LatticePaths) -> Result<(), JournalError> {
+        let dir = Self::ops_dir(paths);
         fs::create_dir_all(&dir)?;
 
-        let path = self.file_path(git_dir);
+        let path = self.file_path(paths);
         let content = serde_json::to_string_pretty(self)?;
 
         let mut file = OpenOptions::new()
@@ -376,8 +386,10 @@ impl Journal {
     }
 
     /// Read a journal from disk.
-    pub fn read(git_dir: &Path, op_id: &OpId) -> Result<Self, JournalError> {
-        let path = Self::ops_dir(git_dir).join(format!("{}.json", op_id));
+    ///
+    /// Per SPEC.md §4.6.5, journals are read from `<common_dir>/lattice/ops/`.
+    pub fn read(paths: &LatticePaths, op_id: &OpId) -> Result<Self, JournalError> {
+        let path = paths.repo_op_journal_path(op_id.as_str());
 
         if !path.exists() {
             return Err(JournalError::NotFound(op_id.to_string()));
@@ -391,8 +403,9 @@ impl Journal {
     /// List all journal files.
     ///
     /// Returns operation IDs sorted by modification time (newest first).
-    pub fn list(git_dir: &Path) -> Result<Vec<OpId>, JournalError> {
-        let dir = Self::ops_dir(git_dir);
+    /// Per SPEC.md §4.6.5, journals are listed from `<common_dir>/lattice/ops/`.
+    pub fn list(paths: &LatticePaths) -> Result<Vec<OpId>, JournalError> {
+        let dir = Self::ops_dir(paths);
         if !dir.exists() {
             return Ok(vec![]);
         }
@@ -414,17 +427,19 @@ impl Journal {
     }
 
     /// Get the most recent journal.
-    pub fn most_recent(git_dir: &Path) -> Result<Option<Self>, JournalError> {
-        let ids = Self::list(git_dir)?;
+    ///
+    /// Per SPEC.md §4.6.5, journals are stored at `<common_dir>/lattice/ops/`.
+    pub fn most_recent(paths: &LatticePaths) -> Result<Option<Self>, JournalError> {
+        let ids = Self::list(paths)?;
         match ids.first() {
-            Some(id) => Ok(Some(Self::read(git_dir, id)?)),
+            Some(id) => Ok(Some(Self::read(paths, id)?)),
             None => Ok(None),
         }
     }
 
     /// Delete this journal from disk.
-    pub fn delete(&self, git_dir: &Path) -> Result<(), JournalError> {
-        let path = self.file_path(git_dir);
+    pub fn delete(&self, paths: &LatticePaths) -> Result<(), JournalError> {
+        let path = self.file_path(paths);
         if path.exists() {
             fs::remove_file(&path)?;
         }
@@ -453,6 +468,11 @@ impl Journal {
 /// This file exists only while a Lattice operation is executing or
 /// paused waiting for user intervention. It prevents other Lattice
 /// commands from running until the current operation is resolved.
+///
+/// Per SPEC.md §4.6.5, op-state is repo-scoped (shared across worktrees),
+/// stored at `<common_dir>/lattice/op-state.json`. The `origin_git_dir` and
+/// `origin_work_dir` fields track where the operation was started, which is
+/// required for `continue` and `abort` to be run from the correct worktree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpState {
     /// Operation id (matches the journal).
@@ -463,30 +483,53 @@ pub struct OpState {
     pub phase: OpPhase,
     /// When the op-state was last updated.
     pub updated_at: UtcTimestamp,
+    /// The git_dir of the worktree that started this operation.
+    ///
+    /// Per SPEC.md §4.6.5, `continue` and `abort` must be run from
+    /// the originating worktree when the operation is paused.
+    pub origin_git_dir: PathBuf,
+    /// The work_dir of the originating worktree.
+    ///
+    /// None for bare repositories (no working directory available).
+    pub origin_work_dir: Option<PathBuf>,
 }
 
 impl OpState {
     /// Create a new op-state marker from a journal.
-    pub fn from_journal(journal: &Journal) -> Self {
+    ///
+    /// The `paths` argument identifies the originating worktree, which is
+    /// required per SPEC.md §4.6.5 for `continue` and `abort` enforcement.
+    /// The `work_dir` is None for bare repositories.
+    pub fn from_journal(
+        journal: &Journal,
+        paths: &LatticePaths,
+        work_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             op_id: journal.op_id.clone(),
             command: journal.command.clone(),
             phase: journal.phase.clone(),
             updated_at: UtcTimestamp::now(),
+            origin_git_dir: paths.git_dir.clone(),
+            origin_work_dir: work_dir,
         }
     }
 
     /// Path to the op-state file.
-    pub fn path(git_dir: &Path) -> PathBuf {
-        git_dir.join("lattice").join("op-state.json")
+    ///
+    /// Per SPEC.md §4.6.5, op-state is stored at `<common_dir>/lattice/op-state.json`.
+    pub fn path(paths: &LatticePaths) -> PathBuf {
+        paths.repo_op_state_path()
     }
 
     /// Write the op-state marker to disk.
-    pub fn write(&self, git_dir: &Path) -> Result<(), JournalError> {
-        let dir = git_dir.join("lattice");
+    ///
+    /// Per SPEC.md §4.6.5, op-state is written to `<common_dir>/lattice/op-state.json`.
+    pub fn write(&self, paths: &LatticePaths) -> Result<(), JournalError> {
+        let dir = paths.repo_lattice_dir();
         fs::create_dir_all(&dir)?;
 
-        let path = Self::path(git_dir);
+        let path = Self::path(paths);
         let content = serde_json::to_string_pretty(self)?;
 
         let mut file = OpenOptions::new()
@@ -502,8 +545,10 @@ impl OpState {
     }
 
     /// Read the op-state marker, if it exists.
-    pub fn read(git_dir: &Path) -> Result<Option<Self>, JournalError> {
-        let path = Self::path(git_dir);
+    ///
+    /// Per SPEC.md §4.6.5, op-state is read from `<common_dir>/lattice/op-state.json`.
+    pub fn read(paths: &LatticePaths) -> Result<Option<Self>, JournalError> {
+        let path = Self::path(paths);
         if !path.exists() {
             return Ok(None);
         }
@@ -514,8 +559,10 @@ impl OpState {
     }
 
     /// Remove the op-state marker.
-    pub fn remove(git_dir: &Path) -> Result<(), JournalError> {
-        let path = Self::path(git_dir);
+    ///
+    /// Per SPEC.md §4.6.5, op-state is stored at `<common_dir>/lattice/op-state.json`.
+    pub fn remove(paths: &LatticePaths) -> Result<(), JournalError> {
+        let path = Self::path(paths);
         if path.exists() {
             fs::remove_file(&path)?;
         }
@@ -523,15 +570,37 @@ impl OpState {
     }
 
     /// Check if an op-state marker exists.
-    pub fn exists(git_dir: &Path) -> bool {
-        Self::path(git_dir).exists()
+    pub fn exists(paths: &LatticePaths) -> bool {
+        Self::path(paths).exists()
     }
 
     /// Update the phase and write to disk.
-    pub fn update_phase(&mut self, phase: OpPhase, git_dir: &Path) -> Result<(), JournalError> {
+    pub fn update_phase(
+        &mut self,
+        phase: OpPhase,
+        paths: &LatticePaths,
+    ) -> Result<(), JournalError> {
         self.phase = phase;
         self.updated_at = UtcTimestamp::now();
-        self.write(git_dir)
+        self.write(paths)
+    }
+
+    /// Check if continue/abort can be run from the current worktree.
+    ///
+    /// Per SPEC.md §4.6.5, `continue` and `abort` must be run from the
+    /// originating worktree when the operation is paused due to Git conflicts.
+    /// Returns `Ok(())` if allowed, or `Err` with a message pointing to the
+    /// correct worktree.
+    pub fn check_origin_worktree(&self, current_git_dir: &Path) -> Result<(), String> {
+        if self.origin_git_dir == current_git_dir {
+            Ok(())
+        } else {
+            Err(format!(
+                "This operation was started in a different worktree.\n\
+                 Please run continue/abort from: {}",
+                self.origin_git_dir.display()
+            ))
+        }
     }
 }
 
@@ -542,6 +611,12 @@ mod tests {
 
     fn create_test_dir() -> TempDir {
         TempDir::new().expect("create temp dir")
+    }
+
+    /// Create test paths from a temp directory.
+    /// For normal repos, git_dir == common_dir.
+    fn create_test_paths(temp: &TempDir) -> LatticePaths {
+        LatticePaths::new(temp.path().to_path_buf(), temp.path().to_path_buf())
     }
 
     mod op_id {
@@ -753,16 +828,16 @@ mod tests {
         #[test]
         fn write_and_read_roundtrip() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let mut journal = Journal::new("restack");
             journal.record_ref_update("refs/heads/feature", None, "abc123");
             journal.record_checkpoint("midpoint");
             journal.commit();
 
-            journal.write(git_dir).expect("write");
+            journal.write(&paths).expect("write");
 
-            let loaded = Journal::read(git_dir, &journal.op_id).expect("read");
+            let loaded = Journal::read(&paths, &journal.op_id).expect("read");
 
             assert_eq!(loaded.op_id, journal.op_id);
             assert_eq!(loaded.command, journal.command);
@@ -773,27 +848,27 @@ mod tests {
         #[test]
         fn read_nonexistent_returns_error() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
-            let result = Journal::read(git_dir, &OpId::from_string("nonexistent"));
+            let result = Journal::read(&paths, &OpId::from_string("nonexistent"));
             assert!(matches!(result, Err(JournalError::NotFound(_))));
         }
 
         #[test]
         fn list_returns_journals_by_mtime() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let journal1 = Journal::new("first");
-            journal1.write(git_dir).expect("write 1");
+            journal1.write(&paths).expect("write 1");
 
             // Small delay to ensure different mtime
             std::thread::sleep(std::time::Duration::from_millis(10));
 
             let journal2 = Journal::new("second");
-            journal2.write(git_dir).expect("write 2");
+            journal2.write(&paths).expect("write 2");
 
-            let ids = Journal::list(git_dir).expect("list");
+            let ids = Journal::list(&paths).expect("list");
 
             assert_eq!(ids.len(), 2);
             // Most recent first
@@ -804,26 +879,26 @@ mod tests {
         #[test]
         fn list_empty_dir() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
-            let ids = Journal::list(git_dir).expect("list");
+            let ids = Journal::list(&paths).expect("list");
             assert!(ids.is_empty());
         }
 
         #[test]
         fn most_recent_returns_latest() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let journal1 = Journal::new("first");
-            journal1.write(git_dir).expect("write 1");
+            journal1.write(&paths).expect("write 1");
 
             std::thread::sleep(std::time::Duration::from_millis(10));
 
             let journal2 = Journal::new("second");
-            journal2.write(git_dir).expect("write 2");
+            journal2.write(&paths).expect("write 2");
 
-            let recent = Journal::most_recent(git_dir)
+            let recent = Journal::most_recent(&paths)
                 .expect("most_recent")
                 .expect("should have journal");
 
@@ -833,24 +908,24 @@ mod tests {
         #[test]
         fn most_recent_returns_none_when_empty() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
-            let recent = Journal::most_recent(git_dir).expect("most_recent");
+            let recent = Journal::most_recent(&paths).expect("most_recent");
             assert!(recent.is_none());
         }
 
         #[test]
         fn delete_removes_file() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let journal = Journal::new("test");
-            journal.write(git_dir).expect("write");
+            journal.write(&paths).expect("write");
 
-            let path = journal.file_path(git_dir);
+            let path = journal.file_path(&paths);
             assert!(path.exists());
 
-            journal.delete(git_dir).expect("delete");
+            journal.delete(&paths).expect("delete");
             assert!(!path.exists());
         }
 
@@ -878,6 +953,34 @@ mod tests {
                 matches!(updates[2], StepKind::RefUpdate { refname, .. } if refname == "refs/heads/a")
             );
         }
+
+        #[test]
+        fn worktree_shares_journals_via_common_dir() {
+            // Simulate a worktree where git_dir != common_dir
+            let temp = create_test_dir();
+            let common_dir = temp.path().to_path_buf();
+            let worktree_git_dir = temp.path().join("worktrees").join("feature");
+
+            // Parent repo paths (uses common_dir for storage)
+            let parent_paths = LatticePaths::new(common_dir.clone(), common_dir.clone());
+
+            // Worktree paths (different git_dir, same common_dir)
+            let worktree_paths = LatticePaths::new(worktree_git_dir, common_dir);
+
+            // Write journal from parent
+            let journal = Journal::new("restack");
+            journal.write(&parent_paths).expect("write from parent");
+
+            // Read journal from worktree - should see same journal
+            let loaded =
+                Journal::read(&worktree_paths, &journal.op_id).expect("read from worktree");
+            assert_eq!(loaded.op_id, journal.op_id);
+
+            // List from worktree should show the journal
+            let ids = Journal::list(&worktree_paths).expect("list from worktree");
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0], journal.op_id);
+        }
     }
 
     mod op_state {
@@ -885,99 +988,183 @@ mod tests {
 
         #[test]
         fn from_journal() {
+            let temp = create_test_dir();
+            let paths = create_test_paths(&temp);
+            let work_dir = Some(temp.path().join("workdir"));
+
             let journal = Journal::new("test-cmd");
-            let state = OpState::from_journal(&journal);
+            let state = OpState::from_journal(&journal, &paths, work_dir.clone());
 
             assert_eq!(state.op_id, journal.op_id);
             assert_eq!(state.command, "test-cmd");
             assert_eq!(state.phase, OpPhase::InProgress);
+            assert_eq!(state.origin_git_dir, paths.git_dir);
+            assert_eq!(state.origin_work_dir, work_dir);
+        }
+
+        #[test]
+        fn from_journal_bare_repo() {
+            let temp = create_test_dir();
+            let paths = create_test_paths(&temp);
+
+            let journal = Journal::new("test-cmd");
+            // Bare repo has no work_dir
+            let state = OpState::from_journal(&journal, &paths, None);
+
+            assert_eq!(state.origin_git_dir, paths.git_dir);
+            assert!(state.origin_work_dir.is_none());
         }
 
         #[test]
         fn write_and_read_roundtrip() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
+            let work_dir = Some(temp.path().join("workdir"));
 
             let journal = Journal::new("test");
-            let state = OpState::from_journal(&journal);
-            state.write(git_dir).expect("write");
+            let state = OpState::from_journal(&journal, &paths, work_dir);
+            state.write(&paths).expect("write");
 
-            let loaded = OpState::read(git_dir).expect("read").expect("should exist");
+            let loaded = OpState::read(&paths).expect("read").expect("should exist");
 
             assert_eq!(loaded.op_id, state.op_id);
             assert_eq!(loaded.command, state.command);
             assert_eq!(loaded.phase, state.phase);
+            assert_eq!(loaded.origin_git_dir, state.origin_git_dir);
+            assert_eq!(loaded.origin_work_dir, state.origin_work_dir);
         }
 
         #[test]
         fn read_nonexistent_returns_none() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
-            let result = OpState::read(git_dir).expect("read");
+            let result = OpState::read(&paths).expect("read");
             assert!(result.is_none());
         }
 
         #[test]
         fn exists_check() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
-            assert!(!OpState::exists(git_dir));
+            assert!(!OpState::exists(&paths));
 
             let journal = Journal::new("test");
-            let state = OpState::from_journal(&journal);
-            state.write(git_dir).expect("write");
+            let state = OpState::from_journal(&journal, &paths, None);
+            state.write(&paths).expect("write");
 
-            assert!(OpState::exists(git_dir));
+            assert!(OpState::exists(&paths));
         }
 
         #[test]
         fn remove_clears_file() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let journal = Journal::new("test");
-            let state = OpState::from_journal(&journal);
-            state.write(git_dir).expect("write");
+            let state = OpState::from_journal(&journal, &paths, None);
+            state.write(&paths).expect("write");
 
-            assert!(OpState::exists(git_dir));
+            assert!(OpState::exists(&paths));
 
-            OpState::remove(git_dir).expect("remove");
+            OpState::remove(&paths).expect("remove");
 
-            assert!(!OpState::exists(git_dir));
+            assert!(!OpState::exists(&paths));
         }
 
         #[test]
         fn remove_nonexistent_ok() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             // Should not error
-            OpState::remove(git_dir).expect("remove nonexistent");
+            OpState::remove(&paths).expect("remove nonexistent");
         }
 
         #[test]
         fn update_phase() {
             let temp = create_test_dir();
-            let git_dir = temp.path();
+            let paths = create_test_paths(&temp);
 
             let journal = Journal::new("test");
-            let mut state = OpState::from_journal(&journal);
-            state.write(git_dir).expect("write");
+            let mut state = OpState::from_journal(&journal, &paths, None);
+            state.write(&paths).expect("write");
 
-            state
-                .update_phase(OpPhase::Paused, git_dir)
-                .expect("update");
+            state.update_phase(OpPhase::Paused, &paths).expect("update");
 
-            let loaded = OpState::read(git_dir).expect("read").expect("should exist");
+            let loaded = OpState::read(&paths).expect("read").expect("should exist");
             assert_eq!(loaded.phase, OpPhase::Paused);
         }
 
         #[test]
-        fn path_is_correct() {
-            let path = OpState::path(Path::new("/repo/.git"));
+        fn path_uses_common_dir() {
+            // Simulate worktree: git_dir != common_dir
+            let common_dir = PathBuf::from("/repo/.git");
+            let git_dir = PathBuf::from("/repo/.git/worktrees/feature");
+            let paths = LatticePaths::new(git_dir, common_dir);
+
+            let path = OpState::path(&paths);
+            // Should use common_dir, not git_dir
             assert_eq!(path, PathBuf::from("/repo/.git/lattice/op-state.json"));
+        }
+
+        #[test]
+        fn check_origin_worktree_same() {
+            let temp = create_test_dir();
+            let paths = create_test_paths(&temp);
+
+            let journal = Journal::new("test");
+            let state = OpState::from_journal(&journal, &paths, None);
+
+            // Same worktree should pass
+            assert!(state.check_origin_worktree(&paths.git_dir).is_ok());
+        }
+
+        #[test]
+        fn check_origin_worktree_different() {
+            let temp = create_test_dir();
+            let paths = create_test_paths(&temp);
+
+            let journal = Journal::new("test");
+            let state = OpState::from_journal(&journal, &paths, None);
+
+            // Different worktree should fail
+            let other_git_dir = PathBuf::from("/other/worktree/.git");
+            let result = state.check_origin_worktree(&other_git_dir);
+            assert!(result.is_err());
+
+            let err_msg = result.unwrap_err();
+            assert!(err_msg.contains("different worktree"));
+            assert!(err_msg.contains(&paths.git_dir.display().to_string()));
+        }
+
+        #[test]
+        fn worktree_shares_op_state_via_common_dir() {
+            // Simulate a worktree where git_dir != common_dir
+            let temp = create_test_dir();
+            let common_dir = temp.path().to_path_buf();
+            let worktree_git_dir = temp.path().join("worktrees").join("feature");
+
+            // Parent repo paths
+            let parent_paths = LatticePaths::new(common_dir.clone(), common_dir.clone());
+
+            // Worktree paths (different git_dir, same common_dir)
+            let worktree_paths = LatticePaths::new(worktree_git_dir, common_dir);
+
+            // Write op-state from parent
+            let journal = Journal::new("restack");
+            let state = OpState::from_journal(&journal, &parent_paths, None);
+            state.write(&parent_paths).expect("write from parent");
+
+            // Read op-state from worktree - should see same state
+            let loaded = OpState::read(&worktree_paths)
+                .expect("read from worktree")
+                .expect("should exist");
+            assert_eq!(loaded.op_id, state.op_id);
+
+            // exists() from worktree should return true
+            assert!(OpState::exists(&worktree_paths));
         }
     }
 

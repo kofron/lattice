@@ -29,6 +29,7 @@ use crate::core::metadata::schema::{BaseInfo, ParentInfo};
 use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
+use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
 use crate::engine::scan::scan;
 use crate::engine::Context;
@@ -45,10 +46,11 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
@@ -97,7 +99,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
     check_freeze_affected_set(&stack, &snapshot)?;
 
     // Create temp file with branch list
-    let temp_file = git_dir.join("REORDER_BRANCHES");
+    let temp_file = paths.git_dir.join("REORDER_BRANCHES");
     let content = format!(
         "# Reorder branches by moving lines. Lines starting with # are ignored.\n\
          # Do not add or remove branches.\n\
@@ -209,14 +211,14 @@ pub fn reorder(ctx: &Context) -> Result<()> {
     }
 
     // Acquire lock
-    let _lock = RepoLock::acquire(git_dir).context("Failed to acquire repository lock")?;
+    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
 
     // Create journal
     let mut journal = Journal::new("reorder");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal);
-    op_state.write(git_dir)?;
+    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    op_state.write(&paths)?;
 
     // Execute rebase sequence
     // We need to rebase each branch onto its new parent
@@ -275,7 +277,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
             new_parent_tip,
             &mut journal,
             remaining,
-            git_dir,
+            &paths,
             ctx,
         )?;
 
@@ -358,10 +360,10 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Commit journal
     journal.commit();
-    journal.write(git_dir)?;
+    journal.write(&paths)?;
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(&paths)?;
 
     if !ctx.quiet {
         println!("Reorder complete.");

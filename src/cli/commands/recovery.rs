@@ -1,6 +1,7 @@
 //! continue and abort commands - Resume or cancel paused operations
 
 use crate::core::ops::journal::{OpPhase, OpState};
+use crate::core::paths::LatticePaths;
 use crate::engine::Context;
 use crate::git::{Git, GitState};
 use anyhow::{bail, Context as _, Result};
@@ -18,11 +19,12 @@ pub fn continue_op(ctx: &Context, all: bool) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
     let op_state =
-        OpState::read(git_dir)?.ok_or_else(|| anyhow::anyhow!("No operation in progress"))?;
+        OpState::read(&paths)?.ok_or_else(|| anyhow::anyhow!("No operation in progress"))?;
 
     if op_state.phase != OpPhase::Paused {
         bail!(
@@ -39,7 +41,7 @@ pub fn continue_op(ctx: &Context, all: bool) -> Result<()> {
         if !ctx.quiet {
             println!("Git operation appears to be complete. Cleaning up...");
         }
-        OpState::remove(git_dir)?;
+        OpState::remove(&paths)?;
         return Ok(());
     }
 
@@ -93,7 +95,7 @@ pub fn continue_op(ctx: &Context, all: bool) -> Result<()> {
     // A full implementation would read the journal and continue remaining steps
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(&paths)?;
 
     if !ctx.quiet {
         println!("Operation '{}' completed.", op_state.command);
@@ -109,11 +111,12 @@ pub fn abort(ctx: &Context) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
     let op_state =
-        OpState::read(git_dir)?.ok_or_else(|| anyhow::anyhow!("No operation in progress"))?;
+        OpState::read(&paths)?.ok_or_else(|| anyhow::anyhow!("No operation in progress"))?;
 
     if !ctx.quiet {
         println!("Aborting {}...", op_state.command);
@@ -148,7 +151,7 @@ pub fn abort(ctx: &Context) -> Result<()> {
     // A full implementation would use journal.ref_updates_for_rollback()
 
     // Clear op-state
-    OpState::remove(git_dir)?;
+    OpState::remove(&paths)?;
 
     if !ctx.quiet {
         println!("Operation '{}' aborted.", op_state.command);

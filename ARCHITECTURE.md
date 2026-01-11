@@ -71,7 +71,9 @@ Lattice stores all persistent, repository-scoped state inside the repository. Th
 
 Repository configuration is stored under:
 
-* `.git/lattice/config.toml`
+* `<git common dir>/lattice/config.toml`
+
+In normal repositories, common dir equals git dir (`.git/`). In linked worktrees, common dir is the shared parent repository's git directory. See SPEC.md §4.6 for full definitions.
 
 This config MUST contain:
 
@@ -95,7 +97,8 @@ Branch metadata is divided into:
 
 * `version`
 * `parent`
-* `frozen`
+* `base` (commit OID representing where branch diverged from parent)
+* `frozen` (structured freeze state, not a simple boolean)
 
 **Cached fields (non-blocking, may be missing or stale):**
 
@@ -114,14 +117,16 @@ Metadata parsing is strict:
 
 This ensures Lattice never “accidentally accepts” malformed metadata and then acts on it.
 
-Illustrative interface (architectural shape):
+Illustrative interface (architectural shape, non-exhaustive):
 
 ```rust
 /// Structural metadata only. Cached fields are defined separately.
+/// See SPEC.md Appendix A for the complete schema.
 pub struct BranchMetadataV1 {
     pub version: u32,          // always 1 for this schema
     pub parent: BranchName,    // validated refname-compatible branch name
-    pub frozen: bool,
+    pub base: Oid,             // commit where branch diverged from parent
+    pub frozen: FreezeState,   // structured state, not a simple boolean
 }
 ```
 
@@ -135,7 +140,7 @@ This prevents applying a plan to a changed reality.
 
 Lattice maintains an operation state marker to make in-progress operations explicit:
 
-* `.git/lattice/op-state.json`
+* `<git common dir>/lattice/op-state.json`
 
 This file exists only when Lattice is executing a multi-step operation or when that operation is waiting for user conflict resolution.
 
@@ -146,6 +151,10 @@ The op-state marker MUST include:
 * touched refs and their expected old values
 * plan digest
 * phase (`executing` or `awaiting_user`)
+* `origin_git_dir`: The git_dir of the worktree that started the operation
+* `origin_work_dir`: The work_dir of the originating worktree (None for bare repos)
+
+The op-state is repo-scoped (shared across worktrees), but Git conflict state (rebase/merge/cherry-pick) is per-worktree. Therefore, `continue` and `abort` MUST be run from the originating worktree when the operation is paused due to Git conflicts.
 
 While the op-state marker exists, Lattice MUST:
 
@@ -285,9 +294,12 @@ Representative capabilities:
 * `ScopeResolved`
 * `FrozenPolicySatisfied`
 * `WorkingCopyStateKnown`
+* `WorkingDirectoryAvailable` – A working directory exists (absent in bare repos)
 * `AuthAvailable(host)` – A valid GitHub App user access token exists for the specified host OR can be refreshed
 * `RemoteResolved(owner, repo)` – The git remote can be parsed to identify the owner and repository
 * `RepoAuthorized(owner, repo)` – The authenticated user's token has access to the specified repository via an installed GitHub App
+
+Bare repositories are missing `WorkingDirectoryAvailable`. Commands requiring this capability (e.g., `create`, `checkout`, `restack`) are gated and refuse with guidance rather than failing obscurely. See SPEC.md §4.6.6 for command categories.
 
 A capability either exists or does not. “Partial” capability is represented as absence plus an issue in the health report.
 
@@ -366,6 +378,7 @@ The Executor MUST:
 * acquire the Lattice repository lock for the duration of execution
 * write op-state marker before the first mutation
 * record `IntentRecorded` event before the first mutation
+* revalidate worktree occupancy constraints under lock before ref-mutating steps (abort with precondition-failed if occupancy changed since scan)
 * apply all ref updates with CAS semantics
 * if a CAS precondition fails, abort without continuing execution and record `Aborted`
 * if a Git conflict pauses execution, transition op-state to `awaiting_user` and stop

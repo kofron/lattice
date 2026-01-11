@@ -113,7 +113,7 @@ A state is self-consistent if all of the following are true:
 
 Every mutating command MUST:
 
-* Acquire an **exclusive repo lock** (`.git/lattice/lock`) before making changes.
+* Acquire an **exclusive repo lock** (`<common_dir>/lattice/lock`; see §4.6) before making changes.
 * Run a **preflight verification** (fast, deterministic).
 * Create an **operation journal** before any irreversible step.
 * Apply changes using a **transaction-like ref update strategy**:
@@ -178,8 +178,8 @@ See Appendix A for the full schema.
 
 Mutating commands must write an operation journal under:
 
-* `.git/lattice/ops/<op_id>.json`
-* `.git/lattice/current-op` (text file containing `<op_id>`) while in progress
+* `<common_dir>/lattice/ops/<op_id>.json`
+* `<common_dir>/lattice/op-state.json` (see §4.6.5) while in progress
 
 The journal is the source of truth for:
 
@@ -209,7 +209,7 @@ The journal is the source of truth for:
 * Journals must be written with `fsync` at each appended step boundary.
 * A command interrupted mid-flight must be recoverable:
 
-  * next invocation of `lattice` detects `current-op`
+  * next invocation of `lattice` detects `op-state.json`
   * refuses most commands and instructs:
 
     * `lattice continue`, `lattice abort`, or `lattice undo` depending on journal state
@@ -234,7 +234,7 @@ Global config search order:
 
 Repo config location:
 
-* `.git/lattice/config.toml` (canonical)
+* `<common_dir>/lattice/config.toml` (canonical; see §4.6.3)
 
 Precedence:
 
@@ -381,7 +381,7 @@ To manage authorization at the owner/repo level, Lattice stores **repo identity 
 
 Repo config file location:
 
-* `.git/lattice/config.toml` (canonical)
+* `<common_dir>/lattice/config.toml` (canonical; see §4.6.3)
 
 Add the following table to repo config:
 
@@ -402,6 +402,357 @@ Notes:
 * `owner`/`repo` default to parsing the git remote URL; config acts as an override.
 * Cached ids (`installation_id`, `repository_id`) speed up "is the app installed for this repo?" checks but are not required for correctness.
 * `authorized_at` is a timestamp for cache invalidation (recommended TTL: 10 minutes).
+
+---
+
+### 4.6 Repository contexts: linked worktrees and bare repositories
+
+Lattice MUST run safely and predictably in:
+
+1. **Normal repositories** (single working tree, `.git/` directory)
+2. **Linked worktrees** (`git worktree add ...`)
+3. **Bare repositories** (`git init --bare` or `core.bare=true`)
+
+The prime invariant remains unchanged:
+
+> At the beginning and end of every `lattice` command, the repository and metadata must be in a self-consistent state.
+
+Worktrees and bare repos change *where* state lives and *which commands are valid* in a given context. They do not relax correctness guarantees.
+
+#### 4.6.1 Definitions: git dir, common dir, work dir
+
+Git introduces three relevant paths:
+
+* **git dir**: The per-worktree Git directory that contains `HEAD`, `index`, and in-progress operation state (rebase/merge/cherry-pick).
+
+  * Normal repo: `<repo>/.git/`
+  * Worktree: `<common>/.git/worktrees/<name>/`
+  * Bare repo: `<repo>/` (the repo root is the git dir)
+
+* **common dir**: The shared directory that contains the object database and shared refs namespace.
+
+  * Normal repo: `<repo>/.git/`
+  * Worktree: the "main" repo's `.git/` (shared)
+  * Bare repo: `<repo>/`
+
+* **work dir**: The checked-out working directory (files).
+
+  * Normal repo: `<repo>/`
+  * Worktree: `<worktree path>/`
+  * Bare repo: **none**
+
+Lattice MUST treat **common dir** as the canonical "repository scope" for all Lattice repo-scoped persistence.
+
+#### 4.6.2 RepoInfo and context classification
+
+The Git interface MUST expose a single authoritative structure for repository context detection:
+
+```rust
+pub enum RepoContext { Normal, Worktree, Bare }
+
+pub struct RepoInfo {
+    pub git_dir: PathBuf,           // per-worktree git dir
+    pub common_dir: PathBuf,        // shared common dir
+    pub work_dir: Option<PathBuf>,  // None iff bare
+    pub context: RepoContext,
+}
+```
+
+Classification MUST be deterministic:
+
+* `Bare` iff `work_dir.is_none()`
+* Else `Worktree` iff `git_dir != common_dir`
+* Else `Normal`
+
+This classification MUST work when invoked from:
+
+* the repo root
+* nested subdirectories
+* a linked worktree
+* a bare repo directory
+* `--cwd <path>` overrides
+
+#### 4.6.3 Canonical repository-scoped storage location
+
+All repository-scoped Lattice state MUST be stored under:
+
+> **`<common_dir>/lattice/`**
+
+This path is called the **Repo Lattice Dir**.
+
+Concretely:
+
+| Purpose                      | Canonical path                       |
+| ---------------------------- | ------------------------------------ |
+| Repo config                  | `<common_dir>/lattice/config.toml`   |
+| Repo lock                    | `<common_dir>/lattice/lock`          |
+| Operation state marker       | `<common_dir>/lattice/op-state.json` |
+| Operation journals directory | `<common_dir>/lattice/ops/`          |
+| Optional caches              | `<common_dir>/lattice/cache/`        |
+
+**Hard rule:** No code may assume `.git/` is a directory or writable in the current working directory. In worktrees, `.git` may be a gitfile, and repo-scoped state must still be shared across all worktrees.
+
+##### Centralized path routing (mandatory)
+
+To prevent path drift, all code MUST obtain these locations from a centralized helper (shape, not exact file):
+
+```rust
+pub struct LatticePaths {
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+impl LatticePaths {
+    pub fn repo_lattice_dir(&self) -> PathBuf { self.common_dir.join("lattice") }
+    pub fn repo_config_path(&self) -> PathBuf { self.repo_lattice_dir().join("config.toml") }
+    pub fn repo_lock_path(&self) -> PathBuf { self.repo_lattice_dir().join("lock") }
+    pub fn repo_op_state_path(&self) -> PathBuf { self.repo_lattice_dir().join("op-state.json") }
+    pub fn repo_ops_dir(&self) -> PathBuf { self.repo_lattice_dir().join("ops") }
+    pub fn repo_cache_dir(&self) -> PathBuf { self.repo_lattice_dir().join("cache") }
+}
+```
+
+No production code may construct these paths ad hoc.
+
+#### 4.6.4 Repo lock semantics across worktrees
+
+The Lattice repo lock is **per repository**, not per worktree.
+
+* Lock file MUST live at: `<common_dir>/lattice/lock`
+* Any command that mutates **refs**, **metadata refs**, or **repo config** MUST acquire this lock.
+* Read-only commands MUST NOT require the lock.
+
+This enforces "single-writer per repository" even when users have many worktrees.
+
+#### 4.6.5 Operation state and crash safety across worktrees
+
+##### Repo-scoped op-state marker
+
+The "current operation" indicator MUST be repo-scoped:
+
+* Path: `<common_dir>/lattice/op-state.json`
+
+This file exists when:
+
+* Lattice is executing a multi-step operation, or
+* Lattice is paused awaiting conflict resolution.
+
+It MUST include the originating worktree identity, because Git conflict state is stored in the **per-worktree git dir**:
+
+```rust
+pub struct OpState {
+    pub op_id: String,
+    pub command: String,
+    pub phase: String, // executing | awaiting_user
+    pub origin_git_dir: PathBuf,
+    pub origin_work_dir: Option<PathBuf>, // Some(...) for normal/worktree, None only for bare-compatible ops
+    pub plan_digest: String,
+    // touched refs, expected olds, etc (as required by architecture)
+}
+```
+
+##### Operation journal storage
+
+Operation journals MUST be stored repo-scoped:
+
+* `<common_dir>/lattice/ops/<op_id>.json`
+
+The op-state marker MUST reference `op_id` (directly or via embedded fields). Lattice MUST NOT use a worktree-local "current-op" marker for correctness gating.
+
+##### Cross-worktree behavior: continue/abort ownership
+
+* `lattice continue` and `lattice abort` MUST be run from the **originating worktree** whenever the operation is paused due to a Git conflict state (rebase/merge/cherry-pick/revert).
+* If `origin_git_dir != current git_dir`, `continue` and `abort` MUST refuse with:
+
+  * the path of `origin_work_dir` when present (preferred), otherwise `origin_git_dir`
+  * a crisp instruction: "Run this from that worktree."
+
+This is not optional. Running continue/abort from the wrong worktree produces ambiguous outcomes and MUST be prevented.
+
+#### 4.6.6 Capability gating: WorkingDirectoryAvailable
+
+Add a first-class capability:
+
+* `WorkingDirectoryAvailable` is satisfied iff `RepoInfo.work_dir.is_some()`.
+
+Commands MUST declare whether they require this capability.
+
+##### Command category rules
+
+**Category A: Read-only (works everywhere, including bare)**
+These commands MUST work in bare repos and worktrees:
+
+* `log`, `info`, `parent`, `children`, `trunk` (print), `config get/list`, `auth status`, `changelog`, `completion`
+
+**Category B: Metadata-only mutations (works in bare, normal, worktree)**
+These commands MUST NOT require a working directory (but still require repo lock + CAS ref update rules):
+
+* `init` (including `--reset`, as it only touches config + metadata refs)
+* `track`, `untrack`
+* `freeze`, `unfreeze`
+* `unlink` (metadata only)
+* `config set` (repo config mutation only)
+
+**Category C: Working-copy mutations (MUST require work dir)**
+These MUST refuse in bare repos:
+
+* `create`, `modify`, `restack`, `move`, `reorder`, `split`, `squash`, `fold`, `pop`, `revert`
+* navigation that performs checkout or assumes a checked-out branch: `checkout`, `up`, `down`, `top`, `bottom`
+
+**Category D: Remote/API-only operations (may work in bare)**
+Remote operations that do not require working-copy changes MAY run in bare repos:
+
+* `pr` (open/print URLs)
+* `merge` (GitHub API merge)
+* `auth login/logout` (not repo-scoped)
+
+Remote operations that *normally* restack or checkout MUST NOT silently downgrade in bare repos. See below.
+
+#### 4.6.7 Bare repo policy for submit/sync/get (no silent downgrades)
+
+Bare repositories cannot perform rebases, checkouts, or any operation that uses index/worktree state. Therefore:
+
+##### `lattice submit` in bare repos
+
+Default `submit` semantics include restack by default. In a bare repo:
+
+* `lattice submit` MUST refuse unless the user explicitly passes `--no-restack`.
+* Even with `--no-restack`, `submit` MUST refuse if the submit set is not already aligned.
+
+**Alignment is ancestry-based:** For every included tracked branch `b` with parent `p`, require that `p.tip` is an ancestor of `b.tip` (i.e., `git merge-base --is-ancestor p.tip b.tip`).
+
+**Metadata normalization:** If ancestry holds but `b.base != p.tip`, Lattice SHOULD update `b.base` to `p.tip` as a metadata-only normalization step (no history rewrite) and proceed. Print a brief note: "Updated base metadata for N branches (no history changes)."
+
+If any branch violates the ancestry requirement, print: "Restack required. Run from a worktree and re-run `lattice submit`."
+
+##### `lattice sync` in bare repos
+
+Default `sync` semantics may include restack. In a bare repo:
+
+* `lattice sync` MUST refuse unless the user explicitly passes `--no-restack`.
+* With `--no-restack`, `sync` MAY perform:
+
+  * `git fetch`
+  * trunk fast-forward updates (CAS ref updates)
+  * PR state checks and reporting
+  * optional local branch deletion prompts (these do not require worktree)
+* It MUST NOT attempt any rebase/restack.
+
+##### `lattice get` in bare repos
+
+`get` typically implies "fetch then checkout". In a bare repo:
+
+* Introduce a new flag: `lattice get --no-checkout`
+* `lattice get` MUST refuse in bare repos unless `--no-checkout` is provided.
+* With `--no-checkout`, `get` MUST:
+
+  * fetch the branch
+  * create/update the local branch ref
+  * **track the branch** (write metadata with parent inference)
+  * compute base as `merge-base(branch_tip, parent_tip)`
+  * default to frozen unless `--unfrozen`
+  * print explicit guidance on how to create a worktree to work on it
+
+This keeps behavior explicit and automation-friendly.
+
+#### 4.6.8 Worktree branch occupancy: "checked out elsewhere" is a first-class blocker
+
+Git prohibits certain ref mutations when a branch is checked out in another worktree. Lattice MUST detect and report this *before* attempting execution, as a structured issue (not raw Git spew).
+
+##### Worktree enumeration
+
+The Git interface MUST provide structured access to:
+
+* `git worktree list --porcelain`
+
+Model:
+
+```rust
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub head: Option<Oid>,
+    pub branch: Option<String>, // None for detached
+    pub is_bare: bool,
+}
+```
+
+##### Occupancy gating rule
+
+For any command that would update, rebase, delete, or rename a branch ref, the command MUST compute the set of **touched branches** and then:
+
+* If any touched branch is checked out in a different worktree, the command MUST refuse.
+* The refusal MUST list:
+
+  * branch name(s)
+  * the worktree path(s) where they are checked out
+
+Commands that MUST apply this gating include (at minimum):
+
+* `restack`, `modify`, `move`, `reorder`, `split`, `squash`, `fold`, `pop`, `delete`, `rename`, `revert`
+* `checkout` MUST also refuse when the target branch is checked out elsewhere (because Git will not allow it)
+
+Metadata-only commands (`track`, `freeze`, etc.) do not change branch refs and MUST NOT be blocked by occupancy.
+
+##### Executor revalidation
+
+Worktree occupancy can change out-of-band between scan and execution. The Executor MUST re-check worktree occupancy **after acquiring the repo lock and immediately before applying any ref-mutating steps**. If the occupancy constraint is now violated, the executor aborts with a "precondition failed, re-run command" style error.
+
+#### 4.6.9 UX requirements: bare repo guidance and "Unavailable" working copy state
+
+Bare repos have no working copy. Therefore:
+
+* Any "working tree clean/dirty" probe MUST return an explicit `Unavailable` state when `work_dir` is None.
+
+```rust
+pub enum WorktreeStatus {
+    Clean,
+    Dirty { staged: u32, unstaged: u32, conflicts: u32 },
+    Unavailable { reason: WorktreeUnavailableReason },
+}
+
+pub enum WorktreeUnavailableReason {
+    BareRepository,
+    NoWorkDir,
+    ProbeFailed,
+}
+```
+
+* Commands that refuse due to missing working dir MUST print a high-signal message including:
+
+  * why it failed (bare repo has no working directory)
+  * a concrete `git worktree add` example
+  * a short list of commands that do work in bare (for discoverability)
+
+No command may claim the working tree is "clean" in a bare repo.
+
+#### 4.6.10 Testing requirements: bare/worktree matrix (mandatory)
+
+Add integration tests that use real Git repos and real `git worktree`:
+
+Minimum required coverage:
+
+1. Repo context detection in normal, worktree, bare
+2. Repo-scoped persistence shared across worktrees:
+
+   * config visible from all worktrees
+   * metadata visible from all worktrees
+   * repo lock shared
+   * op-state visible from all worktrees
+3. Bare repo behavior:
+
+   * read-only commands succeed
+   * workdir-required commands refuse with guidance
+4. Worktree occupancy:
+
+   * rewrite command refuses when target branch checked out elsewhere
+   * checkout refuses when branch checked out elsewhere
+5. Continue/abort ownership:
+
+   * paused operation cannot be continued/aborted from a different worktree
+6. Bare repo submit/sync/get:
+
+   * `submit --no-restack` alignment check and metadata normalization
+   * `get --no-checkout` tracking behavior
 
 ---
 
@@ -676,7 +1027,7 @@ Each command section includes:
 
 ### Behavior
 
-* Creates `.git/lattice/config.toml` if missing.
+* Creates `<common_dir>/lattice/config.toml` if missing.
 * If trunk not specified and interactive: prompt to pick from local branches.
 * Writes trunk name to repo config.
 * On `--reset`:
@@ -925,11 +1276,17 @@ Every mutating command that would:
 * `--stack` filters to ancestors/descendants of current branch (tracked graph).
 * Must respect git checkout safety (dirty working tree may block). Lattice should surface git’s error clearly.
 
+### Worktree and bare repo behavior
+
+* **Worktree occupancy:** If the target branch is checked out in another worktree, `checkout` MUST refuse with a structured issue listing the branch and worktree path (see §4.6.8).
+* **Bare repos:** `checkout` requires `WorkingDirectoryAvailable` and MUST refuse in bare repos.
+
 ### Tests
 
 * Checkout by name.
 * Selector path (simulated).
 * Stack filtering correctness.
+* Checkout refuses when target branch is checked out in another worktree.
 
 ---
 
@@ -1344,7 +1701,7 @@ Given `host`, `owner`, `repo`:
 
 **Caching:**
 
-* Cache authorization checks for a short TTL (e.g., 10 minutes) in `.git/lattice/cache/github_auth.json`.
+* Cache authorization checks for a short TTL (e.g., 10 minutes) in `<common_dir>/lattice/cache/github_auth.json`.
 * Repo config caches (`installation_id`, `repository_id`) are allowed to be stale and must never be trusted without validation.
 
 ---
@@ -1462,6 +1819,16 @@ PR creation/update:
 * Must not create PRs if repo is not in a consistent restacked state (unless user explicitly disables restack and accepts risk, recommended to not allow in v1).
 * Must journal any metadata changes (PR linking) and any git ref pushes (recorded for undo only locally; cannot undo remote pushes).
 
+### Bare repository behavior
+
+In bare repos (see §4.6.7):
+
+* `lattice submit` MUST refuse unless `--no-restack` is provided.
+* Even with `--no-restack`, submit MUST refuse if any included branch is not submit-aligned.
+* **Alignment is ancestry-based:** For branch `b` with parent `p`, require `p.tip` is an ancestor of `b.tip`.
+* **Metadata normalization:** If ancestry holds but `b.base != p.tip`, Lattice updates `b.base` to `p.tip` (metadata-only, no history rewrite) and proceeds. Print: "Updated base metadata for N branches (no history changes)."
+* If any branch fails the ancestry check, print: "Restack required. Run from a worktree and re-run `lattice submit`."
+
 ### Behavioral tests (minimum)
 
 * New stack creates PRs with correct bases.
@@ -1473,6 +1840,9 @@ PR creation/update:
 * Confirm flow cancels safely.
 * Draft create and publish toggling calls GraphQL path.
 * Submit refuses when auth missing.
+* Bare repo: submit refuses without `--no-restack`.
+* Bare repo: submit with `--no-restack` normalizes stale base metadata.
+* Bare repo: submit with `--no-restack` refuses if not ancestry-aligned.
 
 ---
 
@@ -1505,12 +1875,26 @@ PR creation/update:
 
   * restack all restackable branches; skip those that conflict and report
 
+### Bare repository behavior
+
+In bare repos (see §4.6.7):
+
+* `lattice sync` MUST refuse unless `--no-restack` is provided.
+* With `--no-restack`, sync MAY perform:
+  * `git fetch`
+  * trunk fast-forward updates (CAS ref updates)
+  * PR state checks and reporting
+  * local branch deletion prompts (these do not require worktree)
+* It MUST NOT attempt any rebase/restack.
+
 ### Tests
 
 * Merged branch deletion prompt.
 * Trunk fast-forward update.
 * Diverged trunk requires force or prompt.
 * Restack happens post-trunk update.
+* Bare repo: sync refuses without `--no-restack`.
+* Bare repo: sync with `--no-restack` performs fetch and PR checks.
 
 ---
 
@@ -1526,6 +1910,7 @@ PR creation/update:
 * `lattice get --force`
 * `lattice get --restack` / `--no-restack`
 * `lattice get --unfrozen`
+* `lattice get --no-checkout`
 
 ### Behavior
 
@@ -1549,11 +1934,26 @@ PR creation/update:
   * by default sync upstack branches too unless `--downstack`
 * Optionally restack after syncing.
 
+### Bare repository behavior
+
+In bare repos (see §4.6.7):
+
+* `lattice get` MUST refuse unless `--no-checkout` is provided.
+* With `--no-checkout`, get MUST:
+  * fetch the branch ref from remote
+  * create/update the local branch ref
+  * **track the branch** (write metadata with parent inference)
+  * compute base as `merge-base(branch_tip, parent_tip)`
+  * default to frozen unless `--unfrozen`
+  * print explicit guidance on creating a worktree to work on the branch
+
 ### Tests
 
 * Get by PR number resolves and fetches.
 * New fetched branch defaults to frozen; `--unfrozen` overrides.
 * Force overwrites divergence.
+* Bare repo: get refuses without `--no-checkout`.
+* Bare repo: get with `--no-checkout` tracks branch with correct base.
 
 ---
 
@@ -1795,6 +2195,12 @@ Read-only relationship queries.
 * Non-interactive mode refusing ambiguous operations.
 * Undo after multi-branch operation.
 * Crash simulation mid-restack and recovery on next invocation.
+* Bare repo: read-only commands succeed.
+* Bare repo: workdir-required commands refuse with guidance.
+* Worktree: rewrite command refuses when target branch checked out elsewhere.
+* Worktree: continue/abort refuse from non-origin worktree.
+* Bare repo: `submit --no-restack` alignment check and metadata normalization.
+* Bare repo: `get --no-checkout` tracking behavior.
 
 ---
 
@@ -1838,6 +2244,12 @@ Each command must have:
 
 * `docs/commands/<cmd>.md`
 * sections: Summary, Examples, Flags, Semantics, Pitfalls, Recovery, Parity notes
+
+Additional documentation requirements for worktree/bare repo support:
+
+* `docs/commands/get.md` MUST document `--no-checkout` and bare repo behavior
+* `docs/commands/submit.md` MUST document bare-mode gating rules and alignment checks
+* `docs/commands/sync.md` MUST document bare-mode gating rules
 
 ---
 
@@ -1955,6 +2367,7 @@ Git:
 - git update-ref documentation
 - git rebase documentation
 - git push --force-with-lease documentation
+- git worktree list --porcelain documentation
 
 GitHub Auth (GitHub App device flow):
 - https://docs.github.com/en/apps/creating-github-apps/writing-code-for-a-github-app/building-a-cli-with-a-github-app

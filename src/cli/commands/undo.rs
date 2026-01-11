@@ -1,6 +1,7 @@
 //! undo command - Undo the last completed operation
 
 use crate::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
+use crate::core::paths::LatticePaths;
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
@@ -12,10 +13,11 @@ pub fn undo(ctx: &Context) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let info = git.info()?;
+    let paths = LatticePaths::from_repo_info(&info);
 
     // Check for in-progress operation
-    if let Some(op_state) = OpState::read(git_dir)? {
+    if let Some(op_state) = OpState::read(&paths)? {
         bail!(
             "Cannot undo while operation '{}' is in progress. Use 'lattice abort' first.",
             op_state.command
@@ -23,7 +25,7 @@ pub fn undo(ctx: &Context) -> Result<()> {
     }
 
     // Find most recent committed journal
-    let ops_dir = git_dir.join("lattice/ops");
+    let ops_dir = paths.repo_ops_dir();
     if !ops_dir.exists() {
         bail!("No operations to undo");
     }

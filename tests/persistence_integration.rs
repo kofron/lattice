@@ -12,6 +12,7 @@ use latticework::core::metadata::schema::{BranchMetadataV1, FreezeScope, FreezeS
 use latticework::core::metadata::store::{MetadataStore, StoreError};
 use latticework::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
 use latticework::core::ops::lock::{LockError, RepoLock};
+use latticework::core::paths::LatticePaths;
 use latticework::core::types::{BranchName, Oid};
 use latticework::git::Git;
 
@@ -76,6 +77,12 @@ impl TestRepo {
 
     fn git(&self) -> Git {
         Git::open(self.path()).expect("open git repo")
+    }
+
+    fn paths(&self) -> LatticePaths {
+        let git = self.git();
+        let info = git.info().expect("git info");
+        LatticePaths::from_repo_info(&info)
     }
 
     #[allow(dead_code)]
@@ -399,8 +406,9 @@ mod repo_lock {
     #[test]
     fn acquire_and_release() {
         let repo = TestRepo::new();
+        let paths = repo.paths();
 
-        let lock = RepoLock::acquire(&repo.git_dir()).expect("acquire");
+        let lock = RepoLock::acquire(&paths).expect("acquire");
         assert!(lock.is_held());
 
         // Lock file should exist
@@ -410,46 +418,50 @@ mod repo_lock {
     #[test]
     fn prevents_concurrent_acquire() {
         let repo = TestRepo::new();
+        let paths = repo.paths();
 
-        let lock1 = RepoLock::acquire(&repo.git_dir()).expect("first acquire");
+        let lock1 = RepoLock::acquire(&paths).expect("first acquire");
         assert!(lock1.is_held());
 
-        let result = RepoLock::acquire(&repo.git_dir());
+        let result = RepoLock::acquire(&paths);
         assert!(matches!(result, Err(LockError::AlreadyLocked)));
     }
 
     #[test]
     fn released_on_drop() {
         let repo = TestRepo::new();
+        let paths = repo.paths();
 
         {
-            let lock = RepoLock::acquire(&repo.git_dir()).expect("acquire");
+            let lock = RepoLock::acquire(&paths).expect("acquire");
             assert!(lock.is_held());
         }
 
         // Should be able to acquire again
-        let lock2 = RepoLock::acquire(&repo.git_dir()).expect("reacquire");
+        let lock2 = RepoLock::acquire(&paths).expect("reacquire");
         assert!(lock2.is_held());
     }
 
     #[test]
     fn try_acquire_returns_none_when_locked() {
         let repo = TestRepo::new();
+        let paths = repo.paths();
 
-        let _lock1 = RepoLock::acquire(&repo.git_dir()).expect("first acquire");
+        let _lock1 = RepoLock::acquire(&paths).expect("first acquire");
 
-        let result = RepoLock::try_acquire(&repo.git_dir()).expect("try_acquire");
+        let result = RepoLock::try_acquire(&paths).expect("try_acquire");
         assert!(result.is_none());
     }
 
     #[test]
     fn creates_lattice_directory() {
         let repo = TestRepo::new();
+        let paths = repo.paths();
         let lattice_dir = repo.git_dir().join("lattice");
 
         assert!(!lattice_dir.exists());
 
-        let _lock = RepoLock::acquire(&repo.git_dir()).expect("acquire");
+        let _lock = RepoLock::acquire(&paths).expect("acquire");
 
         assert!(lattice_dir.exists());
     }
@@ -465,7 +477,7 @@ mod journal {
     #[test]
     fn write_and_read_roundtrip() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
 
         let mut journal = Journal::new("restack");
         journal.record_ref_update("refs/heads/feature", None, "abc123");
@@ -473,9 +485,9 @@ mod journal {
         journal.record_checkpoint("midpoint");
         journal.commit();
 
-        journal.write(&git_dir).expect("write");
+        journal.write(&paths).expect("write");
 
-        let loaded = Journal::read(&git_dir, &journal.op_id).expect("read");
+        let loaded = Journal::read(&paths, &journal.op_id).expect("read");
 
         assert_eq!(loaded.op_id, journal.op_id);
         assert_eq!(loaded.command, "restack");
@@ -486,22 +498,22 @@ mod journal {
     #[test]
     fn list_and_most_recent() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
 
         let journal1 = Journal::new("first");
-        journal1.write(&git_dir).expect("write 1");
+        journal1.write(&paths).expect("write 1");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         let journal2 = Journal::new("second");
-        journal2.write(&git_dir).expect("write 2");
+        journal2.write(&paths).expect("write 2");
 
         // List should return both
-        let ids = Journal::list(&git_dir).expect("list");
+        let ids = Journal::list(&paths).expect("list");
         assert_eq!(ids.len(), 2);
 
         // Most recent should be second
-        let recent = Journal::most_recent(&git_dir)
+        let recent = Journal::most_recent(&paths)
             .expect("most_recent")
             .expect("should exist");
         assert_eq!(recent.command, "second");
@@ -510,15 +522,15 @@ mod journal {
     #[test]
     fn delete_journal() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
 
         let journal = Journal::new("test");
-        journal.write(&git_dir).expect("write");
+        journal.write(&paths).expect("write");
 
-        let path = journal.file_path(&git_dir);
+        let path = journal.file_path(&paths);
         assert!(path.exists());
 
-        journal.delete(&git_dir).expect("delete");
+        journal.delete(&paths).expect("delete");
         assert!(!path.exists());
     }
 
@@ -562,16 +574,16 @@ mod op_state {
     #[test]
     fn from_journal_and_roundtrip() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
+        let git = repo.git();
+        let info = git.info().expect("git info");
 
         let journal = Journal::new("test-cmd");
-        let state = OpState::from_journal(&journal);
+        let state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
 
-        state.write(&git_dir).expect("write");
+        state.write(&paths).expect("write");
 
-        let loaded = OpState::read(&git_dir)
-            .expect("read")
-            .expect("should exist");
+        let loaded = OpState::read(&paths).expect("read").expect("should exist");
 
         assert_eq!(loaded.op_id, journal.op_id);
         assert_eq!(loaded.command, "test-cmd");
@@ -581,37 +593,37 @@ mod op_state {
     #[test]
     fn exists_and_remove() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
+        let git = repo.git();
+        let info = git.info().expect("git info");
 
-        assert!(!OpState::exists(&git_dir));
+        assert!(!OpState::exists(&paths));
 
         let journal = Journal::new("test");
-        let state = OpState::from_journal(&journal);
-        state.write(&git_dir).expect("write");
+        let state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        state.write(&paths).expect("write");
 
-        assert!(OpState::exists(&git_dir));
+        assert!(OpState::exists(&paths));
 
-        OpState::remove(&git_dir).expect("remove");
+        OpState::remove(&paths).expect("remove");
 
-        assert!(!OpState::exists(&git_dir));
+        assert!(!OpState::exists(&paths));
     }
 
     #[test]
     fn update_phase() {
         let repo = TestRepo::new();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
+        let git = repo.git();
+        let info = git.info().expect("git info");
 
         let journal = Journal::new("test");
-        let mut state = OpState::from_journal(&journal);
-        state.write(&git_dir).expect("write");
+        let mut state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        state.write(&paths).expect("write");
 
-        state
-            .update_phase(OpPhase::Paused, &git_dir)
-            .expect("update");
+        state.update_phase(OpPhase::Paused, &paths).expect("update");
 
-        let loaded = OpState::read(&git_dir)
-            .expect("read")
-            .expect("should exist");
+        let loaded = OpState::read(&paths).expect("read").expect("should exist");
         assert_eq!(loaded.phase, OpPhase::Paused);
     }
 }
@@ -627,17 +639,18 @@ mod integration {
     fn full_operation_lifecycle() {
         let repo = TestRepo::new();
         let git = repo.git();
-        let git_dir = repo.git_dir();
+        let paths = repo.paths();
+        let info = git.info().expect("git info");
 
         // 1. Acquire lock
-        let _lock = RepoLock::acquire(&git_dir).expect("acquire lock");
+        let _lock = RepoLock::acquire(&paths).expect("acquire lock");
 
         // 2. Create journal
         let mut journal = Journal::new("track");
 
         // 3. Write op-state
-        let op_state = OpState::from_journal(&journal);
-        op_state.write(&git_dir).expect("write op-state");
+        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        op_state.write(&paths).expect("write op-state");
 
         // 4. Write metadata
         let store = MetadataStore::new(&git);
@@ -651,47 +664,46 @@ mod integration {
 
         // 5. Record in journal
         journal.record_metadata_write(branch.to_string(), None, meta_oid.to_string());
-        journal.write(&git_dir).expect("write journal step");
+        journal.write(&paths).expect("write journal step");
 
         // 6. Commit
         journal.commit();
-        journal.write(&git_dir).expect("write journal commit");
-        OpState::remove(&git_dir).expect("remove op-state");
+        journal.write(&paths).expect("write journal commit");
+        OpState::remove(&paths).expect("remove op-state");
 
         // Verify final state
-        assert!(!OpState::exists(&git_dir));
+        assert!(!OpState::exists(&paths));
         assert!(store.exists(&branch).expect("branch exists"));
     }
 
     #[test]
     fn simulated_crash_recovery() {
         let repo = TestRepo::new();
-        let _git = repo.git();
-        let git_dir = repo.git_dir();
+        let git = repo.git();
+        let paths = repo.paths();
+        let info = git.info().expect("git info");
 
         // Simulate an interrupted operation
         let journal = Journal::new("restack");
-        let op_state = OpState::from_journal(&journal);
+        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
 
         // Write op-state but don't complete the operation
-        op_state.write(&git_dir).expect("write op-state");
-        journal.write(&git_dir).expect("write journal");
+        op_state.write(&paths).expect("write op-state");
+        journal.write(&paths).expect("write journal");
 
         // Simulate "next invocation"
         // Should detect op-state exists
-        assert!(OpState::exists(&git_dir));
+        assert!(OpState::exists(&paths));
 
         // Read the op-state and journal
-        let loaded_state = OpState::read(&git_dir)
-            .expect("read")
-            .expect("should exist");
+        let loaded_state = OpState::read(&paths).expect("read").expect("should exist");
         assert_eq!(loaded_state.phase, OpPhase::InProgress);
 
-        let loaded_journal = Journal::read(&git_dir, &loaded_state.op_id).expect("read journal");
+        let loaded_journal = Journal::read(&paths, &loaded_state.op_id).expect("read journal");
         assert_eq!(loaded_journal.command, "restack");
 
         // Cleanup (simulating abort)
-        OpState::remove(&git_dir).expect("remove op-state");
+        OpState::remove(&paths).expect("remove op-state");
     }
 
     #[test]

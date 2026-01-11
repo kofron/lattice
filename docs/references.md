@@ -7,6 +7,8 @@ This document contains links to external documentation referenced by Lattice.
 - [git update-ref](https://git-scm.com/docs/git-update-ref) - Safely update refs
 - [git rebase](https://git-scm.com/docs/git-rebase) - Reapply commits on top of another base
 - [git push --force-with-lease](https://git-scm.com/docs/git-push#Documentation/git-push.txt---force-with-leaseltrefnamegt) - Safe force push
+- [git worktree](https://git-scm.com/docs/git-worktree) - Manage multiple working trees
+- [git worktree list --porcelain](https://git-scm.com/docs/git-worktree#_porcelain_format) - Machine-readable worktree listing
 
 ## GitHub
 

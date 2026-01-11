@@ -127,9 +127,17 @@ fn repo_info() {
     let info = git.info().unwrap();
 
     assert!(info.git_dir.ends_with(".git"));
+    // For normal repos, common_dir should equal git_dir
+    assert_eq!(info.git_dir, info.common_dir);
+    // Context should be Normal for a regular repo
+    assert_eq!(info.context, latticework::git::RepoContext::Normal);
     // Use canonicalize to handle macOS /var -> /private/var symlink
     let expected = repo.path().canonicalize().unwrap();
-    let actual = info.work_dir.canonicalize().unwrap();
+    let actual = info
+        .work_dir
+        .expect("normal repo should have work_dir")
+        .canonicalize()
+        .unwrap();
     assert_eq!(actual, expected);
 }
 
@@ -597,8 +605,8 @@ fn worktree_status_clean() {
 
     let status = git.worktree_status(false).unwrap();
     assert!(status.is_clean());
-    assert_eq!(status.staged, 0);
-    assert_eq!(status.unstaged, 0);
+    assert!(!status.is_dirty());
+    assert!(!status.is_unavailable());
 }
 
 #[test]
@@ -613,7 +621,8 @@ fn worktree_status_staged_changes() {
     let status = git.worktree_status(false).unwrap();
 
     assert!(!status.is_clean());
-    assert!(status.staged > 0);
+    assert!(status.is_dirty());
+    assert!(status.has_staged());
 }
 
 #[test]
@@ -627,25 +636,22 @@ fn worktree_status_unstaged_changes() {
     let status = git.worktree_status(false).unwrap();
 
     assert!(!status.is_clean());
-    assert!(status.unstaged > 0);
+    assert!(status.is_dirty());
 }
 
 #[test]
-fn worktree_status_untracked() {
+fn worktree_status_untracked_not_counted() {
     let repo = TestRepo::new();
 
-    // Create an untracked file
+    // Create an untracked file - should not affect clean status
+    // per SPEC.md §4.6.9, untracked files are not part of WorktreeStatus
     std::fs::write(repo.path().join("untracked.txt"), "content").unwrap();
 
     let git = repo.git();
 
-    // Without untracked
+    // Untracked files don't make the worktree dirty
     let status = git.worktree_status(false).unwrap();
-    assert_eq!(status.untracked, 0);
-
-    // With untracked
-    let status = git.worktree_status(true).unwrap();
-    assert!(status.untracked > 0);
+    assert!(status.is_clean());
 }
 
 #[test]

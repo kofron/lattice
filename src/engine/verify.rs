@@ -353,7 +353,9 @@ mod tests {
         RepoSnapshot {
             info: RepoInfo {
                 git_dir: PathBuf::from("/repo/.git"),
-                work_dir: PathBuf::from("/repo"),
+                common_dir: PathBuf::from("/repo/.git"),
+                work_dir: Some(PathBuf::from("/repo")),
+                context: crate::git::RepoContext::Normal,
             },
             git_state: GitState::Clean,
             worktree_status: WorktreeStatus::default(),
