@@ -131,6 +131,26 @@ pub enum PlanStep {
         /// Git operation that may conflict.
         git_operation: String,
     },
+
+    /// Create a snapshot branch from a fetched PR ref with validation.
+    ///
+    /// This step:
+    /// 1. Reads FETCH_HEAD to get the snapshot commit after a fetch
+    /// 2. Validates the commit is an ancestor of the head branch (reachability check)
+    /// 3. Creates the branch pointing to the snapshot commit
+    /// 4. Computes merge-base for metadata base field
+    ///
+    /// Used by Milestone 5.9 to materialize synthetic stack snapshots.
+    CreateSnapshotBranch {
+        /// Name for the new branch (e.g., "lattice/snap/pr-42").
+        branch_name: String,
+        /// PR number (for error messages and logging).
+        pr_number: u64,
+        /// The synthetic head branch this snapshot belongs to.
+        head_branch: String,
+        /// Current OID of the head branch (for ancestry validation).
+        head_oid: String,
+    },
 }
 
 impl PlanStep {
@@ -153,6 +173,10 @@ impl PlanStep {
             } => expected_effects.iter().map(|s| s.as_str()).collect(),
             PlanStep::Checkpoint { .. } => vec![],
             PlanStep::PotentialConflictPause { .. } => vec![],
+            PlanStep::CreateSnapshotBranch { branch_name, .. } => {
+                // Will create refs/heads/{branch_name}
+                vec![branch_name.as_str()]
+            }
         }
     }
 
@@ -165,6 +189,7 @@ impl PlanStep {
                 | PlanStep::WriteMetadataCas { .. }
                 | PlanStep::DeleteMetadataCas { .. }
                 | PlanStep::RunGit { .. }
+                | PlanStep::CreateSnapshotBranch { .. }
         )
     }
 
@@ -194,6 +219,16 @@ impl PlanStep {
                 git_operation,
             } => {
                 format!("May pause for {} conflict on {}", git_operation, branch)
+            }
+            PlanStep::CreateSnapshotBranch {
+                branch_name,
+                pr_number,
+                ..
+            } => {
+                format!(
+                    "Create snapshot branch '{}' from PR #{}",
+                    branch_name, pr_number
+                )
             }
         }
     }

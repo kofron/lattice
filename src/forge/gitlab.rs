@@ -238,6 +238,28 @@ impl Forge for GitLabForge {
                 .to_string(),
         ))
     }
+
+    async fn list_open_prs(
+        &self,
+        _opts: super::traits::ListPullsOpts,
+    ) -> Result<super::traits::ListPullsResult, ForgeError> {
+        Err(ForgeError::NotImplemented(
+            "GitLab open merge request listing is not yet implemented. \
+             See https://github.com/lattice-cli/lattice for updates."
+                .to_string(),
+        ))
+    }
+
+    async fn list_closed_prs_targeting(
+        &self,
+        _opts: super::traits::ListClosedPrsOpts,
+    ) -> Result<super::traits::ListPullsResult, ForgeError> {
+        Err(ForgeError::NotImplemented(
+            "GitLab closed merge request listing is not yet implemented. \
+             See https://github.com/lattice-cli/lattice for updates."
+                .to_string(),
+        ))
+    }
 }
 
 // --------------------------------------------------------------------------

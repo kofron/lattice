@@ -74,6 +74,14 @@ pub enum Capability {
     /// Remote is configured and resolvable.
     RemoteResolved,
 
+    /// Repository authorization verified via GitHub App installation.
+    ///
+    /// Per SPEC.md Section 8E.0.1, this capability is established when the
+    /// authenticated user has access to the target repository via an installed
+    /// GitHub App. The check queries `/user/installations` and caches the
+    /// result for 10 minutes.
+    RepoAuthorized,
+
     /// Frozen policy is satisfied for target branches.
     ///
     /// This means no frozen branches will be modified by the operation.
@@ -113,6 +121,7 @@ impl Capability {
             Capability::WorkingCopyStateKnown => "working copy state is known",
             Capability::AuthAvailable => "authentication is available",
             Capability::RemoteResolved => "remote is configured",
+            Capability::RepoAuthorized => "repository authorization verified",
             Capability::FrozenPolicySatisfied => "frozen policy is satisfied",
             Capability::WorkingDirectoryAvailable => "working directory is available",
         }
@@ -270,6 +279,7 @@ mod tests {
                 Capability::WorkingCopyStateKnown,
                 Capability::AuthAvailable,
                 Capability::RemoteResolved,
+                Capability::RepoAuthorized,
                 Capability::FrozenPolicySatisfied,
                 Capability::WorkingDirectoryAvailable,
             ];

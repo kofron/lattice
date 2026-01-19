@@ -505,6 +505,7 @@ mod tests {
             graph: StackGraph::new(),
             fingerprint: compute_fingerprint(&HashMap::new(), &HashMap::new(), None),
             health: RepoHealthReport::new(),
+            remote_prs: None,
         }
     }
 

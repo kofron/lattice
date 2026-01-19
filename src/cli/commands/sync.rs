@@ -11,6 +11,13 @@
 //! - Updates stack comments in PR descriptions
 //! - Optionally restacks after syncing
 //!
+//! # Bare Repository Support
+//!
+//! Per SPEC.md Section 4.6.7, in bare repositories:
+//! - `lattice sync` MUST refuse unless `--no-restack` is provided
+//! - With `--no-restack`: may fetch, trunk FF, PR checks, branch deletion prompts
+//! - MUST NOT attempt any rebase/restack
+//!
 //! # Example
 //!
 //! ```bash
@@ -22,6 +29,9 @@
 //!
 //! # Restack after syncing
 //! lattice sync --restack
+//!
+//! # Sync from bare repo (no restack)
+//! lattice sync --no-restack
 //! ```
 
 use crate::engine::Context;
@@ -52,6 +62,16 @@ async fn sync_async(ctx: &Context, force: bool, restack: bool) -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd)?;
     let snapshot = scan(&git)?;
+
+    // Per SPEC.md §4.6.7: sync MUST refuse in bare repos if restack is requested
+    let is_bare = git.info()?.work_dir.is_none();
+    if is_bare && restack {
+        bail!(
+            "This is a bare repository. The `sync` command cannot restack without a working directory.\n\n\
+             To sync without restacking (fetch, trunk FF, PR checks only), use:\n\n\
+                 lattice sync --no-restack"
+        );
+    }
 
     // Get trunk
     let trunk = snapshot
@@ -212,13 +232,21 @@ async fn sync_async(ctx: &Context, force: bool, restack: bool) -> Result<()> {
         }
     }
 
-    // Restack if requested
+    // Restack if requested (per SPEC.md 8E.3)
+    // "If --restack enabled: restack all restackable branches; skip those that conflict and report"
     if restack {
         if !ctx.quiet {
             println!("Restacking branches...");
         }
-        // Would call restack here
-        println!("Note: Restack not yet implemented in sync.");
+
+        // Restack from trunk to catch all branches that may need realignment
+        // after trunk was updated. This reuses the full restack implementation:
+        // - Lock acquisition
+        // - Journal management for crash safety
+        // - Conflict detection and pause/continue model
+        // - Frozen branch skipping
+        // - Topological ordering for correct rebase sequence
+        super::restack::restack(ctx, Some(trunk.as_str()), false, false)?;
     }
 
     if !ctx.quiet {

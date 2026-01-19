@@ -191,6 +191,22 @@ impl fmt::Display for MetadataChange {
     }
 }
 
+/// Information about a closed PR to materialize as a snapshot branch.
+///
+/// Used by the `MaterializeSyntheticSnapshots` fix option to describe
+/// which closed PRs should be fetched and converted to frozen snapshot branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedPrToMaterialize {
+    /// PR number.
+    pub number: u64,
+    /// Head ref of the closed PR (original branch name for display purposes).
+    pub head_ref: String,
+    /// PR URL.
+    pub url: String,
+    /// Whether the PR was merged (true) or just closed without merging (false).
+    pub merged: bool,
+}
+
 /// A change to configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigChange {

@@ -19,6 +19,18 @@ use crate::engine::scan::RepoSnapshot;
 
 use super::fixes::{ConfigChange, FixOption, MetadataChange, RefChange};
 
+/// Context for snapshot branch creation.
+///
+/// Used to pass information about the synthetic head branch when converting
+/// snapshot-related RefChanges to PlanSteps.
+#[derive(Debug, Clone, Default)]
+struct SnapshotContext {
+    /// The synthetic head branch these snapshots belong to.
+    head_branch: String,
+    /// Current OID of the head branch (for ancestry validation).
+    head_oid: String,
+}
+
 /// Errors from repair plan generation.
 #[derive(Debug, Error)]
 pub enum RepairPlanError {
@@ -113,9 +125,29 @@ fn add_fix_steps(
         name: format!("fix:{}", fix.id),
     });
 
+    // Build snapshot context if this is a synthetic stack fix
+    let context = build_snapshot_context(fix, snapshot);
+
     // Convert preview changes to plan steps
+    // For snapshot branches, we need to add a fetch step before each CreateSnapshotBranch
     for change in &fix.preview.ref_changes {
-        plan = plan.with_step(ref_change_to_step(change));
+        let step = ref_change_to_step(change, &context);
+
+        // If this is a CreateSnapshotBranch, we need to add a fetch step first
+        if let PlanStep::CreateSnapshotBranch { pr_number, .. } = &step {
+            // Add the fetch step to get the PR ref
+            plan = plan.with_step(PlanStep::RunGit {
+                args: vec![
+                    "fetch".to_string(),
+                    "origin".to_string(),
+                    format!("refs/pull/{}/head", pr_number),
+                ],
+                description: format!("Fetch PR #{} head ref", pr_number),
+                expected_effects: vec![], // FETCH_HEAD is updated
+            });
+        }
+
+        plan = plan.with_step(step);
     }
 
     for change in &fix.preview.metadata_changes {
@@ -129,15 +161,99 @@ fn add_fix_steps(
     Ok(plan)
 }
 
+/// Build snapshot context from a fix's metadata description.
+///
+/// For synthetic stack materialization fixes, this extracts the head branch
+/// and its OID from the fix preview's metadata changes.
+fn build_snapshot_context(fix: &FixOption, snapshot: &RepoSnapshot) -> SnapshotContext {
+    // Check if this is a synthetic stack head fix
+    if !fix.id.as_str().contains("synthetic-stack-head") {
+        return SnapshotContext::default();
+    }
+
+    // Extract head branch from the metadata changes description
+    // Format: "parent=<head_branch>, frozen (remote_synthetic_snapshot), pr=#<num>"
+    for change in &fix.preview.metadata_changes {
+        if let MetadataChange::Create { description, .. } = change {
+            if let Some(start) = description.find("parent=") {
+                let rest = &description[start + 7..];
+                if let Some(end) = rest.find(',') {
+                    let head_branch = rest[..end].trim().to_string();
+
+                    // Get the head branch's current OID
+                    if let Ok(branch_name) = crate::core::types::BranchName::new(&head_branch) {
+                        if let Some(oid) = snapshot.branches.get(&branch_name) {
+                            return SnapshotContext {
+                                head_branch,
+                                head_oid: oid.as_str().to_string(),
+                            };
+                        }
+                    }
+
+                    // Even without the OID, return the branch name
+                    // The executor will need to look it up
+                    return SnapshotContext {
+                        head_branch,
+                        head_oid: String::new(),
+                    };
+                }
+            }
+        }
+    }
+
+    SnapshotContext::default()
+}
+
 /// Convert a RefChange to a PlanStep.
-fn ref_change_to_step(change: &RefChange) -> PlanStep {
+fn ref_change_to_step(change: &RefChange, context: &SnapshotContext) -> PlanStep {
     match change {
-        RefChange::Create { ref_name, new_oid } => PlanStep::UpdateRefCas {
-            refname: ref_name.clone(),
-            old_oid: None,
-            new_oid: new_oid.clone(),
-            reason: "doctor: create ref".to_string(),
-        },
+        RefChange::Create { ref_name, new_oid } => {
+            // Check for snapshot branch creation (Milestone 5.9)
+            // Format: "(fetched from PR #<number>)"
+            if let Some(pr_num_str) = new_oid
+                .strip_prefix("(fetched from PR #")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                if let Ok(pr_number) = pr_num_str.parse::<u64>() {
+                    // This is a snapshot branch - generate fetch + CreateSnapshotBranch steps
+                    // The caller will need to handle this specially since we return one step
+                    // but actually need two. We use a marker approach here.
+                    let branch_name = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+
+                    // Return a marker step. The caller (add_fix_steps) will expand this.
+                    return PlanStep::CreateSnapshotBranch {
+                        branch_name: branch_name.to_string(),
+                        pr_number,
+                        head_branch: context.head_branch.clone(),
+                        head_oid: context.head_oid.clone(),
+                    };
+                }
+            }
+
+            // Check for the special placeholder indicating a fetch is needed
+            if new_oid == "(fetched from remote)" {
+                // Extract branch name from ref_name (e.g., "refs/heads/feature" -> "feature")
+                let branch = ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name);
+
+                // Generate a git fetch command that creates the local branch
+                PlanStep::RunGit {
+                    args: vec![
+                        "fetch".to_string(),
+                        "origin".to_string(),
+                        format!("{}:{}", branch, ref_name),
+                    ],
+                    description: format!("Fetch '{}' from origin", branch),
+                    expected_effects: vec![ref_name.clone()],
+                }
+            } else {
+                PlanStep::UpdateRefCas {
+                    refname: ref_name.clone(),
+                    old_oid: None,
+                    new_oid: new_oid.clone(),
+                    reason: "doctor: create ref".to_string(),
+                }
+            }
+        }
         RefChange::Update {
             ref_name,
             old_oid,
@@ -164,17 +280,14 @@ fn metadata_change_to_step(
     match change {
         MetadataChange::Create {
             branch,
-            description: _,
+            description,
         } => {
-            // Create new metadata for the branch
-            // For now, create minimal metadata with trunk as parent
-            let parent_name = snapshot
-                .trunk
-                .as_ref()
-                .map(|t| t.as_str())
-                .unwrap_or("main");
+            // Parse the description to extract parent, frozen, and PR info.
+            // Format: "parent=<name>, pr=#<num>, unfrozen|frozen (reason)"
+            let (parent_name, frozen, pr_info) = parse_create_description(description, snapshot);
 
-            let metadata = create_minimal_metadata(branch, parent_name, snapshot)?;
+            let metadata =
+                create_minimal_metadata(branch, &parent_name, snapshot, frozen, pr_info)?;
 
             Ok(PlanStep::WriteMetadataCas {
                 branch: branch.clone(),
@@ -206,6 +319,20 @@ fn metadata_change_to_step(
                             metadata.base = BaseInfo {
                                 oid: new_value.clone(),
                             };
+                        }
+                        "pr" => {
+                            // Parse PR linkage from new_value format: "linked(#42)"
+                            use crate::core::metadata::schema::PrState;
+                            if let Some(num_str) = new_value
+                                .strip_prefix("linked(#")
+                                .and_then(|s| s.strip_suffix(')'))
+                            {
+                                if let Ok(number) = num_str.parse::<u64>() {
+                                    // Use "github" as default forge for now
+                                    // URL can be empty - it's a cached field
+                                    metadata.pr = PrState::linked("github", number, "");
+                                }
+                            }
                         }
                         _ => {
                             return Err(RepairPlanError::CannotGeneratePlan(format!(
@@ -284,13 +411,78 @@ fn config_change_to_step(change: &ConfigChange) -> Result<PlanStep, RepairPlanEr
     }
 }
 
+/// Parse a MetadataChange::Create description to extract parent, frozen, and PR info.
+///
+/// Expected formats:
+/// - "parent=main, pr=#42, unfrozen"
+/// - "parent=feature-a, pr=#42, frozen (teammate_branch)"
+///
+/// Returns (parent_name, frozen, pr_info) where pr_info is Option<(&str, u64, &str)>.
+fn parse_create_description<'a>(
+    description: &str,
+    snapshot: &'a RepoSnapshot,
+) -> (String, bool, Option<(&'a str, u64, &'a str)>) {
+    let mut parent_name = snapshot
+        .trunk
+        .as_ref()
+        .map(|t| t.as_str().to_string())
+        .unwrap_or_else(|| "main".to_string());
+    let mut pr_number: Option<u64> = None;
+
+    // Parse "parent=<name>"
+    if let Some(start) = description.find("parent=") {
+        let rest = &description[start + 7..];
+        if let Some(end) = rest.find(',') {
+            parent_name = rest[..end].trim().to_string();
+        } else {
+            parent_name = rest.trim().to_string();
+        }
+    }
+
+    // Parse "frozen" or "unfrozen"
+    // frozen if contains "frozen (" (with reason) or ends with "frozen", but not "unfrozen"
+    let frozen = (description.contains("frozen (") || description.ends_with("frozen"))
+        && !description.contains("unfrozen");
+
+    // Parse "pr=#<num>"
+    if let Some(start) = description.find("pr=#") {
+        let rest = &description[start + 4..];
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(num) = num_str.parse() {
+            pr_number = Some(num);
+        }
+    }
+
+    // For PR info, we need forge and URL. Use defaults for bootstrap.
+    // The URL is empty because we don't have it in the description.
+    let pr_info = pr_number.map(|num| ("github", num, ""));
+
+    (parent_name, frozen, pr_info)
+}
+
 /// Create minimal metadata for a new branch tracking.
+///
+/// This creates metadata with the parent's tip as the base. For bootstrap
+/// fixes, this is acceptable because:
+/// 1. The branch is being tracked for the first time
+/// 2. The true merge-base will be computed during sync/rebase operations
+/// 3. The stack graph will be valid for dependency tracking
+///
+/// # Arguments
+///
+/// * `branch` - Branch name to track
+/// * `parent_name` - Parent branch name
+/// * `snapshot` - Repository snapshot for looking up branch OIDs
+/// * `frozen` - Whether to create as frozen (teammate branch)
+/// * `pr_info` - Optional (forge, pr_number, url) for PR linkage
 fn create_minimal_metadata(
     branch: &str,
     parent_name: &str,
     snapshot: &RepoSnapshot,
+    frozen: bool,
+    pr_info: Option<(&str, u64, &str)>,
 ) -> Result<crate::core::metadata::schema::BranchMetadataV1, RepairPlanError> {
-    use crate::core::metadata::schema::BranchMetadataV1;
+    use crate::core::metadata::schema::{BranchMetadataV1, FreezeState, PrState};
     use crate::core::types::{BranchName, Oid};
 
     // Validate branch name
@@ -304,6 +496,9 @@ fn create_minimal_metadata(
     })?;
 
     // Get the parent's tip as the base
+    // Note: For strict correctness, we'd compute merge-base here, but that
+    // requires Git access which the planner doesn't have. The base will be
+    // refined during sync/rebase operations.
     let base_oid_str = snapshot
         .branches
         .get(&parent_branch)
@@ -313,8 +508,31 @@ fn create_minimal_metadata(
     let base_oid = Oid::new(&base_oid_str)
         .map_err(|e| RepairPlanError::CannotGeneratePlan(format!("invalid base oid: {}", e)))?;
 
-    // Use the constructor to create properly structured metadata
-    Ok(BranchMetadataV1::new(branch_name, parent_branch, base_oid))
+    // Build metadata with appropriate freeze and PR states
+    let mut builder = BranchMetadataV1::builder(branch_name, parent_branch, base_oid);
+
+    // Check if parent is trunk
+    if let Some(trunk) = &snapshot.trunk {
+        if trunk.as_str() == parent_name {
+            builder = builder.parent_is_trunk();
+        }
+    }
+
+    // Set freeze state
+    if frozen {
+        use crate::core::metadata::schema::FreezeScope;
+        builder = builder.freeze_state(FreezeState::frozen(
+            FreezeScope::Single,
+            Some("teammate_branch".to_string()),
+        ));
+    }
+
+    // Set PR state if provided
+    if let Some((forge, number, url)) = pr_info {
+        builder = builder.pr_state(PrState::linked(forge, number, url));
+    }
+
+    Ok(builder.build())
 }
 
 /// Combine multiple repair plans into one.
@@ -376,6 +594,7 @@ mod tests {
             graph: StackGraph::new(),
             fingerprint: Fingerprint::compute(&[]),
             health,
+            remote_prs: None,
         }
     }
 
@@ -440,7 +659,8 @@ mod tests {
             new_oid: "abc123".to_string(),
         };
 
-        let step = ref_change_to_step(&change);
+        let context = SnapshotContext::default();
+        let step = ref_change_to_step(&change, &context);
 
         match step {
             PlanStep::UpdateRefCas {
@@ -464,7 +684,8 @@ mod tests {
             old_oid: "abc123".to_string(),
         };
 
-        let step = ref_change_to_step(&change);
+        let context = SnapshotContext::default();
+        let step = ref_change_to_step(&change, &context);
 
         match step {
             PlanStep::DeleteRefCas {
@@ -474,6 +695,35 @@ mod tests {
                 assert_eq!(old_oid, "abc123");
             }
             _ => panic!("expected DeleteRefCas"),
+        }
+    }
+
+    #[test]
+    fn ref_change_to_step_snapshot_branch() {
+        let change = RefChange::Create {
+            ref_name: "refs/heads/lattice/snap/pr-42".to_string(),
+            new_oid: "(fetched from PR #42)".to_string(),
+        };
+
+        let context = SnapshotContext {
+            head_branch: "feature".to_string(),
+            head_oid: "abc123def4567890abc123def4567890abc12345".to_string(),
+        };
+        let step = ref_change_to_step(&change, &context);
+
+        match step {
+            PlanStep::CreateSnapshotBranch {
+                branch_name,
+                pr_number,
+                head_branch,
+                head_oid,
+            } => {
+                assert_eq!(branch_name, "lattice/snap/pr-42");
+                assert_eq!(pr_number, 42);
+                assert_eq!(head_branch, "feature");
+                assert_eq!(head_oid, "abc123def4567890abc123def4567890abc12345");
+            }
+            _ => panic!("expected CreateSnapshotBranch"),
         }
     }
 

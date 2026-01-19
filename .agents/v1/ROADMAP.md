@@ -948,3 +948,17 @@ If you want the tightest critical-path ordering (the shortest route through the 
 13. auth + forge + submit
 14. sync/get/merge/pr/unlink
 15. advanced rewrite commands one-by-one with conflict tests
+
+---
+
+# v2 Continuation
+
+GitHub App OAuth authentication and additional compliance work are tracked in `.agents/v2/ROADMAP.md`.
+
+The v1 roadmap covers the foundational implementation (milestones 0-10). v2 continues with:
+
+- **GitHub App OAuth** - Device flow authentication replacing PATs
+- **Bare Repository Support** - Infrastructure for bare repos and linked worktrees
+- **Compliance Milestones** - Doctor fix execution, sync restack, OAuth RepoAuthorized, bare repo command flags, event ledger completion, documentation alignment
+
+See: `.agents/v2/ROADMAP.md` for continued development.

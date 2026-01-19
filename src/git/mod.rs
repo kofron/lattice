@@ -50,6 +50,6 @@
 mod interface;
 
 pub use interface::{
-    CommitInfo, Git, GitError, GitState, RefEntry, RepoContext, RepoInfo, WorktreeEntry,
-    WorktreeStatus, WorktreeUnavailableReason,
+    CommitInfo, Git, GitCommandResult, GitError, GitState, RefEntry, RepoContext, RepoInfo,
+    WorktreeEntry, WorktreeStatus, WorktreeUnavailableReason,
 };

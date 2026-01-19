@@ -149,6 +149,8 @@ pub mod requirements {
     /// Per SPEC.md §4.6.6, submit/sync/get may work in bare repos with
     /// restrictions (e.g., `--no-restack`, `--no-checkout`), but by default
     /// they require a working directory.
+    ///
+    /// Per SPEC.md §8E.0, requires RepoAuthorized to verify GitHub App access.
     pub const REMOTE: RequirementSet = RequirementSet::new(
         "remote",
         &[
@@ -162,6 +164,7 @@ pub mod requirements {
             Capability::WorkingDirectoryAvailable,
             Capability::RemoteResolved,
             Capability::AuthAvailable,
+            Capability::RepoAuthorized,
         ],
     );
 
@@ -170,6 +173,8 @@ pub mod requirements {
     /// Per SPEC.md §4.6.6, remote commands can work in bare repos
     /// when used with flags like `--no-restack` or `--no-checkout`.
     /// This requirement set is for those restricted modes.
+    ///
+    /// Per SPEC.md §8E.0, requires RepoAuthorized to verify GitHub App access.
     pub const REMOTE_BARE_ALLOWED: RequirementSet = RequirementSet::new(
         "remote-bare-allowed",
         &[
@@ -183,6 +188,7 @@ pub mod requirements {
             // Note: WorkingDirectoryAvailable NOT required
             Capability::RemoteResolved,
             Capability::AuthAvailable,
+            Capability::RepoAuthorized,
         ],
     );
 
@@ -451,6 +457,7 @@ mod tests {
             graph: crate::core::graph::StackGraph::new(),
             fingerprint: Fingerprint::compute(&[]),
             health,
+            remote_prs: None,
         }
     }
 
@@ -561,6 +568,9 @@ mod tests {
             assert!(requirements::REMOTE
                 .capabilities
                 .contains(&Capability::RemoteResolved));
+            assert!(requirements::REMOTE
+                .capabilities
+                .contains(&Capability::RepoAuthorized));
             // Also includes mutating requirements
             assert!(requirements::REMOTE
                 .capabilities
@@ -579,6 +589,9 @@ mod tests {
             assert!(requirements::REMOTE_BARE_ALLOWED
                 .capabilities
                 .contains(&Capability::RemoteResolved));
+            assert!(requirements::REMOTE_BARE_ALLOWED
+                .capabilities
+                .contains(&Capability::RepoAuthorized));
             // Does NOT require working directory (for bare repo operations)
             assert!(!requirements::REMOTE_BARE_ALLOWED
                 .capabilities
