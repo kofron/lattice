@@ -367,6 +367,7 @@ mod tests {
             graph: StackGraph::new(),
             fingerprint: Fingerprint::compute(&[]),
             health: RepoHealthReport::new(),
+            remote_prs: None,
         }
     }
 

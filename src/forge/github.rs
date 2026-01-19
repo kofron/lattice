@@ -42,8 +42,8 @@ use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::traits::{
-    CreatePrRequest, Forge, ForgeError, MergeMethod, PrState, PullRequest, Reviewers,
-    UpdatePrRequest,
+    CreatePrRequest, Forge, ForgeError, ListPullsOpts, ListPullsResult, MergeMethod, PrState,
+    PullRequest, PullRequestSummary, Reviewers, UpdatePrRequest,
 };
 
 /// Default GitHub API base URL.
@@ -500,6 +500,119 @@ impl Forge for GitHubForge {
             self.handle_error_response(response, status).await
         }
     }
+
+    async fn list_open_prs(&self, opts: ListPullsOpts) -> Result<ListPullsResult, ForgeError> {
+        let limit = opts.effective_limit();
+        let per_page: u32 = 100; // GitHub's max per page
+
+        let mut all_prs: Vec<PullRequestSummary> = Vec::with_capacity(limit.min(100));
+        let mut page: u32 = 1;
+        let mut truncated = false;
+
+        loop {
+            // Fetch a page of PRs sorted by updated_at descending
+            let url = format!(
+                "{}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page={}&page={}",
+                self.api_base, self.owner, self.repo, per_page, page
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .headers(self.headers())
+                .send()
+                .await
+                .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+            let page_prs: Vec<GitHubPullRequestListItem> = self.handle_response(response).await?;
+            let page_count = page_prs.len();
+
+            for pr in page_prs {
+                if all_prs.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                all_prs.push(pr.into());
+            }
+
+            // Stop if we hit the limit or no more pages
+            if all_prs.len() >= limit || page_count < per_page as usize {
+                break;
+            }
+
+            page += 1;
+        }
+
+        // If we stopped exactly at limit and the last page was full, we're likely truncated
+        if all_prs.len() == limit && !truncated {
+            // We may or may not be truncated - be conservative
+            // The only way to know for sure is to fetch one more item
+            // For simplicity, we don't mark as truncated unless we explicitly stopped early
+        }
+
+        Ok(ListPullsResult {
+            pulls: all_prs,
+            truncated,
+        })
+    }
+
+    async fn list_closed_prs_targeting(
+        &self,
+        opts: super::ListClosedPrsOpts,
+    ) -> Result<ListPullsResult, ForgeError> {
+        let limit = opts.effective_limit();
+        let per_page: u32 = 100; // GitHub's max per page
+
+        let mut all_prs: Vec<PullRequestSummary> = Vec::with_capacity(limit.min(100));
+        let mut page: u32 = 1;
+        let mut truncated = false;
+
+        loop {
+            // Fetch a page of closed PRs filtered by base branch
+            // Note: GitHub's base filter works for closed PRs too
+            // Branch names typically don't need URL encoding for basic ASCII chars
+            let url = format!(
+                "{}/repos/{}/{}/pulls?state=closed&base={}&sort=updated&direction=desc&per_page={}&page={}",
+                self.api_base,
+                self.owner,
+                self.repo,
+                &opts.base,
+                per_page,
+                page
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .headers(self.headers())
+                .send()
+                .await
+                .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+
+            let page_prs: Vec<GitHubPullRequestListItem> = self.handle_response(response).await?;
+            let page_count = page_prs.len();
+
+            for pr in page_prs {
+                if all_prs.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                all_prs.push(pr.into());
+            }
+
+            // Stop if we hit the limit or no more pages
+            if all_prs.len() >= limit || page_count < per_page as usize {
+                break;
+            }
+
+            page += 1;
+        }
+
+        Ok(ListPullsResult {
+            pulls: all_prs,
+            truncated,
+        })
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -567,6 +680,56 @@ struct GitHubPullRequest {
 struct GitHubRef {
     #[serde(rename = "ref")]
     ref_name: String,
+}
+
+/// GitHub PR list item response (subset of full PR for list endpoint).
+///
+/// Used by `list_open_prs` to avoid parsing unused fields.
+#[derive(Deserialize)]
+struct GitHubPullRequestListItem {
+    number: u64,
+    html_url: String,
+    draft: bool,
+    head: GitHubHeadRefWithRepo,
+    base: GitHubRef,
+    updated_at: String,
+}
+
+/// GitHub head ref with repository info (for fork detection).
+#[derive(Deserialize)]
+struct GitHubHeadRefWithRepo {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    /// Repository info (None for deleted forks)
+    repo: Option<GitHubRepoInfo>,
+}
+
+/// Minimal GitHub repository info.
+#[derive(Deserialize)]
+struct GitHubRepoInfo {
+    owner: GitHubOwnerInfo,
+}
+
+/// Minimal GitHub owner info.
+#[derive(Deserialize)]
+struct GitHubOwnerInfo {
+    login: String,
+}
+
+impl From<GitHubPullRequestListItem> for PullRequestSummary {
+    fn from(gh: GitHubPullRequestListItem) -> Self {
+        let head_repo_owner = gh.head.repo.map(|r| r.owner.login);
+
+        PullRequestSummary {
+            number: gh.number,
+            head_ref: gh.head.ref_name,
+            head_repo_owner,
+            base_ref: gh.base.ref_name,
+            is_draft: gh.draft,
+            url: gh.html_url,
+            updated_at: gh.updated_at,
+        }
+    }
 }
 
 /// GraphQL response wrapper.

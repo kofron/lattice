@@ -120,6 +120,14 @@ COMMON SCENARIOS:
         /// List all issues and fixes in machine-readable format
         #[arg(long)]
         list: bool,
+
+        /// Perform deep remote analysis (query closed PRs for synthetic stacks)
+        ///
+        /// When enabled, doctor will query the forge for closed PRs to confirm
+        /// synthetic stack patterns. This provides more detailed information
+        /// but consumes additional API quota.
+        #[arg(long)]
+        deep_remote: bool,
     },
 
     // ========== Phase A: Read-Only Commands ==========
@@ -1205,7 +1213,9 @@ WORKFLOW EXAMPLES:
             This is the main command for getting your work onto GitHub. It pushes \
             branches, creates PRs for branches that don't have them, and updates \
             existing PRs. PR descriptions automatically include a stack visualization \
-            showing how PRs relate to each other.",
+            showing how PRs relate to each other.\n\n\
+            NOTE: Synthetic snapshot branches (created by `lattice doctor` from closed PRs) \
+            are automatically excluded from the submit scope.",
         after_help = "\
 WORKFLOW EXAMPLES:
     # Submit current branch and ancestors (most common)

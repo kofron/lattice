@@ -512,6 +512,24 @@ pub struct CommitInfo {
 /// This is the **single point of interaction** with Git. All repository
 /// reads and writes flow through this interface. No other module should
 /// import `git2` directly.
+/// Result of running a git command via [`Git::run_command`].
+///
+/// This struct captures the full output of a git command execution,
+/// including stdout, stderr, and exit status. It's used for low-level
+/// git command execution where no typed interface exists.
+#[derive(Debug, Clone)]
+pub struct GitCommandResult {
+    /// Whether the command exited successfully (exit code 0).
+    pub success: bool,
+    /// Standard output from the command.
+    pub stdout: String,
+    /// Standard error from the command.
+    pub stderr: String,
+    /// Exit code of the command (-1 if not available).
+    pub exit_code: i32,
+}
+
+/// The primary Git interface.
 ///
 /// # CAS Semantics
 ///
@@ -1588,6 +1606,165 @@ impl Git {
         }
 
         Some((owner.to_string(), repo.to_string()))
+    }
+
+    /// Fetch a specific ref from a remote.
+    ///
+    /// This fetches a ref from the specified remote using the given refspec.
+    /// The refspec can be a simple branch name or a full refspec like
+    /// `refs/heads/feature:refs/heads/feature`.
+    ///
+    /// # Arguments
+    ///
+    /// * `remote` - Remote name (e.g., "origin")
+    /// * `refspec` - Refspec to fetch. Can be:
+    ///   - A branch name: `feature` (fetches `refs/heads/feature`)
+    ///   - A full refspec: `refs/heads/feature:refs/heads/feature`
+    ///   - A PR ref: `refs/pull/123/head:refs/heads/pr-123`
+    ///
+    /// # Returns
+    ///
+    /// The OID of the fetched ref tip.
+    ///
+    /// # Errors
+    ///
+    /// - [`GitError::Internal`] if the fetch fails
+    /// - [`GitError::RefNotFound`] if the ref cannot be resolved after fetch
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Fetch a branch from origin
+    /// let oid = git.fetch_ref("origin", "refs/heads/feature:refs/heads/feature")?;
+    ///
+    /// // Fetch a PR head ref
+    /// let oid = git.fetch_ref("origin", "refs/pull/42/head:refs/heads/pr-42")?;
+    /// ```
+    pub fn fetch_ref(&self, remote: &str, refspec: &str) -> Result<Oid, GitError> {
+        use std::process::Command;
+
+        // Determine the working directory for the command
+        let work_dir = self.info().ok().and_then(|i| i.work_dir);
+        let run_dir = work_dir.as_deref().unwrap_or_else(|| self.repo.path());
+
+        let output = Command::new("git")
+            .args(["fetch", remote, refspec])
+            .current_dir(run_dir)
+            .output()
+            .map_err(|e| GitError::Internal {
+                message: format!("failed to run git fetch: {}", e),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::Internal {
+                message: format!("git fetch {} {} failed: {}", remote, refspec, stderr.trim()),
+            });
+        }
+
+        // Extract the target ref from refspec and resolve it
+        // Refspec format: source:destination or just source
+        let target_ref = if refspec.contains(':') {
+            // Full refspec - use destination
+            refspec.split(':').next_back().unwrap_or(refspec)
+        } else {
+            // Simple refspec - construct the full ref
+            // If it looks like a branch name, prefix with refs/heads/
+            if !refspec.starts_with("refs/") {
+                // For simple branch names, FETCH_HEAD contains the result
+                // We need to read FETCH_HEAD to get the OID
+                return self.read_fetch_head();
+            }
+            refspec
+        };
+
+        self.resolve_ref(target_ref)
+    }
+
+    /// Run a git command with the given arguments.
+    ///
+    /// This is a low-level method for executing arbitrary git commands.
+    /// Prefer specific typed methods (like [`fetch_ref`], [`update_ref_cas`])
+    /// when available, as they provide better error handling and type safety.
+    ///
+    /// The command is executed in the repository's working directory (or git
+    /// directory for bare repos).
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Command arguments (excluding "git" itself)
+    ///
+    /// # Returns
+    ///
+    /// A [`GitCommandResult`] with stdout, stderr, and success status.
+    /// The method itself only fails if the git process couldn't be spawned.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Run a simple git command
+    /// let result = git.run_command(&["status".to_string()])?;
+    /// if result.success {
+    ///     println!("Status: {}", result.stdout);
+    /// } else {
+    ///     eprintln!("Failed: {}", result.stderr);
+    /// }
+    ///
+    /// // Fetch a branch
+    /// let result = git.run_command(&[
+    ///     "fetch".to_string(),
+    ///     "origin".to_string(),
+    ///     "feature:refs/heads/feature".to_string(),
+    /// ])?;
+    /// ```
+    pub fn run_command(&self, args: &[String]) -> Result<GitCommandResult, GitError> {
+        use std::process::Command;
+
+        // Determine the working directory for the command
+        let work_dir = self.info().ok().and_then(|i| i.work_dir);
+        let run_dir = work_dir.as_deref().unwrap_or_else(|| self.repo.path());
+
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(run_dir)
+            .output()
+            .map_err(|e| GitError::Internal {
+                message: format!(
+                    "failed to run git {}: {}",
+                    args.first().unwrap_or(&String::new()),
+                    e
+                ),
+            })?;
+
+        Ok(GitCommandResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        })
+    }
+
+    /// Read the OID from FETCH_HEAD after a fetch operation.
+    ///
+    /// FETCH_HEAD contains the OID of the most recently fetched ref.
+    fn read_fetch_head(&self) -> Result<Oid, GitError> {
+        let fetch_head_path = self.repo.path().join("FETCH_HEAD");
+        let content =
+            std::fs::read_to_string(&fetch_head_path).map_err(|e| GitError::Internal {
+                message: format!("failed to read FETCH_HEAD: {}", e),
+            })?;
+
+        // FETCH_HEAD format: <oid> <tab> <info>
+        // We just need the first 40 characters (the OID)
+        let oid_str = content
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or_else(|| GitError::Internal {
+                message: "FETCH_HEAD is empty or malformed".to_string(),
+            })?;
+
+        Oid::new(oid_str).map_err(|e| e.into())
     }
 }
 

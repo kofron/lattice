@@ -46,6 +46,22 @@ pub const METADATA_KIND: &str = "lattice.branch-metadata";
 /// Current schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Freeze reason for teammate branches fetched from remote PRs.
+///
+/// This indicates a branch was created by tracking another user's PR
+/// and should not be modified locally.
+pub const FREEZE_REASON_TEAMMATE_BRANCH: &str = "teammate_branch";
+
+/// Freeze reason for synthetic snapshot branches created from closed PRs.
+///
+/// These branches represent historical state (closed/merged PRs that
+/// targeted a synthetic stack head) and must not be modified.
+/// Per ROADMAP.md Milestone 5.9, this enables:
+/// - Submit scope exclusion for snapshot branches
+/// - Clear UX messaging about why the branch is frozen
+/// - Future tooling to filter/manage snapshot branches
+pub const FREEZE_REASON_SYNTHETIC_SNAPSHOT: &str = "remote_synthetic_snapshot";
+
 /// Errors from metadata operations.
 #[derive(Debug, Error)]
 pub enum MetadataError {

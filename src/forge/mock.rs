@@ -40,8 +40,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::traits::{
-    CreatePrRequest, Forge, ForgeError, MergeMethod, PrState, PullRequest, Reviewers,
-    UpdatePrRequest,
+    CreatePrRequest, Forge, ForgeError, ListPullsOpts, ListPullsResult, MergeMethod, PrState,
+    PullRequest, PullRequestSummary, Reviewers, UpdatePrRequest,
 };
 
 /// Mock forge for testing.
@@ -83,6 +83,10 @@ pub enum FailOn {
     RequestReviewers(ForgeError),
     /// Fail merge_pr with the given error.
     MergePr(ForgeError),
+    /// Fail list_open_prs with the given error.
+    ListOpenPrs(ForgeError),
+    /// Fail list_closed_prs_targeting with the given error.
+    ListClosedPrsTargeting(ForgeError),
 }
 
 /// Recorded operation for test verification.
@@ -118,6 +122,13 @@ pub enum MockOperation {
     MergePr {
         number: u64,
         method: MergeMethod,
+    },
+    ListOpenPrs {
+        max_results: Option<usize>,
+    },
+    ListClosedPrsTargeting {
+        base: String,
+        max_results: Option<usize>,
     },
 }
 
@@ -248,6 +259,12 @@ impl MockForge {
                 Some(Err(clone_error(e)))
             }
             Some(FailOn::MergePr(e)) if expected == "merge_pr" => Some(Err(clone_error(e))),
+            Some(FailOn::ListOpenPrs(e)) if expected == "list_open_prs" => {
+                Some(Err(clone_error(e)))
+            }
+            Some(FailOn::ListClosedPrsTargeting(e)) if expected == "list_closed_prs_targeting" => {
+                Some(Err(clone_error(e)))
+            }
             _ => None,
         }
     }
@@ -437,6 +454,91 @@ impl Forge for MockForge {
 
         pr.state = PrState::Merged;
         Ok(())
+    }
+
+    async fn list_open_prs(&self, opts: ListPullsOpts) -> Result<ListPullsResult, ForgeError> {
+        self.record(MockOperation::ListOpenPrs {
+            max_results: opts.max_results,
+        });
+
+        if let Some(result) = self.check_fail("list_open_prs") {
+            return result;
+        }
+
+        let limit = opts.effective_limit();
+        let inner = self.inner.lock().unwrap();
+
+        // Get all open PRs, sorted by number descending (simulating updated_at sort)
+        let mut open_prs: Vec<_> = inner
+            .prs
+            .values()
+            .filter(|p| p.state == PrState::Open)
+            .collect();
+
+        open_prs.sort_by(|a, b| b.number.cmp(&a.number));
+
+        let truncated = open_prs.len() > limit;
+        let pulls: Vec<PullRequestSummary> = open_prs
+            .into_iter()
+            .take(limit)
+            .map(|pr| PullRequestSummary {
+                number: pr.number,
+                head_ref: pr.head.clone(),
+                head_repo_owner: None, // Mock doesn't track forks
+                base_ref: pr.base.clone(),
+                is_draft: pr.is_draft,
+                url: pr.url.clone(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(), // Mock timestamp
+            })
+            .collect();
+
+        Ok(ListPullsResult { pulls, truncated })
+    }
+
+    async fn list_closed_prs_targeting(
+        &self,
+        opts: super::ListClosedPrsOpts,
+    ) -> Result<ListPullsResult, ForgeError> {
+        self.record(MockOperation::ListClosedPrsTargeting {
+            base: opts.base.clone(),
+            max_results: opts.max_results,
+        });
+
+        if let Some(result) = self.check_fail("list_closed_prs_targeting") {
+            return result;
+        }
+
+        let limit = opts.effective_limit();
+        let inner = self.inner.lock().unwrap();
+
+        // Get all closed PRs (merged or closed) that target the specified base branch
+        let mut closed_prs: Vec<_> = inner
+            .prs
+            .values()
+            .filter(|p| {
+                (p.state == PrState::Closed || p.state == PrState::Merged) && p.base == opts.base
+            })
+            .collect();
+
+        // Sort by number descending (simulating updated_at sort)
+        closed_prs.sort_by(|a, b| b.number.cmp(&a.number));
+
+        let truncated = closed_prs.len() > limit;
+        let pulls: Vec<PullRequestSummary> = closed_prs
+            .into_iter()
+            .take(limit)
+            .map(|pr| PullRequestSummary {
+                number: pr.number,
+                head_ref: pr.head.clone(),
+                head_repo_owner: None, // Mock doesn't track forks
+                base_ref: pr.base.clone(),
+                is_draft: pr.is_draft,
+                url: pr.url.clone(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(), // Mock timestamp
+            })
+            .collect();
+
+        Ok(ListPullsResult { pulls, truncated })
     }
 }
 
@@ -779,5 +881,358 @@ mod tests {
         assert_eq!(forge.pr_count(), 2);
         let all = forge.all_prs();
         assert_eq!(all.len(), 2);
+    }
+
+    mod list_open_prs {
+        use super::*;
+
+        #[tokio::test]
+        async fn returns_open_prs() {
+            let forge = MockForge::new();
+
+            // Create some PRs
+            for i in 1..=5 {
+                forge
+                    .create_pr(CreatePrRequest {
+                        head: format!("feature-{}", i),
+                        base: "main".into(),
+                        title: format!("PR {}", i),
+                        body: None,
+                        draft: false,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await.unwrap();
+            assert_eq!(result.pulls.len(), 5);
+            assert!(!result.truncated);
+        }
+
+        #[tokio::test]
+        async fn respects_limit() {
+            let forge = MockForge::new();
+
+            // Create 10 PRs
+            for i in 1..=10 {
+                forge
+                    .create_pr(CreatePrRequest {
+                        head: format!("feature-{}", i),
+                        base: "main".into(),
+                        title: format!("PR {}", i),
+                        body: None,
+                        draft: false,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let result = forge
+                .list_open_prs(ListPullsOpts::with_limit(3))
+                .await
+                .unwrap();
+            assert_eq!(result.pulls.len(), 3);
+            assert!(result.truncated);
+        }
+
+        #[tokio::test]
+        async fn excludes_merged_and_closed() {
+            let forge = MockForge::new();
+
+            let pr1 = forge
+                .create_pr(CreatePrRequest {
+                    head: "open-pr".into(),
+                    base: "main".into(),
+                    title: "Open".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            let pr2 = forge
+                .create_pr(CreatePrRequest {
+                    head: "merged-pr".into(),
+                    base: "main".into(),
+                    title: "To merge".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            forge
+                .merge_pr(pr2.number, MergeMethod::Squash)
+                .await
+                .unwrap();
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await.unwrap();
+            assert_eq!(result.pulls.len(), 1);
+            assert_eq!(result.pulls[0].number, pr1.number);
+        }
+
+        #[tokio::test]
+        async fn fail_on_list_open_prs() {
+            let forge = MockForge::new().fail_on(FailOn::ListOpenPrs(ForgeError::RateLimited));
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await;
+            assert!(matches!(result, Err(ForgeError::RateLimited)));
+        }
+
+        #[tokio::test]
+        async fn records_operation() {
+            let forge = MockForge::new();
+
+            forge
+                .list_open_prs(ListPullsOpts::with_limit(50))
+                .await
+                .unwrap();
+
+            let ops = forge.operations();
+            assert_eq!(ops.len(), 1);
+            match &ops[0] {
+                MockOperation::ListOpenPrs { max_results } => {
+                    assert_eq!(*max_results, Some(50));
+                }
+                _ => panic!("Expected ListOpenPrs operation"),
+            }
+        }
+
+        #[tokio::test]
+        async fn empty_repo_returns_empty_list() {
+            let forge = MockForge::new();
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await.unwrap();
+            assert!(result.pulls.is_empty());
+            assert!(!result.truncated);
+        }
+
+        #[tokio::test]
+        async fn sorted_by_number_descending() {
+            let forge = MockForge::new();
+
+            // Create PRs in order 1, 2, 3
+            for i in 1..=3 {
+                forge
+                    .create_pr(CreatePrRequest {
+                        head: format!("feature-{}", i),
+                        base: "main".into(),
+                        title: format!("PR {}", i),
+                        body: None,
+                        draft: false,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await.unwrap();
+
+            // Should be returned in descending order: 3, 2, 1
+            assert_eq!(result.pulls[0].number, 3);
+            assert_eq!(result.pulls[1].number, 2);
+            assert_eq!(result.pulls[2].number, 1);
+        }
+
+        #[tokio::test]
+        async fn includes_draft_prs() {
+            let forge = MockForge::new();
+
+            forge
+                .create_pr(CreatePrRequest {
+                    head: "draft-feature".into(),
+                    base: "main".into(),
+                    title: "Draft PR".into(),
+                    body: None,
+                    draft: true,
+                })
+                .await
+                .unwrap();
+
+            let result = forge.list_open_prs(ListPullsOpts::default()).await.unwrap();
+
+            assert_eq!(result.pulls.len(), 1);
+            assert!(result.pulls[0].is_draft);
+        }
+
+        #[tokio::test]
+        async fn zero_limit_returns_empty() {
+            let forge = MockForge::new();
+
+            forge
+                .create_pr(CreatePrRequest {
+                    head: "feature".into(),
+                    base: "main".into(),
+                    title: "PR".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            let result = forge
+                .list_open_prs(ListPullsOpts::with_limit(0))
+                .await
+                .unwrap();
+
+            assert!(result.pulls.is_empty());
+            assert!(result.truncated);
+        }
+    }
+
+    // --- Closed PR Tests (Milestone 5.8) ---
+
+    mod list_closed_prs {
+        use super::*;
+        use crate::forge::ListClosedPrsOpts;
+
+        #[tokio::test]
+        async fn filters_by_base() {
+            let forge = MockForge::new();
+
+            // Create and merge PRs targeting "feature" branch
+            let pr1 = forge
+                .create_pr(CreatePrRequest {
+                    head: "sub-a".into(),
+                    base: "feature".into(),
+                    title: "Sub A".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            let pr2 = forge
+                .create_pr(CreatePrRequest {
+                    head: "sub-b".into(),
+                    base: "feature".into(),
+                    title: "Sub B".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            // Create and merge a PR targeting "main" (different base)
+            let pr3 = forge
+                .create_pr(CreatePrRequest {
+                    head: "other".into(),
+                    base: "main".into(),
+                    title: "Other".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            // Merge all PRs to make them closed
+            forge
+                .merge_pr(pr1.number, MergeMethod::Squash)
+                .await
+                .unwrap();
+            forge
+                .merge_pr(pr2.number, MergeMethod::Squash)
+                .await
+                .unwrap();
+            forge
+                .merge_pr(pr3.number, MergeMethod::Squash)
+                .await
+                .unwrap();
+
+            // Query closed PRs targeting "feature"
+            let result = forge
+                .list_closed_prs_targeting(ListClosedPrsOpts::for_base("feature"))
+                .await
+                .unwrap();
+
+            assert_eq!(result.pulls.len(), 2);
+            assert!(result.pulls.iter().all(|pr| pr.base_ref == "feature"));
+        }
+
+        #[tokio::test]
+        async fn respects_limit() {
+            let forge = MockForge::new();
+
+            // Create and merge 10 PRs targeting "feature"
+            for i in 1..=10 {
+                let pr = forge
+                    .create_pr(CreatePrRequest {
+                        head: format!("sub-{}", i),
+                        base: "feature".into(),
+                        title: format!("Sub {}", i),
+                        body: None,
+                        draft: false,
+                    })
+                    .await
+                    .unwrap();
+                forge
+                    .merge_pr(pr.number, MergeMethod::Squash)
+                    .await
+                    .unwrap();
+            }
+
+            let result = forge
+                .list_closed_prs_targeting(ListClosedPrsOpts::for_base("feature").with_limit(3))
+                .await
+                .unwrap();
+
+            assert_eq!(result.pulls.len(), 3);
+            assert!(result.truncated);
+        }
+
+        #[tokio::test]
+        async fn empty_when_no_closed_prs() {
+            let forge = MockForge::new();
+
+            // Create an open PR (not merged)
+            forge
+                .create_pr(CreatePrRequest {
+                    head: "feature".into(),
+                    base: "main".into(),
+                    title: "Open PR".into(),
+                    body: None,
+                    draft: false,
+                })
+                .await
+                .unwrap();
+
+            let result = forge
+                .list_closed_prs_targeting(ListClosedPrsOpts::for_base("main"))
+                .await
+                .unwrap();
+
+            assert!(result.pulls.is_empty());
+            assert!(!result.truncated);
+        }
+
+        #[tokio::test]
+        async fn not_truncated_when_under_limit() {
+            let forge = MockForge::new();
+
+            // Create and merge 2 PRs
+            for i in 1..=2 {
+                let pr = forge
+                    .create_pr(CreatePrRequest {
+                        head: format!("sub-{}", i),
+                        base: "feature".into(),
+                        title: format!("Sub {}", i),
+                        body: None,
+                        draft: false,
+                    })
+                    .await
+                    .unwrap();
+                forge
+                    .merge_pr(pr.number, MergeMethod::Squash)
+                    .await
+                    .unwrap();
+            }
+
+            let result = forge
+                .list_closed_prs_targeting(ListClosedPrsOpts::for_base("feature").with_limit(10))
+                .await
+                .unwrap();
+
+            assert_eq!(result.pulls.len(), 2);
+            assert!(!result.truncated);
+        }
     }
 }

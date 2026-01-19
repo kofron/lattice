@@ -131,6 +131,40 @@ impl std::fmt::Display for IssueId {
     }
 }
 
+/// A potential parent branch for an untracked branch.
+///
+/// Used by local-only bootstrap to rank parent candidates by
+/// merge-base distance. The candidate with the smallest distance
+/// (closest to the untracked branch) is the preferred parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParentCandidate {
+    /// Branch name.
+    pub name: String,
+    /// Merge-base OID between the untracked branch and this candidate.
+    pub merge_base: String,
+    /// Number of commits from merge-base to the untracked branch tip.
+    /// Lower distance = closer relationship = better parent candidate.
+    pub distance: u32,
+    /// Whether this is the configured trunk branch.
+    pub is_trunk: bool,
+}
+
+/// Information about a closed PR that targeted a synthetic stack head.
+///
+/// Used in Tier 2 deep analysis (Milestone 5.8) to provide details
+/// about closed PRs that were merged into a potential synthetic head branch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosedPrInfo {
+    /// PR number.
+    pub number: u64,
+    /// Head branch of the closed PR.
+    pub head_ref: String,
+    /// Whether the PR was merged (true) or just closed (false).
+    pub merged: bool,
+    /// PR URL.
+    pub url: String,
+}
+
 /// Evidence supporting an issue.
 ///
 /// Evidence provides concrete details about what was found during
@@ -195,6 +229,42 @@ pub enum Evidence {
         /// Frozen branch that would be modified
         branch: String,
     },
+
+    /// Parent candidates for an untracked branch (local-only bootstrap).
+    ///
+    /// Used when detecting untracked branches to provide evidence
+    /// about potential parent branches ranked by merge-base distance.
+    ParentCandidates {
+        /// The untracked branch name.
+        branch: String,
+        /// Ranked list of parent candidates (closest first).
+        candidates: Vec<ParentCandidate>,
+    },
+
+    /// PR reference for context (Milestone 5.8: Synthetic Stack Detection).
+    ///
+    /// Used to provide PR information as evidence for issues.
+    PrReference {
+        /// PR number.
+        number: u64,
+        /// PR URL.
+        url: String,
+        /// Context description for the reference.
+        context: String,
+    },
+
+    /// Closed PRs that targeted a synthetic stack head (Tier 2 deep analysis).
+    ///
+    /// Used when `--deep-remote` is enabled to enumerate closed PRs
+    /// that were merged into a potential synthetic stack head.
+    SyntheticStackChildren {
+        /// The synthetic head branch.
+        head_branch: String,
+        /// Closed PRs that targeted this head.
+        closed_prs: Vec<ClosedPrInfo>,
+        /// Whether the result was truncated due to budget limits.
+        truncated: bool,
+    },
 }
 
 impl Evidence {
@@ -211,6 +281,9 @@ impl Evidence {
             Evidence::Config { key, .. } => key.clone(),
             Evidence::BaseAncestry { branch, .. } => branch.clone(),
             Evidence::FrozenViolation { branch } => branch.clone(),
+            Evidence::ParentCandidates { branch, .. } => branch.clone(),
+            Evidence::PrReference { number, .. } => number.to_string(),
+            Evidence::SyntheticStackChildren { head_branch, .. } => head_branch.clone(),
         }
     }
 }
@@ -763,6 +836,133 @@ pub mod issues {
 
         issue
     }
+
+    // --- Bootstrap Issues (Remote Evidence) ---
+
+    /// Create an issue for detecting open PRs on the remote.
+    ///
+    /// This is an informational issue indicating bootstrap opportunity.
+    pub fn remote_open_prs_detected(count: usize, truncated: bool) -> Issue {
+        let truncation_note = if truncated {
+            " (results truncated, more may exist)"
+        } else {
+            ""
+        };
+
+        Issue::new(
+            "remote-open-prs-detected",
+            Severity::Info,
+            format!(
+                "Remote has {} open pull request(s){}. Run `lattice doctor --fix` to import.",
+                count, truncation_note
+            ),
+        )
+    }
+
+    /// Create an issue for an open PR whose head branch doesn't exist locally.
+    ///
+    /// The user should fetch the branch to import the PR into Lattice tracking.
+    pub fn remote_pr_branch_missing(
+        number: u64,
+        head_ref: &str,
+        base_ref: &str,
+        url: &str,
+    ) -> Issue {
+        Issue::new(
+            "remote-pr-branch-missing",
+            Severity::Warning,
+            format!(
+                "Open PR #{} targets '{}' from '{}' but branch '{}' doesn't exist locally",
+                number, base_ref, head_ref, head_ref
+            ),
+        )
+        .with_evidence(Evidence::Ref {
+            name: format!("refs/heads/{}", head_ref),
+            oid: None,
+        })
+        .with_evidence(Evidence::Config {
+            key: format!("pr.{}", number),
+            problem: format!("branch missing, base:{} PR URL: {}", base_ref, url),
+        })
+    }
+
+    /// Create an issue for a local branch matching an open PR but not tracked.
+    ///
+    /// The user should track the branch to link it with the PR.
+    pub fn remote_pr_branch_untracked(
+        branch: &str,
+        number: u64,
+        base_ref: &str,
+        url: &str,
+    ) -> Issue {
+        Issue::new(
+            "remote-pr-branch-untracked",
+            Severity::Warning,
+            format!(
+                "Branch '{}' matches open PR #{} but is not tracked by Lattice",
+                branch, number
+            ),
+        )
+        .with_evidence(Evidence::Ref {
+            name: format!("refs/heads/{}", branch),
+            oid: None,
+        })
+        .with_evidence(Evidence::Config {
+            key: format!("pr.{}", number),
+            problem: format!("untracked, base:{} PR URL: {}", base_ref, url),
+        })
+    }
+
+    /// Create an issue for a tracked branch with an open PR but no linkage.
+    ///
+    /// The user should link the PR to the tracked branch in metadata.
+    pub fn remote_pr_not_linked(branch: &str, number: u64, url: &str) -> Issue {
+        Issue::new(
+            "remote-pr-not-linked",
+            Severity::Info,
+            format!(
+                "Tracked branch '{}' has open PR #{} but PR is not linked in metadata",
+                branch, number
+            ),
+        )
+        .with_evidence(Evidence::Ref {
+            name: format!("refs/branch-metadata/{}", branch),
+            oid: None,
+        })
+        .with_evidence(Evidence::Config {
+            key: format!("pr.{}", number),
+            problem: format!("not linked, PR URL: {}", url),
+        })
+    }
+
+    // --- Synthetic Stack Detection (Milestone 5.8) ---
+
+    /// Create an issue for a potential synthetic stack head.
+    ///
+    /// This is an informational issue indicating that a PR targeting trunk
+    /// may have accumulated commits from merged sub-PRs. The branch could
+    /// be a "synthetic stack head" where prior work was merged in.
+    ///
+    /// # Arguments
+    ///
+    /// * `branch` - The branch that may be a synthetic stack head
+    /// * `pr_number` - The PR number targeting trunk
+    /// * `pr_url` - URL of the PR
+    pub fn potential_synthetic_stack_head(branch: &str, pr_number: u64, pr_url: &str) -> Issue {
+        Issue::new(
+            "synthetic-stack-head",
+            Severity::Info,
+            format!(
+                "PR #{} targeting trunk may be a synthetic stack head (branch '{}')",
+                pr_number, branch
+            ),
+        )
+        .with_evidence(Evidence::PrReference {
+            number: pr_number,
+            url: pr_url.to_string(),
+            context: format!("Open PR targeting trunk with head branch '{}'", branch),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -865,6 +1065,20 @@ mod tests {
         fn missing_branch_key() {
             let e = Evidence::MissingBranch {
                 name: "feature".to_string(),
+            };
+            assert_eq!(e.key(), "feature");
+        }
+
+        #[test]
+        fn parent_candidates_key() {
+            let e = Evidence::ParentCandidates {
+                branch: "feature".to_string(),
+                candidates: vec![ParentCandidate {
+                    name: "main".to_string(),
+                    merge_base: "abc123".to_string(),
+                    distance: 3,
+                    is_trunk: true,
+                }],
             };
             assert_eq!(e.key(), "feature");
         }
@@ -1204,6 +1418,64 @@ mod tests {
             assert!(issue.message.contains("feature-a"));
             assert!(issue.message.contains("feature-b"));
             assert!(issue.message.contains("other worktrees"));
+        }
+
+        // --- Bootstrap Issues ---
+
+        #[test]
+        fn remote_open_prs_detected() {
+            let issue = issues::remote_open_prs_detected(5, false);
+            assert!(!issue.is_blocking()); // Info severity
+            assert!(issue.message.contains("5 open pull request"));
+            assert!(!issue.message.contains("truncated"));
+        }
+
+        #[test]
+        fn remote_open_prs_detected_truncated() {
+            let issue = issues::remote_open_prs_detected(200, true);
+            assert!(!issue.is_blocking());
+            assert!(issue.message.contains("200"));
+            assert!(issue.message.contains("truncated"));
+        }
+
+        #[test]
+        fn remote_pr_branch_missing() {
+            let issue = issues::remote_pr_branch_missing(
+                42,
+                "feature-branch",
+                "main",
+                "https://github.com/org/repo/pull/42",
+            );
+            assert!(!issue.is_blocking()); // Warning severity
+            assert!(issue.message.contains("42"));
+            assert!(issue.message.contains("feature-branch"));
+            assert_eq!(issue.evidence.len(), 2);
+        }
+
+        #[test]
+        fn remote_pr_branch_untracked() {
+            let issue = issues::remote_pr_branch_untracked(
+                "feature",
+                42,
+                "main",
+                "https://github.com/org/repo/pull/42",
+            );
+            assert!(!issue.is_blocking()); // Warning severity
+            assert!(issue.message.contains("feature"));
+            assert!(issue.message.contains("42"));
+            assert!(issue.message.contains("not tracked"));
+            assert_eq!(issue.evidence.len(), 2);
+        }
+
+        #[test]
+        fn remote_pr_not_linked() {
+            let issue =
+                issues::remote_pr_not_linked("feature", 42, "https://github.com/org/repo/pull/42");
+            assert!(!issue.is_blocking()); // Info severity
+            assert!(issue.message.contains("feature"));
+            assert!(issue.message.contains("42"));
+            assert!(issue.message.contains("not linked"));
+            assert_eq!(issue.evidence.len(), 2);
         }
     }
 }

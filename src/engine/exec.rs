@@ -451,20 +451,47 @@ impl<'a> Executor<'a> {
             PlanStep::RunGit {
                 args,
                 description,
-                expected_effects: _,
+                expected_effects,
             } => {
-                // RunGit would shell out to git - for now we skip actual execution
-                // In a real implementation, we'd use std::process::Command
+                // Record intent in journal before executing
                 journal.record_git_process(args.clone(), description);
 
-                // Check for conflicts after git command
+                // Execute the git command
+                let result = self.git.run_command(args)?;
+
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git {} failed (exit code {}): {}",
+                            args.first().unwrap_or(&String::new()),
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                // Check for conflicts after git command (rebase/merge/cherry-pick)
                 let git_state = self.git.state();
                 if git_state.is_in_progress() {
-                    // Conflict occurred - need to pause
-                    return Ok(StepResult::Pause {
-                        branch: "unknown".to_string(), // Would extract from context
-                        git_state,
-                    });
+                    // Conflict occurred - need to pause for user resolution
+                    let branch = expected_effects
+                        .first()
+                        .and_then(|r| r.strip_prefix("refs/heads/"))
+                        .unwrap_or("unknown")
+                        .to_string();
+                    return Ok(StepResult::Pause { branch, git_state });
+                }
+
+                // Verify expected effects (refs were created/updated as expected)
+                for effect in expected_effects {
+                    if self.git.try_resolve_ref(effect)?.is_none() {
+                        return Ok(StepResult::Abort {
+                            error: format!(
+                                "git command succeeded but expected ref '{}' was not created",
+                                effect
+                            ),
+                        });
+                    }
                 }
 
                 Ok(StepResult::Continue)
@@ -477,6 +504,69 @@ impl<'a> Executor<'a> {
 
             PlanStep::PotentialConflictPause { .. } => {
                 // This is a marker, not an action
+                Ok(StepResult::Continue)
+            }
+
+            PlanStep::CreateSnapshotBranch {
+                branch_name,
+                pr_number,
+                head_branch,
+                head_oid,
+            } => {
+                // Step 1: Read FETCH_HEAD to get the PR commit
+                // (Assumes a prior RunGit step fetched the PR ref)
+                let fetch_head = self.git.try_resolve_ref("FETCH_HEAD")?.ok_or_else(|| {
+                    ExecuteError::Internal(format!(
+                        "FETCH_HEAD not found after fetching PR #{}",
+                        pr_number
+                    ))
+                })?;
+
+                // Step 2: Validate ancestry - the snapshot commit must be reachable from head
+                let head = if head_oid.is_empty() {
+                    // Head OID wasn't provided, look it up
+                    self.git
+                        .resolve_ref(&format!("refs/heads/{}", head_branch))?
+                } else {
+                    Oid::new(head_oid).map_err(|e| ExecuteError::Internal(e.to_string()))?
+                };
+
+                let is_ancestor = self.git.is_ancestor(&fetch_head, &head)?;
+
+                if !is_ancestor {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "PR #{} commit {} is not an ancestor of '{}' ({}). \
+                             The PR may have been rebased or force-pushed after being closed.",
+                            pr_number,
+                            &fetch_head.as_str()[..8.min(fetch_head.as_str().len())],
+                            head_branch,
+                            &head.as_str()[..8.min(head.as_str().len())],
+                        ),
+                    });
+                }
+
+                // Step 3: Create the branch (CAS: expect no prior ref)
+                let refname = format!("refs/heads/{}", branch_name);
+                self.git
+                    .update_ref_cas(
+                        &refname,
+                        &fetch_head,
+                        None,
+                        "lattice: create snapshot branch",
+                    )
+                    .map_err(|e| match e {
+                        GitError::CasFailed {
+                            expected, actual, ..
+                        } => ExecuteError::CasFailed {
+                            refname: refname.clone(),
+                            expected,
+                            actual,
+                        },
+                        other => ExecuteError::Git(other),
+                    })?;
+
+                journal.record_ref_update(&refname, None, fetch_head.as_str());
                 Ok(StepResult::Continue)
             }
         }

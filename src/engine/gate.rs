@@ -457,6 +457,7 @@ mod tests {
             graph: crate::core::graph::StackGraph::new(),
             fingerprint: Fingerprint::compute(&[]),
             health,
+            remote_prs: None,
         }
     }
 

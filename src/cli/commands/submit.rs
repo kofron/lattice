@@ -52,7 +52,7 @@
 //! lattice submit --no-restack
 //! ```
 
-use crate::core::metadata::schema::BaseInfo;
+use crate::core::metadata::schema::{BaseInfo, FreezeState, FREEZE_REASON_SYNTHETIC_SNAPSHOT};
 use crate::core::metadata::store::MetadataStore;
 use crate::core::types::{BranchName, Oid};
 use crate::engine::scan::RepoSnapshot;
@@ -63,6 +63,115 @@ use anyhow::{bail, Context as _, Result};
 use super::stack_comment_ops::{
     generate_merged_body, update_stack_comments_for_branches_from_forge,
 };
+
+// ============================================================================
+// Snapshot Branch Exclusion (Milestone 5.10)
+// ============================================================================
+
+/// Check if a branch is a synthetic snapshot branch.
+///
+/// A synthetic snapshot branch is one created by Milestone 5.9 to represent
+/// historical closed PRs that were merged into a synthetic stack head.
+/// These branches are frozen with reason `remote_synthetic_snapshot`.
+///
+/// # Arguments
+///
+/// * `branch` - The branch name to check
+/// * `snapshot` - The repo snapshot containing metadata
+///
+/// # Returns
+///
+/// `true` if the branch is a synthetic snapshot, `false` otherwise.
+fn is_synthetic_snapshot(branch: &BranchName, snapshot: &RepoSnapshot) -> bool {
+    let Some(entry) = snapshot.metadata.get(branch) else {
+        return false;
+    };
+
+    if let FreezeState::Frozen {
+        reason: Some(r), ..
+    } = &entry.metadata.freeze
+    {
+        r == FREEZE_REASON_SYNTHETIC_SNAPSHOT
+    } else {
+        false
+    }
+}
+
+/// Filter snapshot branches from submit scope.
+///
+/// Returns the filtered list and the excluded branches (for reporting).
+///
+/// # Arguments
+///
+/// * `branches` - The original submit scope
+/// * `snapshot` - The repo snapshot containing metadata
+///
+/// # Returns
+///
+/// A tuple of (filtered_branches, excluded_branches).
+fn filter_snapshot_branches(
+    branches: Vec<BranchName>,
+    snapshot: &RepoSnapshot,
+) -> (Vec<BranchName>, Vec<BranchName>) {
+    let mut filtered = Vec::with_capacity(branches.len());
+    let mut excluded = Vec::new();
+
+    for branch in branches {
+        if is_synthetic_snapshot(&branch, snapshot) {
+            excluded.push(branch);
+        } else {
+            filtered.push(branch);
+        }
+    }
+
+    (filtered, excluded)
+}
+
+/// Print information about excluded snapshot branches.
+///
+/// # Arguments
+///
+/// * `excluded` - The list of excluded snapshot branches
+/// * `quiet` - Whether to suppress output
+fn report_excluded_snapshots(excluded: &[BranchName], quiet: bool) {
+    if excluded.is_empty() || quiet {
+        return;
+    }
+
+    println!(
+        "Excluding {} snapshot branch(es) from submit scope:",
+        excluded.len()
+    );
+    for branch in excluded {
+        println!("  {}", branch);
+    }
+    println!("These branches represent historical snapshots and cannot be submitted.");
+    println!();
+}
+
+/// Check if current branch is a snapshot and refuse if so.
+///
+/// # Errors
+///
+/// Returns an error if the current branch is a synthetic snapshot branch.
+fn check_current_branch_not_snapshot(current: &BranchName, snapshot: &RepoSnapshot) -> Result<()> {
+    if is_synthetic_snapshot(current, snapshot) {
+        bail!(
+            "Cannot submit from a snapshot branch ('{}')\n\n\
+             Snapshot branches represent historical state from closed PRs and\n\
+             cannot be submitted. To work on this code, create a new branch:\n\n\
+                 git checkout -b my-new-branch\n\
+                 lattice track\n\n\
+             Then you can submit the new branch.",
+            current
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Submit Command Implementation
+// ============================================================================
 
 /// Submit options parsed from CLI arguments.
 #[derive(Debug)]
@@ -164,6 +273,9 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Not on a branch."))?;
 
+    // Check current branch is not a snapshot (refuse early)
+    check_current_branch_not_snapshot(current, &snapshot)?;
+
     // Determine branches to submit
     let branches = if opts.stack {
         // Include ancestors and descendants
@@ -180,6 +292,18 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
         all.push(current.clone());
         all
     };
+
+    // Filter out snapshot branches (Milestone 5.10)
+    let (branches, excluded) = filter_snapshot_branches(branches, &snapshot);
+    report_excluded_snapshots(&excluded, ctx.quiet);
+
+    // Check we have branches to submit after filtering
+    if branches.is_empty() {
+        bail!(
+            "No branches to submit after filtering.\n\n\
+             All branches in the scope were excluded (snapshot branches cannot be submitted)."
+        );
+    }
 
     // Per SPEC.md §4.6.7: Even with --no-restack, check alignment in bare repos
     if is_bare && opts.no_restack {
@@ -581,5 +705,180 @@ mod tests {
         };
         assert!(!opts.stack);
         assert!(!opts.draft);
+    }
+
+    mod snapshot_exclusion {
+        use super::*;
+        use crate::core::graph::StackGraph;
+        use crate::core::metadata::schema::{BranchMetadataV1, FreezeScope};
+        use crate::engine::scan::ScannedMetadata;
+        use crate::git::{GitState, RepoContext, RepoInfo};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn sample_oid() -> Oid {
+            Oid::new("abc123def4567890abc123def4567890abc12345").unwrap()
+        }
+
+        /// Create a minimal RepoSnapshot for testing snapshot exclusion.
+        fn make_test_snapshot(
+            branches: Vec<(&str, Option<&str>)>, // (name, freeze_reason)
+        ) -> RepoSnapshot {
+            let mut metadata = HashMap::new();
+            let main_branch = BranchName::new("main").unwrap();
+
+            for (name, freeze_reason) in branches {
+                let branch = BranchName::new(name).unwrap();
+                let oid = sample_oid();
+
+                let freeze_state = match freeze_reason {
+                    Some(reason) => {
+                        FreezeState::frozen(FreezeScope::Single, Some(reason.to_string()))
+                    }
+                    None => FreezeState::Unfrozen,
+                };
+
+                let mut meta =
+                    BranchMetadataV1::new(branch.clone(), main_branch.clone(), oid.clone());
+                meta.freeze = freeze_state;
+
+                metadata.insert(
+                    branch,
+                    ScannedMetadata {
+                        ref_oid: oid,
+                        metadata: meta,
+                    },
+                );
+            }
+
+            RepoSnapshot {
+                info: RepoInfo {
+                    git_dir: PathBuf::from("/repo/.git"),
+                    common_dir: PathBuf::from("/repo/.git"),
+                    work_dir: Some(PathBuf::from("/repo")),
+                    context: RepoContext::Normal,
+                },
+                git_state: GitState::Clean,
+                worktree_status: Default::default(),
+                current_branch: Some(main_branch.clone()),
+                branches: HashMap::new(),
+                metadata,
+                repo_config: None,
+                trunk: Some(main_branch),
+                graph: StackGraph::new(),
+                fingerprint: crate::engine::scan::compute_fingerprint(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    None,
+                ),
+                health: crate::engine::health::RepoHealthReport::new(),
+                remote_prs: None,
+            }
+        }
+
+        #[test]
+        fn is_synthetic_snapshot_returns_true_for_snapshot() {
+            let snapshot = make_test_snapshot(vec![(
+                "lattice/snap/pr-42",
+                Some(FREEZE_REASON_SYNTHETIC_SNAPSHOT),
+            )]);
+
+            let branch = BranchName::new("lattice/snap/pr-42").unwrap();
+            assert!(is_synthetic_snapshot(&branch, &snapshot));
+        }
+
+        #[test]
+        fn is_synthetic_snapshot_returns_false_for_normal_branch() {
+            let snapshot = make_test_snapshot(vec![("feature", None)]);
+
+            let branch = BranchName::new("feature").unwrap();
+            assert!(!is_synthetic_snapshot(&branch, &snapshot));
+        }
+
+        #[test]
+        fn is_synthetic_snapshot_returns_false_for_other_frozen_branch() {
+            let snapshot = make_test_snapshot(vec![("teammate-branch", Some("teammate_branch"))]);
+
+            let branch = BranchName::new("teammate-branch").unwrap();
+            assert!(!is_synthetic_snapshot(&branch, &snapshot));
+        }
+
+        #[test]
+        fn is_synthetic_snapshot_returns_false_for_untracked() {
+            let snapshot = make_test_snapshot(vec![]);
+
+            let branch = BranchName::new("unknown").unwrap();
+            assert!(!is_synthetic_snapshot(&branch, &snapshot));
+        }
+
+        #[test]
+        fn filter_snapshot_branches_excludes_snapshots() {
+            let snapshot = make_test_snapshot(vec![
+                ("feature-a", None),
+                ("lattice/snap/pr-10", Some(FREEZE_REASON_SYNTHETIC_SNAPSHOT)),
+                ("feature-b", None),
+                ("lattice/snap/pr-11", Some(FREEZE_REASON_SYNTHETIC_SNAPSHOT)),
+            ]);
+
+            let branches = vec![
+                BranchName::new("feature-a").unwrap(),
+                BranchName::new("lattice/snap/pr-10").unwrap(),
+                BranchName::new("feature-b").unwrap(),
+                BranchName::new("lattice/snap/pr-11").unwrap(),
+            ];
+
+            let (filtered, excluded) = filter_snapshot_branches(branches, &snapshot);
+
+            assert_eq!(filtered.len(), 2);
+            assert_eq!(excluded.len(), 2);
+            assert!(filtered.iter().any(|b| b.as_str() == "feature-a"));
+            assert!(filtered.iter().any(|b| b.as_str() == "feature-b"));
+            assert!(excluded.iter().any(|b| b.as_str() == "lattice/snap/pr-10"));
+            assert!(excluded.iter().any(|b| b.as_str() == "lattice/snap/pr-11"));
+        }
+
+        #[test]
+        fn filter_snapshot_branches_preserves_order() {
+            let snapshot = make_test_snapshot(vec![("a", None), ("b", None), ("c", None)]);
+
+            let branches = vec![
+                BranchName::new("a").unwrap(),
+                BranchName::new("b").unwrap(),
+                BranchName::new("c").unwrap(),
+            ];
+
+            let (filtered, excluded) = filter_snapshot_branches(branches, &snapshot);
+
+            assert_eq!(filtered.len(), 3);
+            assert!(excluded.is_empty());
+            assert_eq!(filtered[0].as_str(), "a");
+            assert_eq!(filtered[1].as_str(), "b");
+            assert_eq!(filtered[2].as_str(), "c");
+        }
+
+        #[test]
+        fn check_current_branch_not_snapshot_passes_for_normal() {
+            let snapshot = make_test_snapshot(vec![("feature", None)]);
+            let branch = BranchName::new("feature").unwrap();
+
+            let result = check_current_branch_not_snapshot(&branch, &snapshot);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn check_current_branch_not_snapshot_fails_for_snapshot() {
+            let snapshot = make_test_snapshot(vec![(
+                "lattice/snap/pr-42",
+                Some(FREEZE_REASON_SYNTHETIC_SNAPSHOT),
+            )]);
+            let branch = BranchName::new("lattice/snap/pr-42").unwrap();
+
+            let result = check_current_branch_not_snapshot(&branch, &snapshot);
+            assert!(result.is_err());
+
+            let err_msg = result.unwrap_err().to_string();
+            assert!(err_msg.contains("Cannot submit from a snapshot branch"));
+            assert!(err_msg.contains("lattice/snap/pr-42"));
+        }
     }
 }

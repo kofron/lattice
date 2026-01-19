@@ -1,11 +1,86 @@
 //! log command - Display tracked branches in stack layout
 //!
 //! Shows the stack graph with branch names, commit counts, and PR status.
+//! Supports degraded mode for repositories without tracked branches.
 
-use crate::engine::scan::scan;
+use crate::engine::scan::{scan, RepoSnapshot};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{Context as _, Result};
+
+/// Check if log should display in degraded mode.
+///
+/// Degraded mode is when no branches are tracked yet. This indicates
+/// a bootstrap opportunity where we should show helpful guidance.
+///
+/// This is distinct from corruption (metadata parse errors), which is
+/// a Doctor repair case.
+fn is_degraded_mode(snapshot: &RepoSnapshot) -> bool {
+    // No branches are tracked
+    let no_tracked = snapshot.metadata.is_empty();
+
+    // Trunk not configured means we're in early setup
+    let trunk_not_configured = snapshot.trunk.is_none();
+
+    // Degraded if nothing tracked OR trunk not configured
+    no_tracked || trunk_not_configured
+}
+
+/// Print the degraded mode banner with guidance.
+fn print_degraded_banner(snapshot: &RepoSnapshot) {
+    eprintln!("---------------------------------------------------------------");
+    eprintln!("  Degraded view - no branches are tracked yet");
+    eprintln!("---------------------------------------------------------------");
+    eprintln!();
+
+    // Show trunk status
+    if let Some(trunk) = &snapshot.trunk {
+        eprintln!("  trunk: {}", trunk);
+    } else {
+        eprintln!("  trunk: (not configured - run 'lattice init')");
+    }
+    eprintln!();
+
+    // Show call to action
+    eprintln!("  To start tracking branches, run:");
+    eprintln!("    lattice track <branch>     - track a single branch");
+    eprintln!("    lattice doctor             - discover bootstrap opportunities");
+    eprintln!();
+    eprintln!("---------------------------------------------------------------");
+    eprintln!();
+}
+
+/// Print untracked branches in degraded mode.
+fn print_untracked_branches(snapshot: &RepoSnapshot) {
+    // Get all local branches that are not tracked and not trunk
+    let trunk_name = snapshot.trunk.as_ref().map(|t| t.as_str());
+
+    let mut untracked: Vec<_> = snapshot
+        .branches
+        .keys()
+        .filter(|b| !snapshot.metadata.contains_key(*b))
+        .filter(|b| Some(b.as_str()) != trunk_name)
+        .collect();
+
+    untracked.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+    if untracked.is_empty() {
+        println!("No local branches found (besides trunk).");
+        return;
+    }
+
+    println!("Untracked local branches:");
+    println!();
+
+    for branch in &untracked {
+        let is_current = snapshot.current_branch.as_ref() == Some(*branch);
+        let prefix = if is_current { "* " } else { "  " };
+        println!("{}{}", prefix, branch);
+    }
+
+    println!();
+    println!("({} branch(es) not tracked by Lattice)", untracked.len());
+}
 
 /// Display tracked branches in stack layout.
 ///
@@ -15,7 +90,7 @@ use anyhow::{Context as _, Result};
 /// * `short` - Short format (branch names only)
 /// * `long` - Long format with full details
 /// * `stack` - Filter to current branch's stack
-/// * `all` - Show all tracked branches
+/// * `all` - Show all tracked branches (includes untracked in mixed mode)
 /// * `reverse` - Reverse display order
 pub fn log(
     ctx: &Context,
@@ -32,7 +107,16 @@ pub fn log(
     let git = Git::open(&cwd).context("Failed to open repository")?;
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    // Get branches to display
+    // Check for degraded mode FIRST (no tracked branches)
+    if is_degraded_mode(&snapshot) {
+        if !ctx.quiet {
+            print_degraded_banner(&snapshot);
+            print_untracked_branches(&snapshot);
+        }
+        return Ok(());
+    }
+
+    // Normal mode: show tracked branches
     let mut branches: Vec<_> = if stack {
         // Filter to current branch's stack
         if let Some(ref current) = snapshot.current_branch {
@@ -62,7 +146,7 @@ pub fn log(
         return Ok(());
     }
 
-    // Display branches
+    // Display tracked branches
     for branch in &branches {
         let is_current = snapshot
             .current_branch
@@ -110,6 +194,29 @@ pub fn log(
                 })
                 .unwrap_or("");
             println!("{}{}{}{}", prefix, branch, parent_str, frozen);
+        }
+    }
+
+    // In --all mode, also show untracked branches (mixed mode)
+    if all {
+        let trunk_name = snapshot.trunk.as_ref().map(|t| t.as_str());
+        let mut untracked: Vec<_> = snapshot
+            .branches
+            .keys()
+            .filter(|b| !snapshot.metadata.contains_key(*b))
+            .filter(|b| Some(b.as_str()) != trunk_name)
+            .collect();
+
+        untracked.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        if !untracked.is_empty() {
+            println!();
+            println!("Untracked branches:");
+            for branch in untracked {
+                let is_current = snapshot.current_branch.as_ref() == Some(branch);
+                let prefix = if is_current { "* " } else { "  " };
+                println!("{}{}  (untracked)", prefix, branch);
+            }
         }
     }
 

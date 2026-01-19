@@ -56,6 +56,9 @@ pub struct GlobalConfig {
 
     /// Secret storage settings
     pub secrets: Option<SecretsConfig>,
+
+    /// Doctor command settings
+    pub doctor: Option<DoctorConfig>,
 }
 
 impl GlobalConfig {
@@ -194,6 +197,75 @@ pub struct ForgeRepoConfig {
     pub repo: Option<String>,
 }
 
+/// Doctor command configuration.
+///
+/// # Example
+///
+/// ```toml
+/// [doctor]
+/// [doctor.bootstrap]
+/// deep_remote = false
+/// max_synthetic_heads = 3
+/// max_closed_prs_per_head = 20
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorConfig {
+    /// Bootstrap-related settings.
+    pub bootstrap: DoctorBootstrapConfig,
+}
+
+/// Doctor bootstrap configuration for synthetic stack detection.
+///
+/// Controls how the doctor command handles synthetic stack detection
+/// and remote PR analysis.
+///
+/// # Example
+///
+/// ```toml
+/// [doctor.bootstrap]
+/// deep_remote = true
+/// max_synthetic_heads = 5
+/// max_closed_prs_per_head = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DoctorBootstrapConfig {
+    /// Enable deep remote analysis (query closed PRs for synthetic stacks).
+    ///
+    /// When enabled, the doctor will query closed PRs to confirm synthetic
+    /// stack patterns. This consumes additional API quota.
+    ///
+    /// Default: false
+    pub deep_remote: bool,
+
+    /// Maximum synthetic stack heads to analyze in deep mode.
+    ///
+    /// Limits how many potential synthetic stack heads will have their
+    /// closed PRs enumerated. Exceeding this budget triggers truncation.
+    ///
+    /// Default: 3
+    pub max_synthetic_heads: usize,
+
+    /// Maximum closed PRs to query per synthetic head.
+    ///
+    /// Limits how many closed PRs targeting a synthetic head branch
+    /// will be retrieved. Exceeding this budget triggers truncation.
+    ///
+    /// Default: 20
+    pub max_closed_prs_per_head: usize,
+}
+
+impl Default for DoctorBootstrapConfig {
+    fn default() -> Self {
+        Self {
+            deep_remote: false,
+            max_synthetic_heads: 3,
+            max_closed_prs_per_head: 20,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +323,7 @@ mod tests {
                 secrets: Some(SecretsConfig {
                     provider: Some("file".to_string()),
                 }),
+                doctor: None,
             };
 
             let toml = toml::to_string_pretty(&config).unwrap();
@@ -350,6 +423,55 @@ mod tests {
                 provider: Some("invalid".to_string()),
             };
             assert!(config.validate().is_err());
+        }
+    }
+
+    mod doctor_config {
+        use super::*;
+
+        #[test]
+        fn defaults() {
+            let config = DoctorBootstrapConfig::default();
+            assert!(!config.deep_remote);
+            assert_eq!(config.max_synthetic_heads, 3);
+            assert_eq!(config.max_closed_prs_per_head, 20);
+        }
+
+        #[test]
+        fn doctor_config_defaults() {
+            let config = DoctorConfig::default();
+            assert!(!config.bootstrap.deep_remote);
+        }
+
+        #[test]
+        fn roundtrip() {
+            let config = DoctorBootstrapConfig {
+                deep_remote: true,
+                max_synthetic_heads: 5,
+                max_closed_prs_per_head: 30,
+            };
+
+            let toml = toml::to_string_pretty(&config).unwrap();
+            let parsed: DoctorBootstrapConfig = toml::from_str(&toml).unwrap();
+            assert_eq!(config, parsed);
+        }
+
+        #[test]
+        fn global_config_with_doctor() {
+            let config = GlobalConfig {
+                doctor: Some(DoctorConfig {
+                    bootstrap: DoctorBootstrapConfig {
+                        deep_remote: true,
+                        max_synthetic_heads: 10,
+                        max_closed_prs_per_head: 50,
+                    },
+                }),
+                ..Default::default()
+            };
+
+            let toml = toml::to_string_pretty(&config).unwrap();
+            let parsed: GlobalConfig = toml::from_str(&toml).unwrap();
+            assert_eq!(config, parsed);
         }
     }
 }

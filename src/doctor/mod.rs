@@ -61,7 +61,7 @@ mod issues;
 mod planner;
 
 pub use fixes::*;
-pub use generators::generate_fixes;
+pub use generators::{analyze_synthetic_stack_deep, generate_fixes};
 pub use issues::*;
 pub use planner::{generate_repair_plan, RepairPlanError};
 
@@ -424,6 +424,7 @@ mod tests {
             graph: StackGraph::new(),
             fingerprint: Fingerprint::compute(&[]),
             health,
+            remote_prs: None,
         }
     }
 

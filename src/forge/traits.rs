@@ -184,6 +184,175 @@ impl std::fmt::Display for MergeMethod {
     }
 }
 
+/// Options for listing pull requests.
+///
+/// Controls pagination and filtering for bulk PR queries.
+#[derive(Debug, Clone, Default)]
+pub struct ListPullsOpts {
+    /// Maximum number of PRs to return.
+    ///
+    /// Default: 200. GitHub returns max 100 per page, so this may require
+    /// multiple paginated requests internally.
+    pub max_results: Option<usize>,
+}
+
+impl ListPullsOpts {
+    /// Create options with a specific limit.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::forge::ListPullsOpts;
+    ///
+    /// let opts = ListPullsOpts::with_limit(50);
+    /// assert_eq!(opts.effective_limit(), 50);
+    /// ```
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            max_results: Some(limit),
+        }
+    }
+
+    /// Get the effective limit (default 200).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::forge::ListPullsOpts;
+    ///
+    /// let opts = ListPullsOpts::default();
+    /// assert_eq!(opts.effective_limit(), 200);
+    /// ```
+    pub fn effective_limit(&self) -> usize {
+        self.max_results.unwrap_or(200)
+    }
+}
+
+/// Options for listing closed PRs targeting a specific base branch.
+///
+/// Used for Tier 2 synthetic stack detection (Milestone 5.8) to query
+/// closed/merged PRs that targeted a potential synthetic stack head branch.
+///
+/// # Example
+///
+/// ```
+/// use latticework::forge::ListClosedPrsOpts;
+///
+/// let opts = ListClosedPrsOpts::for_base("feature-branch").with_limit(20);
+/// assert_eq!(opts.base, "feature-branch");
+/// assert_eq!(opts.effective_limit(), 20);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ListClosedPrsOpts {
+    /// Base branch to filter by (PRs that targeted this branch).
+    pub base: String,
+    /// Maximum number of PRs to return.
+    pub max_results: Option<usize>,
+}
+
+impl ListClosedPrsOpts {
+    /// Create options for a specific base branch.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::forge::ListClosedPrsOpts;
+    ///
+    /// let opts = ListClosedPrsOpts::for_base("main");
+    /// assert_eq!(opts.base, "main");
+    /// assert_eq!(opts.effective_limit(), 100); // default
+    /// ```
+    pub fn for_base(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            max_results: None,
+        }
+    }
+
+    /// Set the maximum results.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::forge::ListClosedPrsOpts;
+    ///
+    /// let opts = ListClosedPrsOpts::for_base("main").with_limit(50);
+    /// assert_eq!(opts.effective_limit(), 50);
+    /// ```
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.max_results = Some(limit);
+        self
+    }
+
+    /// Get the effective limit (default 100).
+    pub fn effective_limit(&self) -> usize {
+        self.max_results.unwrap_or(100)
+    }
+}
+
+/// Lightweight PR summary for bulk listing.
+///
+/// Contains only the fields needed for bootstrap matching and display.
+/// Use [`Forge::get_pr`] for full PR details when needed.
+///
+/// # Example
+///
+/// ```
+/// use latticework::forge::PullRequestSummary;
+///
+/// let summary = PullRequestSummary {
+///     number: 42,
+///     head_ref: "feature-branch".to_string(),
+///     head_repo_owner: None,
+///     base_ref: "main".to_string(),
+///     is_draft: false,
+///     url: "https://github.com/owner/repo/pull/42".to_string(),
+///     updated_at: "2024-01-15T10:30:00Z".to_string(),
+/// };
+///
+/// assert!(!summary.is_fork());
+/// ```
+#[derive(Debug, Clone)]
+pub struct PullRequestSummary {
+    /// PR number
+    pub number: u64,
+    /// Head branch name (the branch with changes)
+    pub head_ref: String,
+    /// Head repository owner (for fork PRs, None if same repo)
+    pub head_repo_owner: Option<String>,
+    /// Base branch name (the branch to merge into)
+    pub base_ref: String,
+    /// Whether the PR is a draft
+    pub is_draft: bool,
+    /// Web URL for the PR
+    pub url: String,
+    /// Last updated timestamp (ISO 8601)
+    pub updated_at: String,
+}
+
+impl PullRequestSummary {
+    /// Check if this PR is from a fork.
+    ///
+    /// Fork PRs have a `head_repo_owner` that differs from the base repo owner.
+    pub fn is_fork(&self) -> bool {
+        self.head_repo_owner.is_some()
+    }
+}
+
+/// Result from listing pull requests.
+///
+/// Contains the PRs up to the requested limit, and indicates whether
+/// more PRs exist beyond the limit.
+#[derive(Debug, Clone)]
+pub struct ListPullsResult {
+    /// The pull requests (up to the requested limit).
+    pub pulls: Vec<PullRequestSummary>,
+    /// Whether there were more PRs than the limit allowed.
+    ///
+    /// When true, callers may want to inform users that the view is incomplete.
+    pub truncated: bool,
+}
+
 /// The Forge trait for interacting with remote hosting services.
 ///
 /// This trait provides the abstraction layer for PR operations.
@@ -340,6 +509,58 @@ pub trait Forge: Send + Sync {
     /// - `NotFound` if the PR doesn't exist
     /// - `ApiError` if merge fails (e.g., conflicts, required checks failing)
     async fn merge_pr(&self, number: u64, method: MergeMethod) -> Result<(), ForgeError>;
+
+    /// List open pull requests.
+    ///
+    /// Returns open PRs up to the configured limit, ordered by most recently
+    /// updated first. Pagination is handled internally by the implementation.
+    ///
+    /// This method is designed for bulk queries during bootstrap, where we need
+    /// to discover existing PRs to match against local branches. Using this
+    /// instead of repeated [`find_pr_by_head`](Self::find_pr_by_head) calls
+    /// avoids N+1 query patterns and rate limit issues.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Options controlling the query (limit, etc.)
+    ///
+    /// # Returns
+    ///
+    /// A [`ListPullsResult`] containing the PRs and truncation status.
+    ///
+    /// # Errors
+    ///
+    /// - `AuthRequired` if no authentication is configured
+    /// - `AuthFailed` if the token is invalid or lacks permissions
+    /// - `RateLimited` if API rate limit is exceeded
+    /// - `NetworkError` if the request fails
+    async fn list_open_prs(&self, opts: ListPullsOpts) -> Result<ListPullsResult, ForgeError>;
+
+    /// List closed PRs that targeted a specific base branch.
+    ///
+    /// Returns closed PRs (both merged and unmerged) that had the specified
+    /// branch as their base. This is used for Tier 2 synthetic stack detection
+    /// to find PRs that were merged into a potential synthetic stack head.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Options including the base branch to filter by and limit
+    ///
+    /// # Returns
+    ///
+    /// A [`ListPullsResult`] containing closed PRs (merged or unmerged).
+    /// The `PullRequestSummary` entries will have PRs that targeted `opts.base`.
+    ///
+    /// # Errors
+    ///
+    /// - `AuthRequired` if no authentication is configured
+    /// - `AuthFailed` if the token is invalid or lacks permissions
+    /// - `RateLimited` if API rate limit is exceeded
+    /// - `NetworkError` if the request fails
+    async fn list_closed_prs_targeting(
+        &self,
+        opts: ListClosedPrsOpts,
+    ) -> Result<ListPullsResult, ForgeError>;
 }
 
 #[cfg(test)]
@@ -425,5 +646,124 @@ mod tests {
             format!("{}", ForgeError::NotImplemented("GitLab".into())),
             "not implemented: GitLab"
         );
+    }
+
+    mod list_pulls_opts {
+        use super::*;
+
+        #[test]
+        fn default_limit_is_200() {
+            let opts = ListPullsOpts::default();
+            assert_eq!(opts.effective_limit(), 200);
+            assert!(opts.max_results.is_none());
+        }
+
+        #[test]
+        fn with_limit_sets_max_results() {
+            let opts = ListPullsOpts::with_limit(50);
+            assert_eq!(opts.max_results, Some(50));
+            assert_eq!(opts.effective_limit(), 50);
+        }
+
+        #[test]
+        fn zero_limit_is_respected() {
+            let opts = ListPullsOpts::with_limit(0);
+            assert_eq!(opts.effective_limit(), 0);
+        }
+    }
+
+    mod list_closed_prs_opts {
+        use super::*;
+
+        #[test]
+        fn for_base_creates_opts() {
+            let opts = ListClosedPrsOpts::for_base("feature-branch");
+            assert_eq!(opts.base, "feature-branch");
+            assert!(opts.max_results.is_none());
+        }
+
+        #[test]
+        fn default_limit_is_100() {
+            let opts = ListClosedPrsOpts::for_base("main");
+            assert_eq!(opts.effective_limit(), 100);
+        }
+
+        #[test]
+        fn with_limit_sets_max_results() {
+            let opts = ListClosedPrsOpts::for_base("main").with_limit(20);
+            assert_eq!(opts.max_results, Some(20));
+            assert_eq!(opts.effective_limit(), 20);
+        }
+
+        #[test]
+        fn chaining_works() {
+            let opts = ListClosedPrsOpts::for_base("feature").with_limit(50);
+            assert_eq!(opts.base, "feature");
+            assert_eq!(opts.effective_limit(), 50);
+        }
+    }
+
+    mod pull_request_summary {
+        use super::*;
+
+        #[test]
+        fn is_fork_with_owner() {
+            let summary = PullRequestSummary {
+                number: 1,
+                head_ref: "feature".into(),
+                head_repo_owner: Some("forker".into()),
+                base_ref: "main".into(),
+                is_draft: false,
+                url: "https://example.com".into(),
+                updated_at: "2024-01-01T00:00:00Z".into(),
+            };
+            assert!(summary.is_fork());
+        }
+
+        #[test]
+        fn is_fork_without_owner() {
+            let summary = PullRequestSummary {
+                number: 1,
+                head_ref: "feature".into(),
+                head_repo_owner: None,
+                base_ref: "main".into(),
+                is_draft: false,
+                url: "https://example.com".into(),
+                updated_at: "2024-01-01T00:00:00Z".into(),
+            };
+            assert!(!summary.is_fork());
+        }
+    }
+
+    mod list_pulls_result {
+        use super::*;
+
+        #[test]
+        fn empty_result() {
+            let result = ListPullsResult {
+                pulls: vec![],
+                truncated: false,
+            };
+            assert!(result.pulls.is_empty());
+            assert!(!result.truncated);
+        }
+
+        #[test]
+        fn truncated_result() {
+            let result = ListPullsResult {
+                pulls: vec![PullRequestSummary {
+                    number: 1,
+                    head_ref: "feature".into(),
+                    head_repo_owner: None,
+                    base_ref: "main".into(),
+                    is_draft: false,
+                    url: "https://example.com".into(),
+                    updated_at: "2024-01-01T00:00:00Z".into(),
+                }],
+                truncated: true,
+            };
+            assert_eq!(result.pulls.len(), 1);
+            assert!(result.truncated);
+        }
     }
 }

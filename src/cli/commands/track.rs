@@ -114,20 +114,38 @@ pub fn track(
         bail!("No parent specified. Use --parent, --force, or run interactively.");
     };
 
-    // Get parent tip for base commit
+    // Get branch tip and parent tip
+    let branch_oid = snapshot
+        .branches
+        .get(&target)
+        .ok_or_else(|| anyhow::anyhow!("Branch '{}' not found", target))?;
+
     let parent_oid = if &parent_branch == trunk {
         snapshot
             .branches
             .get(trunk)
             .ok_or_else(|| anyhow::anyhow!("Trunk branch '{}' not found", trunk))?
-            .clone()
     } else {
         snapshot
             .branches
             .get(&parent_branch)
             .ok_or_else(|| anyhow::anyhow!("Parent branch '{}' not found", parent_branch))?
-            .clone()
     };
+
+    // Compute base via merge-base (the point where branch diverged from parent)
+    // This is more correct than using parent tip directly, especially when
+    // parent has advanced past the divergence point.
+    let base_oid = git
+        .merge_base(branch_oid, parent_oid)
+        .context("Failed to compute merge-base")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot track '{}': no common ancestor with parent '{}'. \
+                 The branch may have been created independently or from a different history.",
+                target,
+                parent_branch
+            )
+        })?;
 
     // Create parent ref
     let parent_ref = if &parent_branch == trunk {
@@ -156,7 +174,7 @@ pub fn track(
         },
         parent: parent_ref,
         base: BaseInfo {
-            oid: parent_oid.to_string(),
+            oid: base_oid.to_string(),
         },
         freeze: freeze_state,
         pr: PrState::None,
@@ -177,7 +195,7 @@ pub fn track(
             "Tracking '{}' with parent '{}' (base: {})",
             target,
             parent_branch,
-            &parent_oid.as_str()[..7]
+            &base_oid.as_str()[..7]
         );
         if as_frozen {
             println!("  (frozen)");

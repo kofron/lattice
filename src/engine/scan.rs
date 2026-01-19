@@ -71,6 +71,24 @@ pub struct ScannedMetadata {
     pub metadata: BranchMetadataV1,
 }
 
+/// Evidence of remote pull requests collected during scan.
+///
+/// Populated by [`scan_with_remote`] when the following capabilities are present:
+/// - TrunkKnown
+/// - RemoteResolved
+/// - AuthAvailable
+/// - RepoAuthorized
+///
+/// When capabilities are missing or the forge query fails, `remote_prs` in
+/// `RepoSnapshot` will be `None` rather than containing this struct.
+#[derive(Debug, Clone)]
+pub struct RemotePrEvidence {
+    /// The open PRs retrieved from the forge.
+    pub prs: Vec<crate::forge::PullRequestSummary>,
+    /// Whether the result was truncated (more PRs exist beyond the limit).
+    pub truncated: bool,
+}
+
 /// Complete snapshot of repository state.
 ///
 /// This is the primary output of scanning. It contains all information
@@ -112,6 +130,12 @@ pub struct RepoSnapshot {
 
     /// Health report with issues and capabilities.
     pub health: RepoHealthReport,
+
+    /// Remote open pull requests (if forge query succeeded).
+    ///
+    /// Populated by [`scan_with_remote`] when all required capabilities
+    /// are present. `None` if capabilities are missing or API call failed.
+    pub remote_prs: Option<RemotePrEvidence>,
 }
 
 impl RepoSnapshot {
@@ -435,7 +459,7 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
         health.set_divergence(divergence);
     }
 
-    Ok(RepoSnapshot {
+    let mut snapshot = RepoSnapshot {
         info,
         git_state,
         worktree_status,
@@ -447,7 +471,14 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
         graph,
         fingerprint,
         health,
-    })
+        remote_prs: None, // Populated by scan_with_remote() if capabilities allow
+    };
+
+    // Detect local untracked branches for local-only bootstrap (Milestone 5.7)
+    // This adds issues with parent candidate evidence for fix generation.
+    detect_local_untracked_branches(git, &mut snapshot);
+
+    Ok(snapshot)
 }
 
 /// Detect divergence and record DivergenceObserved event if needed.
@@ -613,6 +644,368 @@ pub fn scan_from_path(path: &Path) -> Result<RepoSnapshot, ScanError> {
     scan(&git)
 }
 
+/// Scan a repository with optional remote PR query.
+///
+/// This is the async version that can query the forge for open PRs.
+/// Falls back to local-only scan if forge is unavailable or capabilities
+/// are missing.
+///
+/// # Arguments
+///
+/// * `git` - The Git interface for the repository
+///
+/// # Returns
+///
+/// A `RepoSnapshot` containing all scanned state, including remote PR
+/// evidence if the forge query succeeded.
+///
+/// # Example
+///
+/// ```ignore
+/// let git = Git::open(Path::new("."))?;
+/// let snapshot = scan_with_remote(&git).await?;
+///
+/// if let Some(ref evidence) = snapshot.remote_prs {
+///     println!("Found {} open PRs", evidence.prs.len());
+/// }
+/// ```
+pub async fn scan_with_remote(git: &Git) -> Result<RepoSnapshot, ScanError> {
+    // Perform the basic scan first
+    let mut snapshot = scan(git)?;
+
+    // Try to query remote PRs if capabilities allow
+    if let Ok(Some(remote_url)) = git.remote_url("origin") {
+        if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {
+            snapshot.remote_prs = query_remote_prs(&snapshot.health, &owner, &repo).await;
+        }
+    }
+
+    // Generate bootstrap issues based on remote evidence
+    // Clone the evidence to avoid borrow conflict
+    if let Some(evidence) = snapshot.remote_prs.clone() {
+        generate_bootstrap_issues(&mut snapshot, &evidence);
+    }
+
+    Ok(snapshot)
+}
+
+/// Query the forge for open PRs if capabilities allow.
+///
+/// Returns None if:
+/// - Required capabilities are missing
+/// - Forge query fails (logged as warning)
+async fn query_remote_prs(
+    health: &RepoHealthReport,
+    owner: &str,
+    repo: &str,
+) -> Option<RemotePrEvidence> {
+    // Check required capabilities
+    let caps = health.capabilities();
+    if !caps.has(&Capability::TrunkKnown)
+        || !caps.has(&Capability::RemoteResolved)
+        || !caps.has(&Capability::AuthAvailable)
+        || !caps.has(&Capability::RepoAuthorized)
+    {
+        // Missing capabilities - skip remote query silently (this is expected)
+        return None;
+    }
+
+    // Create forge and query
+    match create_forge_and_query(owner, repo).await {
+        Ok(result) => Some(result),
+        Err(e) => {
+            // Log warning but continue - API failures shouldn't block scanning
+            eprintln!("Warning: failed to query remote PRs: {}", e);
+            None
+        }
+    }
+}
+
+/// Create a forge and query for open PRs.
+async fn create_forge_and_query(
+    owner: &str,
+    repo: &str,
+) -> Result<RemotePrEvidence, crate::forge::ForgeError> {
+    use crate::auth::{GitHubAuthManager, TokenProvider};
+    use crate::forge::github::GitHubForge;
+    use crate::forge::{Forge, ListPullsOpts};
+    use crate::secrets;
+
+    let store = secrets::create_store(secrets::DEFAULT_PROVIDER)
+        .map_err(|e| crate::forge::ForgeError::AuthFailed(e.to_string()))?;
+    let auth_manager = GitHubAuthManager::new("github.com", store);
+
+    // Get the bearer token from the auth manager
+    let token = auth_manager
+        .bearer_token()
+        .await
+        .map_err(|e| crate::forge::ForgeError::AuthFailed(e.to_string()))?;
+
+    let forge = GitHubForge::new(token, owner, repo);
+    let opts = ListPullsOpts::default(); // 200 limit
+
+    let result = forge.list_open_prs(opts).await?;
+
+    Ok(RemotePrEvidence {
+        prs: result.pulls,
+        truncated: result.truncated,
+    })
+}
+
+/// Detect potential synthetic stack heads from open PRs.
+///
+/// A potential synthetic stack head is an open PR that:
+/// 1. Targets trunk (base_ref = configured trunk)
+///
+/// This is Tier 1 detection (cheap, uses only open PR data).
+/// Tier 2 deep analysis (querying closed PRs) is handled separately
+/// when `--deep-remote` is enabled.
+///
+/// # Arguments
+///
+/// * `snapshot` - Repository snapshot with trunk configuration
+/// * `open_prs` - Open PRs from the forge
+///
+/// # Returns
+///
+/// A vector of `KnownIssue::PotentialSyntheticStackHead` for each detected head.
+pub fn detect_potential_synthetic_heads(
+    snapshot: &RepoSnapshot,
+    open_prs: &[crate::forge::PullRequestSummary],
+) -> Vec<crate::doctor::KnownIssue> {
+    use crate::doctor::KnownIssue;
+
+    let trunk = match &snapshot.trunk {
+        Some(t) => t.as_str(),
+        None => return vec![], // No trunk configured
+    };
+
+    open_prs
+        .iter()
+        .filter(|pr| pr.base_ref == trunk)
+        .map(|pr| KnownIssue::PotentialSyntheticStackHead {
+            branch: pr.head_ref.clone(),
+            pr_number: pr.number,
+            pr_url: pr.url.clone(),
+        })
+        .collect()
+}
+
+/// Generate bootstrap issues from remote PR evidence.
+///
+/// This examines each open PR and generates appropriate issues based on
+/// the local branch state:
+/// - Missing local branch → `RemoteOpenPrBranchMissingLocally`
+/// - Untracked local branch → `RemoteOpenPrBranchUntracked`
+/// - Tracked but unlinked → `RemoteOpenPrNotLinkedInMetadata`
+fn generate_bootstrap_issues(snapshot: &mut RepoSnapshot, evidence: &RemotePrEvidence) {
+    // Issue: Remote has open PRs (general awareness)
+    if !evidence.prs.is_empty() {
+        snapshot.health.add_issue(issues::remote_open_prs_detected(
+            evidence.prs.len(),
+            evidence.truncated,
+        ));
+    }
+
+    // Match each PR against local state
+    for pr in &evidence.prs {
+        // Skip fork PRs (complex ownership semantics)
+        if pr.is_fork() {
+            continue;
+        }
+
+        // Try to parse the head_ref as a valid branch name
+        let branch_name = match BranchName::new(&pr.head_ref) {
+            Ok(name) => name,
+            Err(_) => {
+                // Invalid branch name, skip this PR
+                continue;
+            }
+        };
+
+        if !snapshot.branches.contains_key(&branch_name) {
+            // Branch doesn't exist locally
+            snapshot.health.add_issue(issues::remote_pr_branch_missing(
+                pr.number,
+                &pr.head_ref,
+                &pr.base_ref,
+                &pr.url,
+            ));
+        } else if !snapshot.metadata.contains_key(&branch_name) {
+            // Branch exists but not tracked
+            snapshot
+                .health
+                .add_issue(issues::remote_pr_branch_untracked(
+                    &pr.head_ref,
+                    pr.number,
+                    &pr.base_ref,
+                    &pr.url,
+                ));
+        } else {
+            // Branch is tracked - check if PR is linked
+            let scanned = snapshot.metadata.get(&branch_name).unwrap();
+            if scanned.metadata.pr.number().is_none() {
+                snapshot.health.add_issue(issues::remote_pr_not_linked(
+                    &pr.head_ref,
+                    pr.number,
+                    &pr.url,
+                ));
+            }
+            // else: PR is already linked, no issue needed
+        }
+    }
+
+    // Tier 1: Detect potential synthetic stack heads
+    // A synthetic stack head is a PR that targets trunk and may have accumulated
+    // commits from merged sub-PRs.
+    let synthetic_heads = detect_potential_synthetic_heads(snapshot, &evidence.prs);
+    for known_issue in synthetic_heads {
+        snapshot.health.add_issue(known_issue.to_issue());
+    }
+}
+
+/// Compute parent candidates for an untracked branch.
+///
+/// Returns candidates ranked by merge-base distance (closest first).
+/// Candidates with equal distance are considered "tied" (ambiguous).
+///
+/// This is used for local-only bootstrap when no remote evidence exists.
+/// The algorithm mirrors `find_nearest_tracked_ancestor()` in track.rs.
+///
+/// # Arguments
+///
+/// * `git` - Git interface for merge-base computation
+/// * `branch` - The untracked branch to find parents for
+/// * `branch_oid` - The tip OID of the untracked branch
+/// * `snapshot` - Repository snapshot with tracked branches and trunk
+///
+/// # Returns
+///
+/// A vector of `ParentCandidate` sorted by distance (ascending).
+/// Empty if no valid candidates found (e.g., no common ancestors).
+pub fn compute_parent_candidates(
+    git: &Git,
+    branch: &BranchName,
+    branch_oid: &Oid,
+    snapshot: &RepoSnapshot,
+) -> Vec<crate::engine::health::ParentCandidate> {
+    use crate::engine::health::ParentCandidate;
+
+    let mut candidates = Vec::new();
+    let trunk = snapshot.trunk.as_ref();
+
+    // Gather all potential parents: tracked branches + trunk
+    let mut potential_parents: Vec<(&BranchName, &Oid, bool)> = snapshot
+        .metadata
+        .keys()
+        .filter_map(|b| {
+            // Don't consider the branch itself as a parent
+            if b == branch {
+                return None;
+            }
+            snapshot.branches.get(b).map(|oid| (b, oid, false))
+        })
+        .collect();
+
+    // Add trunk if present and not already in the list
+    if let Some(trunk_name) = trunk {
+        if let Some(trunk_oid) = snapshot.branches.get(trunk_name) {
+            let already_in_list = potential_parents.iter().any(|(b, _, _)| *b == trunk_name);
+            if !already_in_list {
+                potential_parents.push((trunk_name, trunk_oid, true));
+            } else {
+                // Mark existing entry as trunk
+                for (b, _, is_trunk) in &mut potential_parents {
+                    if *b == trunk_name {
+                        *is_trunk = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Compute merge-base and distance for each candidate
+    for (parent_name, parent_oid, is_trunk) in potential_parents {
+        if let Ok(Some(merge_base)) = git.merge_base(branch_oid, parent_oid) {
+            // Count commits from merge-base to branch tip
+            // This is the "distance" - lower is better (closer ancestor)
+            if let Ok(distance) = git.commit_count(&merge_base, branch_oid) {
+                candidates.push(ParentCandidate {
+                    name: parent_name.as_str().to_string(),
+                    merge_base: merge_base.as_str().to_string(),
+                    distance: distance as u32,
+                    is_trunk,
+                });
+            }
+        }
+    }
+
+    // Sort by distance (ascending) - closest first
+    candidates.sort_by_key(|c| c.distance);
+
+    candidates
+}
+
+/// Detect untracked local branches and add issues with parent candidate evidence.
+///
+/// This is called during scan to populate local bootstrap issues.
+/// For each untracked branch, computes parent candidates using merge-base distance.
+///
+/// # Arguments
+///
+/// * `git` - Git interface for merge-base computation
+/// * `snapshot` - Mutable snapshot to add issues to
+fn detect_local_untracked_branches(git: &Git, snapshot: &mut RepoSnapshot) {
+    use crate::engine::health::{Evidence, Issue, Severity};
+
+    // Collect branches to check (avoid borrow conflict)
+    let branches_to_check: Vec<(BranchName, Oid)> = snapshot
+        .branches
+        .iter()
+        .filter(|(branch, _)| {
+            // Skip trunk
+            if Some(*branch) == snapshot.trunk.as_ref() {
+                return false;
+            }
+            // Skip already tracked
+            if snapshot.metadata.contains_key(*branch) {
+                return false;
+            }
+            true
+        })
+        .map(|(b, o)| (b.clone(), o.clone()))
+        .collect();
+
+    // Process each untracked branch
+    for (branch, oid) in branches_to_check {
+        // Compute parent candidates
+        let candidates = compute_parent_candidates(git, &branch, &oid, snapshot);
+
+        // Create issue with evidence
+        let mut issue = Issue::new(
+            "untracked-branch",
+            Severity::Info,
+            format!("branch '{}' exists but is not tracked", branch.as_str()),
+        );
+
+        // Add branch ref evidence for issue ID computation
+        issue = issue.with_evidence(Evidence::Ref {
+            name: format!("refs/heads/{}", branch.as_str()),
+            oid: Some(oid.as_str().to_string()),
+        });
+
+        // Add parent candidates evidence if we have any
+        if !candidates.is_empty() {
+            issue.evidence.push(Evidence::ParentCandidates {
+                branch: branch.as_str().to_string(),
+                candidates,
+            });
+        }
+
+        snapshot.health.add_issue(issue);
+    }
+}
+
 /// Synchronous wrapper for repository authorization check.
 ///
 /// Per SPEC.md Section 8E.0.1, this queries the GitHub API to verify that
@@ -734,6 +1127,7 @@ mod tests {
                 graph: StackGraph::new(),
                 fingerprint: compute_fingerprint(&HashMap::new(), &HashMap::new(), None),
                 health: RepoHealthReport::new(),
+                remote_prs: None,
             }
         }
 
@@ -824,6 +1218,376 @@ mod tests {
         fn display_formatting() {
             let err = ScanError::Internal("something went wrong".to_string());
             assert!(err.to_string().contains("something went wrong"));
+        }
+    }
+
+    mod bootstrap_issues {
+        use super::*;
+        use crate::forge::PullRequestSummary;
+
+        fn make_pr_summary(number: u64, head_ref: &str, base_ref: &str) -> PullRequestSummary {
+            PullRequestSummary {
+                number,
+                head_ref: head_ref.to_string(),
+                head_repo_owner: None,
+                base_ref: base_ref.to_string(),
+                is_draft: false,
+                url: format!("https://github.com/owner/repo/pull/{}", number),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+            }
+        }
+
+        fn make_test_snapshot() -> RepoSnapshot {
+            RepoSnapshot {
+                info: RepoInfo {
+                    git_dir: std::path::PathBuf::from("/repo/.git"),
+                    common_dir: std::path::PathBuf::from("/repo/.git"),
+                    work_dir: Some(std::path::PathBuf::from("/repo")),
+                    context: crate::git::RepoContext::Normal,
+                },
+                git_state: GitState::Clean,
+                worktree_status: WorktreeStatus::default(),
+                current_branch: Some(BranchName::new("main").unwrap()),
+                branches: HashMap::new(),
+                metadata: HashMap::new(),
+                repo_config: None,
+                trunk: Some(BranchName::new("main").unwrap()),
+                graph: StackGraph::new(),
+                fingerprint: compute_fingerprint(&HashMap::new(), &HashMap::new(), None),
+                health: RepoHealthReport::new(),
+                remote_prs: None,
+            }
+        }
+
+        #[test]
+        fn generates_open_prs_detected_issue() {
+            let mut snapshot = make_test_snapshot();
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(1, "feature", "main")],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            let issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str() == "remote-open-prs-detected")
+                .collect();
+            assert_eq!(issues.len(), 1);
+            assert!(!issues[0].is_blocking());
+        }
+
+        #[test]
+        fn generates_branch_missing_issue() {
+            let mut snapshot = make_test_snapshot();
+            // PR for a branch that doesn't exist locally
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(42, "nonexistent-branch", "main")],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            let issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str().starts_with("remote-pr-branch-missing"))
+                .collect();
+            assert_eq!(issues.len(), 1);
+            assert!(!issues[0].is_blocking()); // Warning, not blocking
+        }
+
+        #[test]
+        fn generates_untracked_issue() {
+            let mut snapshot = make_test_snapshot();
+            // Add a local branch that's not tracked
+            let branch = BranchName::new("untracked-feature").unwrap();
+            let oid = Oid::new("abc123def4567890abc123def4567890abc12345").unwrap();
+            snapshot.branches.insert(branch.clone(), oid);
+            // No metadata for this branch
+
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(42, "untracked-feature", "main")],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            let issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str().starts_with("remote-pr-branch-untracked"))
+                .collect();
+            assert_eq!(issues.len(), 1);
+            assert!(!issues[0].is_blocking());
+        }
+
+        #[test]
+        fn generates_not_linked_issue() {
+            let mut snapshot = make_test_snapshot();
+            // Add a tracked branch without PR linkage
+            let branch = BranchName::new("tracked-no-pr").unwrap();
+            let oid = Oid::new("abc123def4567890abc123def4567890abc12345").unwrap();
+            snapshot.branches.insert(branch.clone(), oid.clone());
+
+            let metadata = BranchMetadataV1::new(
+                branch.clone(),
+                BranchName::new("main").unwrap(),
+                oid.clone(),
+            );
+            snapshot.metadata.insert(
+                branch,
+                ScannedMetadata {
+                    ref_oid: oid,
+                    metadata,
+                },
+            );
+
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(42, "tracked-no-pr", "main")],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            let issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str().starts_with("remote-pr-not-linked"))
+                .collect();
+            assert_eq!(issues.len(), 1);
+            assert!(!issues[0].is_blocking());
+        }
+
+        #[test]
+        fn no_issue_when_pr_already_linked() {
+            use crate::core::metadata::schema::PrState;
+
+            let mut snapshot = make_test_snapshot();
+            // Add a tracked branch WITH PR linkage
+            let branch = BranchName::new("tracked-with-pr").unwrap();
+            let oid = Oid::new("abc123def4567890abc123def4567890abc12345").unwrap();
+            snapshot.branches.insert(branch.clone(), oid.clone());
+
+            let mut metadata = BranchMetadataV1::new(
+                branch.clone(),
+                BranchName::new("main").unwrap(),
+                oid.clone(),
+            );
+            // Link the PR in metadata
+            metadata.pr = PrState::linked("github", 42, "https://github.com/owner/repo/pull/42");
+
+            snapshot.metadata.insert(
+                branch,
+                ScannedMetadata {
+                    ref_oid: oid,
+                    metadata,
+                },
+            );
+
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(42, "tracked-with-pr", "main")],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            // Should only have the "open PRs detected" issue, not any branch-specific issues
+            let branch_issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| {
+                    i.id.as_str().starts_with("remote-pr-")
+                        && i.id.as_str() != "remote-open-prs-detected"
+                })
+                .collect();
+            assert!(
+                branch_issues.is_empty(),
+                "Expected no branch-specific issues, found: {:?}",
+                branch_issues
+            );
+        }
+
+        #[test]
+        fn skips_fork_prs() {
+            let mut snapshot = make_test_snapshot();
+            let mut pr = make_pr_summary(42, "fork-feature", "main");
+            pr.head_repo_owner = Some("forker".to_string());
+
+            let evidence = RemotePrEvidence {
+                prs: vec![pr],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            // Should have the general "open PRs detected" but no branch-specific issues
+            let branch_issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str().starts_with("remote-pr-branch"))
+                .collect();
+            assert!(branch_issues.is_empty());
+        }
+
+        #[test]
+        fn empty_evidence_no_issues() {
+            let mut snapshot = make_test_snapshot();
+            let evidence = RemotePrEvidence {
+                prs: vec![],
+                truncated: false,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            // No issues should be generated for empty PR list
+            let remote_issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str().starts_with("remote-"))
+                .collect();
+            assert!(remote_issues.is_empty());
+        }
+
+        #[test]
+        fn truncated_evidence_noted() {
+            let mut snapshot = make_test_snapshot();
+            let evidence = RemotePrEvidence {
+                prs: vec![make_pr_summary(1, "feature", "main")],
+                truncated: true,
+            };
+
+            generate_bootstrap_issues(&mut snapshot, &evidence);
+
+            let issues: Vec<_> = snapshot
+                .health
+                .issues()
+                .iter()
+                .filter(|i| i.id.as_str() == "remote-open-prs-detected")
+                .collect();
+            assert_eq!(issues.len(), 1);
+            assert!(issues[0].message.contains("truncated"));
+        }
+    }
+
+    // --- Synthetic Stack Detection Tests (Milestone 5.8) ---
+
+    mod synthetic_detection {
+        use super::*;
+        use crate::forge::PullRequestSummary;
+
+        fn make_pr_summary(number: u64, head: &str, base: &str) -> PullRequestSummary {
+            PullRequestSummary {
+                number,
+                head_ref: head.to_string(),
+                head_repo_owner: None,
+                base_ref: base.to_string(),
+                is_draft: false,
+                url: format!("https://github.com/org/repo/pull/{}", number),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+            }
+        }
+
+        fn make_test_snapshot() -> RepoSnapshot {
+            RepoSnapshot {
+                info: RepoInfo {
+                    git_dir: std::path::PathBuf::from("/repo/.git"),
+                    common_dir: std::path::PathBuf::from("/repo/.git"),
+                    work_dir: Some(std::path::PathBuf::from("/repo")),
+                    context: crate::git::RepoContext::Normal,
+                },
+                git_state: GitState::Clean,
+                worktree_status: WorktreeStatus::default(),
+                current_branch: Some(BranchName::new("main").unwrap()),
+                branches: HashMap::new(),
+                metadata: HashMap::new(),
+                repo_config: None,
+                trunk: Some(BranchName::new("main").unwrap()),
+                graph: StackGraph::new(),
+                fingerprint: compute_fingerprint(&HashMap::new(), &HashMap::new(), None),
+                health: RepoHealthReport::new(),
+                remote_prs: None,
+            }
+        }
+
+        #[test]
+        fn detects_trunk_targeting_pr_as_potential_head() {
+            let snapshot = make_test_snapshot();
+
+            let open_prs = vec![make_pr_summary(42, "feature", "main")];
+
+            let issues = detect_potential_synthetic_heads(&snapshot, &open_prs);
+
+            assert_eq!(issues.len(), 1);
+            if let crate::doctor::KnownIssue::PotentialSyntheticStackHead {
+                branch,
+                pr_number,
+                ..
+            } = &issues[0]
+            {
+                assert_eq!(branch, "feature");
+                assert_eq!(*pr_number, 42);
+            } else {
+                panic!("Expected PotentialSyntheticStackHead");
+            }
+        }
+
+        #[test]
+        fn ignores_non_trunk_targeting_prs() {
+            let snapshot = make_test_snapshot();
+
+            // PR targets "feature" branch, not trunk ("main")
+            let open_prs = vec![make_pr_summary(42, "sub-feature", "feature")];
+
+            let issues = detect_potential_synthetic_heads(&snapshot, &open_prs);
+
+            assert!(issues.is_empty());
+        }
+
+        #[test]
+        fn returns_empty_when_no_trunk() {
+            let mut snapshot = make_test_snapshot();
+            snapshot.trunk = None; // No trunk configured
+
+            let open_prs = vec![make_pr_summary(42, "feature", "main")];
+
+            let issues = detect_potential_synthetic_heads(&snapshot, &open_prs);
+
+            assert!(issues.is_empty());
+        }
+
+        #[test]
+        fn detects_multiple_potential_heads() {
+            let snapshot = make_test_snapshot();
+
+            let open_prs = vec![
+                make_pr_summary(42, "feature-a", "main"),
+                make_pr_summary(43, "feature-b", "main"),
+                make_pr_summary(44, "sub-feature", "feature-a"), // Not trunk-targeting
+            ];
+
+            let issues = detect_potential_synthetic_heads(&snapshot, &open_prs);
+
+            assert_eq!(issues.len(), 2);
+        }
+
+        #[test]
+        fn returns_empty_for_empty_prs() {
+            let snapshot = make_test_snapshot();
+
+            let open_prs: Vec<PullRequestSummary> = vec![];
+
+            let issues = detect_potential_synthetic_heads(&snapshot, &open_prs);
+
+            assert!(issues.is_empty());
         }
     }
 }

@@ -105,7 +105,8 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
             fix_ids,
             dry_run,
             list,
-        } => doctor(ctx, &fix_ids, dry_run, list),
+            deep_remote,
+        } => doctor(ctx, &fix_ids, dry_run, list, deep_remote),
 
         // Phase A: Read-Only Commands
         Command::Log {
@@ -303,13 +304,134 @@ pub fn surface_divergence_if_debug(ctx: &Context, health: &crate::engine::RepoHe
     }
 }
 
+/// Perform Tier 2 deep analysis for synthetic stack heads.
+///
+/// Queries the forge for closed PRs that targeted each potential synthetic
+/// stack head branch, adding evidence to the diagnosis.
+fn perform_deep_synthetic_analysis(
+    ctx: &Context,
+    git: &Git,
+    diagnosis: &mut crate::doctor::DiagnosisReport,
+) -> Result<()> {
+    use crate::doctor::analyze_synthetic_stack_deep;
+
+    // Load config to get budget settings
+    let config = crate::core::config::Config::load(ctx.cwd.as_deref()).ok();
+    let bootstrap_config = config
+        .as_ref()
+        .and_then(|c| c.config.global.doctor.as_ref())
+        .map(|d| d.bootstrap.clone())
+        .unwrap_or_default();
+
+    // Get forge if available
+    let forge = match create_forge_for_deep_analysis(git) {
+        Some(f) => f,
+        None => {
+            if ctx.debug {
+                eprintln!("Note: --deep-remote requested but forge not available");
+            }
+            return Ok(());
+        }
+    };
+
+    // Find synthetic-stack-head issues
+    let synthetic_head_issues: Vec<_> = diagnosis
+        .issues
+        .iter()
+        .filter(|i| i.id.as_str().starts_with("synthetic-stack-head:"))
+        .cloned()
+        .collect();
+
+    if synthetic_head_issues.is_empty() {
+        return Ok(());
+    }
+
+    // Enforce budget: max_synthetic_heads
+    let issues_to_analyze = synthetic_head_issues
+        .iter()
+        .take(bootstrap_config.max_synthetic_heads);
+    let skipped = synthetic_head_issues
+        .len()
+        .saturating_sub(bootstrap_config.max_synthetic_heads);
+
+    if skipped > 0 && !ctx.quiet {
+        println!(
+            "Note: Analyzing {} of {} potential synthetic heads (budget: {})",
+            bootstrap_config.max_synthetic_heads,
+            synthetic_head_issues.len(),
+            bootstrap_config.max_synthetic_heads
+        );
+    }
+
+    // Create runtime for async calls
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+
+    // Analyze each synthetic head
+    for issue in issues_to_analyze {
+        if let Some(evidence) = rt.block_on(analyze_synthetic_stack_deep(
+            issue,
+            forge.as_ref(),
+            &bootstrap_config,
+        )) {
+            // Find the issue in diagnosis and add evidence
+            if let Some(diag_issue) = diagnosis.issues.iter_mut().find(|i| i.id == issue.id) {
+                diag_issue.evidence.push(evidence);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a forge for deep synthetic analysis.
+///
+/// Returns None if forge cannot be created (no auth, no remote, etc.)
+fn create_forge_for_deep_analysis(git: &Git) -> Option<Box<dyn crate::forge::Forge>> {
+    use crate::forge::github::GitHubForge;
+
+    // Get remote URL
+    let remote_url = git.remote_url("origin").ok()??;
+
+    // Parse GitHub URL
+    let (owner, repo) = crate::forge::github::parse_github_url(&remote_url)?;
+
+    // Get token
+    if !has_github_token() {
+        return None;
+    }
+
+    // Create auth manager and get token synchronously
+    let store = crate::secrets::create_store(crate::secrets::DEFAULT_PROVIDER).ok()?;
+    let auth_manager = crate::auth::GitHubAuthManager::new("github.com", store);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+
+    let token = rt
+        .block_on(crate::auth::TokenProvider::bearer_token(&auth_manager))
+        .ok()?;
+
+    Some(Box::new(GitHubForge::new(token, owner, repo)))
+}
+
 /// Doctor command - diagnose and repair repository issues.
 ///
 /// Per ARCHITECTURE.md Section 8.3, doctor never applies fixes without
 /// explicit confirmation:
 /// - Interactive: user selects from presented options
 /// - Non-interactive: user provides explicit `--fix` IDs
-fn doctor(ctx: &Context, fix_ids: &[String], dry_run: bool, list: bool) -> Result<()> {
+fn doctor(
+    ctx: &Context,
+    fix_ids: &[String],
+    dry_run: bool,
+    list: bool,
+    deep_remote: bool,
+) -> Result<()> {
     // Initialize git interface
     let cwd = ctx
         .cwd
@@ -317,15 +439,27 @@ fn doctor(ctx: &Context, fix_ids: &[String], dry_run: bool, list: bool) -> Resul
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd)?;
 
-    // Scan the repository
-    let snapshot = crate::engine::scan::scan(&git)?;
+    // Scan the repository (with remote if capabilities allow)
+    // Use blocking runtime to call async scan_with_remote
+    let snapshot = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to create runtime: {}", e))?;
+        rt.block_on(crate::engine::scan::scan_with_remote(&git))?
+    };
 
     // Surface divergence info if debug mode (per ARCHITECTURE.md 7.2)
     surface_divergence_if_debug(ctx, &snapshot.health);
 
     // Create doctor and diagnose
     let doctor = Doctor::new().interactive(!ctx.quiet && fix_ids.is_empty());
-    let diagnosis = doctor.diagnose(&snapshot);
+    let mut diagnosis = doctor.diagnose(&snapshot);
+
+    // Tier 2: Deep synthetic stack analysis (if --deep-remote enabled)
+    if deep_remote {
+        perform_deep_synthetic_analysis(ctx, &git, &mut diagnosis)?;
+    }
 
     // If --list, output machine-readable format
     if list {
