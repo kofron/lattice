@@ -92,6 +92,8 @@ pub use untrack::untrack;
 
 use crate::cli::args::{Command, ConfigAction};
 use crate::doctor::{Doctor, FixId};
+use crate::engine::exec::{ExecuteResult, Executor};
+use crate::engine::ledger::{Event, EventLedger};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::Result;
@@ -256,6 +258,7 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
             restack,
             no_restack,
             unfrozen,
+            no_checkout,
         } => get::get(
             ctx,
             &target,
@@ -263,6 +266,7 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
             force,
             restack && !no_restack,
             unfrozen,
+            no_checkout,
         ),
         Command::Merge {
             confirm,
@@ -271,6 +275,31 @@ pub fn dispatch(command: Command, ctx: &Context) -> Result<()> {
         } => merge::merge(ctx, confirm, dry_run, method),
         Command::Pr { target, stack } => pr::pr(ctx, target.as_deref(), stack),
         Command::Unlink { branch } => unlink::unlink(ctx, branch.as_deref()),
+    }
+}
+
+/// Surface divergence information in debug/verbose output.
+///
+/// Per ARCHITECTURE.md Section 7.2, divergence is not an error but evidence
+/// that the repository was modified outside Lattice. This helper surfaces
+/// that information when debug mode is enabled.
+pub fn surface_divergence_if_debug(ctx: &Context, health: &crate::engine::RepoHealthReport) {
+    if ctx.debug {
+        if let Some(divergence) = health.divergence() {
+            eprintln!(
+                "Note: Repository state has changed since last Lattice operation.\n\
+                 Prior fingerprint: {}\n\
+                 Current fingerprint: {}",
+                &divergence.prior_fingerprint[..12.min(divergence.prior_fingerprint.len())],
+                &divergence.current_fingerprint[..12.min(divergence.current_fingerprint.len())]
+            );
+            if !divergence.changed_refs.is_empty() {
+                eprintln!("Changed refs:");
+                for ref_name in &divergence.changed_refs {
+                    eprintln!("  - {}", ref_name);
+                }
+            }
+        }
     }
 }
 
@@ -290,6 +319,9 @@ fn doctor(ctx: &Context, fix_ids: &[String], dry_run: bool, list: bool) -> Resul
 
     // Scan the repository
     let snapshot = crate::engine::scan::scan(&git)?;
+
+    // Surface divergence info if debug mode (per ARCHITECTURE.md 7.2)
+    surface_divergence_if_debug(ctx, &snapshot.health);
 
     // Create doctor and diagnose
     let doctor = Doctor::new().interactive(!ctx.quiet && fix_ids.is_empty());
@@ -319,6 +351,23 @@ fn doctor(ctx: &Context, fix_ids: &[String], dry_run: bool, list: bool) -> Resul
     // If no fixes requested, just show diagnosis
     if fix_ids.is_empty() {
         println!("{}", diagnosis.format());
+
+        // Record DoctorProposed event when fixes are available (per ARCHITECTURE.md 3.4.2)
+        if !diagnosis.fixes.is_empty() {
+            let issue_ids: Vec<String> =
+                diagnosis.issues.iter().map(|i| i.id.to_string()).collect();
+            let available_fix_ids: Vec<String> =
+                diagnosis.fixes.iter().map(|f| f.id.to_string()).collect();
+
+            let ledger = EventLedger::new(&git);
+            let event = Event::doctor_proposed(issue_ids, available_fix_ids);
+            if let Err(e) = ledger.append(event) {
+                if ctx.debug {
+                    eprintln!("Warning: failed to record DoctorProposed event: {}", e);
+                }
+            }
+        }
+
         return Ok(());
     }
 
@@ -347,14 +396,81 @@ fn doctor(ctx: &Context, fix_ids: &[String], dry_run: bool, list: bool) -> Resul
         println!();
     }
 
-    // Execute the plan
-    // Note: For now, we just show the plan. Actual execution would use the executor.
-    // This will be fully implemented when the executor is complete.
-    if !ctx.quiet {
-        println!(
-            "Would apply {} fix(es). Execution not yet implemented.",
-            parsed_fix_ids.len()
-        );
+    // Execute the plan through the standard executor (per ARCHITECTURE.md 8.1)
+    // Doctor uses the same executor as other commands - no separate repair path.
+    let executor = Executor::new(&git);
+    let result = executor.execute(&plan, ctx)?;
+
+    match result {
+        ExecuteResult::Success { fingerprint } => {
+            // Record DoctorApplied event (per ARCHITECTURE.md 8.4)
+            let fix_id_strings: Vec<String> =
+                parsed_fix_ids.iter().map(|f| f.to_string()).collect();
+            let ledger = EventLedger::new(&git);
+            let event = Event::doctor_applied(fix_id_strings.clone(), fingerprint.to_string());
+            if let Err(e) = ledger.append(event) {
+                // Event recording failure is non-fatal but should be reported
+                eprintln!("Warning: failed to record DoctorApplied event: {}", e);
+            }
+
+            if !ctx.quiet {
+                println!("Successfully applied {} fix(es).", parsed_fix_ids.len());
+            }
+
+            // Post-verify: re-run diagnosis to confirm issues are resolved
+            if !ctx.quiet {
+                let new_snapshot = crate::engine::scan::scan(&git)?;
+                let new_diagnosis = doctor.diagnose(&new_snapshot);
+
+                // Check if the fixed issues are now resolved
+                let fixed_issue_ids: std::collections::HashSet<_> = parsed_fix_ids
+                    .iter()
+                    .filter_map(|f| diagnosis.fixes.iter().find(|fix| &fix.id == f))
+                    .map(|fix| &fix.issue_id)
+                    .collect();
+
+                let remaining: Vec<_> = new_diagnosis
+                    .issues
+                    .iter()
+                    .filter(|i| fixed_issue_ids.contains(&i.id))
+                    .collect();
+
+                if remaining.is_empty() {
+                    println!("All targeted issues resolved.");
+                } else {
+                    println!(
+                        "Warning: {} issue(s) may not be fully resolved. Run 'lattice doctor' to check.",
+                        remaining.len()
+                    );
+                }
+            }
+        }
+        ExecuteResult::Paused {
+            branch, git_state, ..
+        } => {
+            // Conflict during repair - transition to awaiting_user op-state
+            // The executor already handles op-state transition
+            println!(
+                "Repair paused: conflict on branch '{}' ({:?}).",
+                branch, git_state
+            );
+            println!("Resolve conflicts and run 'lattice continue', or 'lattice abort' to cancel.");
+        }
+        ExecuteResult::Aborted {
+            error,
+            applied_steps,
+        } => {
+            // Repair failed - some steps may have been applied
+            eprintln!("Repair aborted: {}", error);
+            if !applied_steps.is_empty() {
+                eprintln!(
+                    "Warning: {} step(s) were applied before failure.",
+                    applied_steps.len()
+                );
+                eprintln!("Run 'lattice doctor' to check repository state.");
+            }
+            return Err(anyhow::anyhow!("Repair failed: {}", error));
+        }
     }
 
     Ok(())

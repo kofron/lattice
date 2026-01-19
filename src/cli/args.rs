@@ -1380,6 +1380,12 @@ BUILDING ON SOMEONE'S WORK:
         /// Track as unfrozen (default is frozen)
         #[arg(long)]
         unfrozen: bool,
+
+        /// Fetch and track without checkout (required for bare repos).
+        /// Creates tracking metadata and computes base, but does not
+        /// modify working directory. Prints worktree creation guidance.
+        #[arg(long)]
+        no_checkout: bool,
     },
 
     /// Merge PRs via GitHub API

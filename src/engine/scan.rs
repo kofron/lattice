@@ -378,6 +378,63 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
     // Note: Missing auth is not an issue - it's just a missing capability.
     // Commands that need auth will gate on AuthAvailable.
 
+    // Check for RepoAuthorized capability (GitHub App installed for repo)
+    // Only check if we have both AuthAvailable and RemoteResolved
+    if health.capabilities().has(&Capability::AuthAvailable)
+        && health.capabilities().has(&Capability::RemoteResolved)
+    {
+        if let Ok(Some(remote_url)) = git.remote_url("origin") {
+            if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {
+                let host = "github.com"; // v1: only github.com supported
+
+                // Load authorization cache
+                let mut cache = crate::auth::cache::AuthCache::load(&paths);
+
+                // Check cache first (10-minute TTL per SPEC.md 8E.0.1)
+                if let Some(cached_entry) = cache.get(host, &owner, &repo) {
+                    // Cache hit - capability satisfied
+                    health.add_capability(Capability::RepoAuthorized);
+                    // Note: cached_entry contains installation_id and repository_id
+                    // which can be used by forge operations
+                    let _ = cached_entry; // Mark as used
+                } else {
+                    // Cache miss - need to query API
+                    // Use blocking runtime for sync context
+                    match check_repo_authorization_sync(host, &owner, &repo) {
+                        Ok(Some(result)) => {
+                            // Authorized - cache and add capability
+                            cache.set(host, &owner, &repo, &result);
+                            cache.prune_expired();
+                            cache.save(&paths);
+                            health.add_capability(Capability::RepoAuthorized);
+                        }
+                        Ok(None) => {
+                            // Not authorized - add blocking issue
+                            health.add_issue(issues::app_not_installed(host, &owner, &repo));
+                        }
+                        Err(e) => {
+                            // Check failed - add warning (non-blocking)
+                            // Commands requiring RepoAuthorized will be gated
+                            health.add_issue(issues::repo_authorization_check_failed(
+                                &owner,
+                                &repo,
+                                &e.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect and record divergence per ARCHITECTURE.md Section 7.2
+    // "On each command invocation, the engine compares the current fingerprint
+    // with the last recorded Committed event fingerprint. If they differ, the
+    // engine records a DivergenceObserved event."
+    if let Some(divergence) = detect_and_record_divergence(git, &fingerprint)? {
+        health.set_divergence(divergence);
+    }
+
     Ok(RepoSnapshot {
         info,
         git_state,
@@ -391,6 +448,41 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
         fingerprint,
         health,
     })
+}
+
+/// Detect divergence and record DivergenceObserved event if needed.
+///
+/// Per ARCHITECTURE.md Section 7.2: "On each command invocation, the engine
+/// compares the current fingerprint with the last recorded Committed event
+/// fingerprint. If they differ, the engine records a DivergenceObserved event."
+///
+/// This is a best-effort operation - ledger write failures are logged but do
+/// not fail the scan. Divergence is informational, not blocking.
+fn detect_and_record_divergence(
+    git: &Git,
+    current_fingerprint: &Fingerprint,
+) -> Result<Option<DivergenceInfo>, ScanError> {
+    let divergence = detect_divergence(git, current_fingerprint)?;
+
+    if let Some(ref info) = divergence {
+        // Record DivergenceObserved event
+        use super::ledger::{Event, EventLedger};
+
+        let ledger = EventLedger::new(git);
+        let event = Event::divergence_observed(
+            &info.prior_fingerprint,
+            &info.current_fingerprint,
+            info.changed_refs.clone(),
+        );
+
+        // Best-effort recording - don't fail the scan if ledger write fails
+        if let Err(e) = ledger.append(event) {
+            // Log warning but continue - divergence detection is informational
+            eprintln!("Warning: failed to record DivergenceObserved event: {}", e);
+        }
+    }
+
+    Ok(divergence)
 }
 
 /// Compute a repository fingerprint for divergence detection.
@@ -519,6 +611,38 @@ pub fn detect_divergence(
 pub fn scan_from_path(path: &Path) -> Result<RepoSnapshot, ScanError> {
     let git = Git::open(path)?;
     scan(&git)
+}
+
+/// Synchronous wrapper for repository authorization check.
+///
+/// Per SPEC.md Section 8E.0.1, this queries the GitHub API to verify that
+/// the authenticated user has access to the repository via an installed
+/// GitHub App.
+///
+/// Uses a blocking runtime to call the async API from the synchronous scanner.
+fn check_repo_authorization_sync(
+    host: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Option<crate::auth::installations::RepoAuthResult>, crate::auth::AuthError> {
+    use crate::auth::installations::check_repo_authorization;
+    use crate::auth::GitHubAuthManager;
+    use crate::secrets;
+
+    // Create auth manager
+    let store = secrets::create_store(secrets::DEFAULT_PROVIDER)?;
+    let auth_manager = GitHubAuthManager::new(host, store);
+
+    // Create a tokio runtime for the async call
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            crate::auth::AuthError::Internal(format!("failed to create runtime: {}", e))
+        })?;
+
+    // Run the async check
+    rt.block_on(check_repo_authorization(&auth_manager, host, owner, repo))
 }
 
 #[cfg(test)]

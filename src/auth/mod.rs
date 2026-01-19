@@ -44,8 +44,10 @@
 //! let token = manager.bearer_token().await?;
 //! ```
 
+pub mod cache;
 mod device_flow;
 mod errors;
+pub mod installations;
 mod lock;
 mod provider;
 mod token_bundle;

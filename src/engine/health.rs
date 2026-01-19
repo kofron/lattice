@@ -41,6 +41,7 @@ use std::hash::{Hash, Hasher};
 use sha2::{Digest, Sha256};
 
 use super::capabilities::{Capability, CapabilitySet};
+use super::scan::DivergenceInfo;
 
 /// Severity of an issue.
 ///
@@ -332,9 +333,12 @@ impl Hash for Issue {
 
 /// Repository health report from scanning.
 ///
-/// Contains all issues found and the capabilities that were
-/// successfully established. Used by gating to determine if
-/// a command can proceed.
+/// Contains all issues found, the capabilities that were successfully
+/// established, and divergence information if out-of-band changes were
+/// detected. Used by gating to determine if a command can proceed.
+///
+/// Per ARCHITECTURE.md Section 7.2, divergence is not an error but
+/// evidence for audit and gating decisions.
 ///
 /// # Example
 ///
@@ -352,11 +356,14 @@ impl Hash for Issue {
 ///
 /// assert!(report.capabilities().has(&Capability::RepoOpen));
 /// assert!(!report.has_blocking_issues());
+/// assert!(!report.has_divergence()); // No divergence by default
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RepoHealthReport {
     issues: Vec<Issue>,
     capabilities: CapabilitySet,
+    /// Divergence information if out-of-band changes were detected.
+    divergence: Option<DivergenceInfo>,
 }
 
 impl RepoHealthReport {
@@ -432,6 +439,26 @@ impl RepoHealthReport {
     /// Check if the report is clean (no issues at all).
     pub fn is_clean(&self) -> bool {
         self.issues.is_empty()
+    }
+
+    /// Set divergence information.
+    ///
+    /// Called by the scanner when out-of-band changes are detected.
+    pub fn set_divergence(&mut self, divergence: DivergenceInfo) {
+        self.divergence = Some(divergence);
+    }
+
+    /// Get divergence information if out-of-band changes were detected.
+    ///
+    /// Per ARCHITECTURE.md Section 7.2, divergence is evidence that the
+    /// repository was modified outside Lattice.
+    pub fn divergence(&self) -> Option<&DivergenceInfo> {
+        self.divergence.as_ref()
+    }
+
+    /// Check if divergence from last committed state was detected.
+    pub fn has_divergence(&self) -> bool {
+        self.divergence.is_some()
     }
 }
 
@@ -625,6 +652,45 @@ pub mod issues {
         .with_evidence(Evidence::Config {
             key: "remote.origin.url".to_string(),
             problem: format!("not a GitHub URL: {}", url),
+        })
+    }
+
+    /// Create an issue for GitHub App not installed or not authorized.
+    ///
+    /// Per ARCHITECTURE.md Section 8.2, this is a blocking issue requiring
+    /// user action - the user must install the GitHub App for the repository.
+    pub fn app_not_installed(host: &str, owner: &str, repo: &str) -> Issue {
+        Issue::new(
+            "app-not-installed",
+            Severity::Blocking,
+            format!(
+                "GitHub App not installed for {}/{}. Install at: https://github.com/apps/lattice/installations/new",
+                owner, repo
+            ),
+        )
+        .with_evidence(Evidence::Config {
+            key: format!("forge.github.{}/{}/{}", host, owner, repo),
+            problem: "GitHub App not installed or not authorized".to_string(),
+        })
+        .blocks(Capability::RepoAuthorized)
+    }
+
+    /// Create an issue for failed repository authorization check.
+    ///
+    /// This is a warning, not blocking - the user can retry or the check
+    /// may have failed due to transient network issues.
+    pub fn repo_authorization_check_failed(owner: &str, repo: &str, error: &str) -> Issue {
+        Issue::new(
+            "repo-auth-check-failed",
+            Severity::Warning,
+            format!(
+                "Could not verify repository authorization for {}/{}: {}",
+                owner, repo, error
+            ),
+        )
+        .with_evidence(Evidence::Config {
+            key: format!("github.authorization-check.{}/{}", owner, repo),
+            problem: error.to_string(),
         })
     }
 
@@ -1068,6 +1134,27 @@ mod tests {
             let issue = issues::remote_not_github("git@gitlab.com:user/repo.git");
             assert!(!issue.is_blocking()); // Warning severity
             assert!(issue.message.contains("gitlab.com"));
+            assert_eq!(issue.evidence.len(), 1);
+        }
+
+        #[test]
+        fn app_not_installed() {
+            let issue = issues::app_not_installed("github.com", "myorg", "myrepo");
+            assert!(issue.is_blocking());
+            assert!(issue.blocks_capability(&Capability::RepoAuthorized));
+            assert!(issue.message.contains("myorg/myrepo"));
+            assert!(issue
+                .message
+                .contains("https://github.com/apps/lattice/installations/new"));
+            assert_eq!(issue.evidence.len(), 1);
+        }
+
+        #[test]
+        fn repo_authorization_check_failed() {
+            let issue = issues::repo_authorization_check_failed("owner", "repo", "network timeout");
+            assert!(!issue.is_blocking()); // Warning severity
+            assert!(issue.message.contains("owner/repo"));
+            assert!(issue.message.contains("network timeout"));
             assert_eq!(issue.evidence.len(), 1);
         }
 
