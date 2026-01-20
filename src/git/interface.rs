@@ -507,6 +507,23 @@ pub struct CommitInfo {
     pub author_time: chrono::DateTime<chrono::Utc>,
 }
 
+/// Entry for building a tree object.
+///
+/// Used with [`Git::write_tree`] to create tree objects containing
+/// blobs or subtrees.
+#[derive(Debug, Clone)]
+pub struct TreeEntry<'a> {
+    /// File name (e.g., "event.json")
+    pub name: &'a str,
+    /// Object ID (blob or subtree)
+    pub oid: &'a Oid,
+    /// File mode:
+    /// - `0o100644` for regular file
+    /// - `0o100755` for executable
+    /// - `0o040000` for directory/subtree
+    pub mode: i32,
+}
+
 /// The Git interface.
 ///
 /// This is the **single point of interaction** with Git. All repository
@@ -1518,6 +1535,188 @@ impl Git {
         }
 
         Ok(parents)
+    }
+
+    /// Get the tree OID from a commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`GitError::ObjectNotFound`] if the commit doesn't exist
+    pub fn commit_tree(&self, commit_oid: &Oid) -> Result<Oid, GitError> {
+        let git_oid = git2::Oid::from_str(commit_oid.as_str())
+            .map_err(|e| GitError::from_git2(e, commit_oid.as_str()))?;
+
+        let commit = self
+            .repo
+            .find_commit(git_oid)
+            .map_err(|e| GitError::from_git2(e, commit_oid.as_str()))?;
+
+        let tree_oid = commit.tree_id();
+        Oid::new(tree_oid.to_string()).map_err(|e| e.into())
+    }
+
+    // =========================================================================
+    // Tree Operations
+    // =========================================================================
+
+    /// Create a tree object with the given entries.
+    ///
+    /// This is used to build trees for commits, particularly for the event
+    /// ledger where each commit contains an `event.json` blob.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - List of tree entries (name, oid, mode)
+    ///
+    /// # Returns
+    ///
+    /// The OID of the created tree.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let blob_oid = git.write_blob(b"content")?;
+    /// let tree_oid = git.write_tree(&[TreeEntry {
+    ///     name: "file.txt",
+    ///     oid: &blob_oid,
+    ///     mode: 0o100644,
+    /// }])?;
+    /// ```
+    pub fn write_tree(&self, entries: &[TreeEntry<'_>]) -> Result<Oid, GitError> {
+        let mut builder = self.repo.treebuilder(None).map_err(|e| GitError::Internal {
+            message: format!("failed to create tree builder: {}", e.message()),
+        })?;
+
+        for entry in entries {
+            let git_oid = git2::Oid::from_str(entry.oid.as_str())
+                .map_err(|e| GitError::from_git2(e, entry.oid.as_str()))?;
+
+            builder
+                .insert(entry.name, git_oid, entry.mode)
+                .map_err(|e| GitError::Internal {
+                    message: format!(
+                        "failed to insert tree entry '{}': {}",
+                        entry.name,
+                        e.message()
+                    ),
+                })?;
+        }
+
+        let tree_oid = builder.write().map_err(|e| GitError::Internal {
+            message: format!("failed to write tree: {}", e.message()),
+        })?;
+
+        Oid::new(tree_oid.to_string()).map_err(|e| e.into())
+    }
+
+    /// Get an entry's OID from a tree by name.
+    ///
+    /// # Arguments
+    ///
+    /// * `tree_oid` - The OID of the tree to search
+    /// * `name` - The name of the entry to find
+    ///
+    /// # Returns
+    ///
+    /// `Some(oid)` if the entry exists, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// - [`GitError::ObjectNotFound`] if the tree doesn't exist
+    pub fn tree_entry_oid(&self, tree_oid: &Oid, name: &str) -> Result<Option<Oid>, GitError> {
+        let git_oid = git2::Oid::from_str(tree_oid.as_str())
+            .map_err(|e| GitError::from_git2(e, tree_oid.as_str()))?;
+
+        let tree = self
+            .repo
+            .find_tree(git_oid)
+            .map_err(|e| GitError::from_git2(e, tree_oid.as_str()))?;
+
+        // Extract the OID before the TreeEntry is dropped
+        let entry_id = tree.get_name(name).map(|entry| entry.id());
+
+        match entry_id {
+            Some(id) => {
+                let entry_oid = Oid::new(id.to_string())?;
+                Ok(Some(entry_oid))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // =========================================================================
+    // Commit Creation
+    // =========================================================================
+
+    /// Create a commit object.
+    ///
+    /// This creates a commit without updating any ref. Use this with
+    /// [`Git::update_ref_cas`] for atomic commit creation with CAS semantics.
+    ///
+    /// # Arguments
+    ///
+    /// * `tree` - OID of the tree for this commit
+    /// * `parents` - Parent commit OIDs (empty for root commit, one for linear history)
+    /// * `message` - Commit message
+    ///
+    /// # Returns
+    ///
+    /// The OID of the created commit.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Create a commit with one parent
+    /// let commit_oid = git.write_commit(&tree_oid, &[&parent_oid], "my message")?;
+    ///
+    /// // Atomically update ref to point to new commit
+    /// git.update_ref_cas("refs/lattice/event-log", &commit_oid, Some(&parent_oid), "lattice: event")?;
+    /// ```
+    pub fn write_commit(
+        &self,
+        tree: &Oid,
+        parents: &[&Oid],
+        message: &str,
+    ) -> Result<Oid, GitError> {
+        // Get tree object
+        let tree_git_oid =
+            git2::Oid::from_str(tree.as_str()).map_err(|e| GitError::from_git2(e, tree.as_str()))?;
+
+        let tree_obj = self
+            .repo
+            .find_tree(tree_git_oid)
+            .map_err(|e| GitError::from_git2(e, tree.as_str()))?;
+
+        // Get parent commits
+        let mut parent_commits = Vec::with_capacity(parents.len());
+        for parent in parents {
+            let parent_git_oid = git2::Oid::from_str(parent.as_str())
+                .map_err(|e| GitError::from_git2(e, parent.as_str()))?;
+
+            let commit = self
+                .repo
+                .find_commit(parent_git_oid)
+                .map_err(|e| GitError::from_git2(e, parent.as_str()))?;
+
+            parent_commits.push(commit);
+        }
+        let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+
+        // Get signature (use repo defaults or a fixed lattice signature)
+        let sig = self.repo.signature().unwrap_or_else(|_| {
+            git2::Signature::now("Lattice", "lattice@localhost")
+                .expect("failed to create default signature")
+        });
+
+        // Create commit (don't update any ref - we do that separately with CAS)
+        let commit_oid = self
+            .repo
+            .commit(None, &sig, &sig, message, &tree_obj, &parent_refs)
+            .map_err(|e| GitError::Internal {
+                message: format!("failed to create commit: {}", e.message()),
+            })?;
+
+        Oid::new(commit_oid.to_string()).map_err(|e| e.into())
     }
 
     // =========================================================================

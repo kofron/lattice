@@ -402,54 +402,10 @@ pub fn scan(git: &Git) -> Result<RepoSnapshot, ScanError> {
     // Note: Missing auth is not an issue - it's just a missing capability.
     // Commands that need auth will gate on AuthAvailable.
 
-    // Check for RepoAuthorized capability (GitHub App installed for repo)
-    // Only check if we have both AuthAvailable and RemoteResolved
-    if health.capabilities().has(&Capability::AuthAvailable)
-        && health.capabilities().has(&Capability::RemoteResolved)
-    {
-        if let Ok(Some(remote_url)) = git.remote_url("origin") {
-            if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {
-                let host = "github.com"; // v1: only github.com supported
-
-                // Load authorization cache
-                let mut cache = crate::auth::cache::AuthCache::load(&paths);
-
-                // Check cache first (10-minute TTL per SPEC.md 8E.0.1)
-                if let Some(cached_entry) = cache.get(host, &owner, &repo) {
-                    // Cache hit - capability satisfied
-                    health.add_capability(Capability::RepoAuthorized);
-                    // Note: cached_entry contains installation_id and repository_id
-                    // which can be used by forge operations
-                    let _ = cached_entry; // Mark as used
-                } else {
-                    // Cache miss - need to query API
-                    // Use blocking runtime for sync context
-                    match check_repo_authorization_sync(host, &owner, &repo) {
-                        Ok(Some(result)) => {
-                            // Authorized - cache and add capability
-                            cache.set(host, &owner, &repo, &result);
-                            cache.prune_expired();
-                            cache.save(&paths);
-                            health.add_capability(Capability::RepoAuthorized);
-                        }
-                        Ok(None) => {
-                            // Not authorized - add blocking issue
-                            health.add_issue(issues::app_not_installed(host, &owner, &repo));
-                        }
-                        Err(e) => {
-                            // Check failed - add warning (non-blocking)
-                            // Commands requiring RepoAuthorized will be gated
-                            health.add_issue(issues::repo_authorization_check_failed(
-                                &owner,
-                                &repo,
-                                &e.to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Note: RepoAuthorized capability check is deferred to scan_with_remote()
+    // because it requires async API calls. The sync scan() function cannot
+    // perform async operations without creating a nested runtime, which panics
+    // if already running inside an async context.
 
     // Detect and record divergence per ARCHITECTURE.md Section 7.2
     // "On each command invocation, the engine compares the current fingerprint
@@ -673,6 +629,20 @@ pub async fn scan_with_remote(git: &Git) -> Result<RepoSnapshot, ScanError> {
     // Perform the basic scan first
     let mut snapshot = scan(git)?;
 
+    // Check for RepoAuthorized capability (GitHub App installed for repo)
+    // This is done here (async context) rather than in scan() to avoid nested runtime panics.
+    // Only check if we have both AuthAvailable and RemoteResolved
+    if snapshot.health.capabilities().has(&Capability::AuthAvailable)
+        && snapshot.health.capabilities().has(&Capability::RemoteResolved)
+    {
+        if let Ok(Some(remote_url)) = git.remote_url("origin") {
+            if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {
+                let paths = LatticePaths::from_repo_info(&snapshot.info);
+                check_repo_authorization_async(&mut snapshot.health, &paths, &owner, &repo).await;
+            }
+        }
+    }
+
     // Try to query remote PRs if capabilities allow
     if let Ok(Some(remote_url)) = git.remote_url("origin") {
         if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {
@@ -687,6 +657,76 @@ pub async fn scan_with_remote(git: &Git) -> Result<RepoSnapshot, ScanError> {
     }
 
     Ok(snapshot)
+}
+
+/// Check repository authorization asynchronously.
+///
+/// Per SPEC.md Section 8E.0.1, this queries the GitHub API to verify that
+/// the authenticated user has access to the repository via an installed
+/// GitHub App. Results are cached with a 10-minute TTL.
+///
+/// Updates the health report with RepoAuthorized capability or appropriate issues.
+async fn check_repo_authorization_async(
+    health: &mut RepoHealthReport,
+    paths: &LatticePaths,
+    owner: &str,
+    repo: &str,
+) {
+    use crate::auth::installations::check_repo_authorization;
+    use crate::auth::GitHubAuthManager;
+    use crate::secrets;
+
+    let host = "github.com"; // v1: only github.com supported
+
+    // Load authorization cache
+    let mut cache = crate::auth::cache::AuthCache::load(paths);
+
+    // Check cache first (10-minute TTL per SPEC.md 8E.0.1)
+    if let Some(cached_entry) = cache.get(host, owner, repo) {
+        // Cache hit - capability satisfied
+        health.add_capability(Capability::RepoAuthorized);
+        // Note: cached_entry contains installation_id and repository_id
+        // which can be used by forge operations
+        let _ = cached_entry; // Mark as used
+        return;
+    }
+
+    // Cache miss - need to query API
+    let store = match secrets::create_store(secrets::DEFAULT_PROVIDER) {
+        Ok(s) => s,
+        Err(e) => {
+            health.add_issue(issues::repo_authorization_check_failed(
+                owner,
+                repo,
+                &e.to_string(),
+            ));
+            return;
+        }
+    };
+    let auth_manager = GitHubAuthManager::new(host, store);
+
+    match check_repo_authorization(&auth_manager, host, owner, repo).await {
+        Ok(Some(result)) => {
+            // Authorized - cache and add capability
+            cache.set(host, owner, repo, &result);
+            cache.prune_expired();
+            cache.save(paths);
+            health.add_capability(Capability::RepoAuthorized);
+        }
+        Ok(None) => {
+            // Not authorized - add blocking issue
+            health.add_issue(issues::app_not_installed(host, owner, repo));
+        }
+        Err(e) => {
+            // Check failed - add warning (non-blocking)
+            // Commands requiring RepoAuthorized will be gated
+            health.add_issue(issues::repo_authorization_check_failed(
+                owner,
+                repo,
+                &e.to_string(),
+            ));
+        }
+    }
 }
 
 /// Query the forge for open PRs if capabilities allow.
@@ -1004,38 +1044,6 @@ fn detect_local_untracked_branches(git: &Git, snapshot: &mut RepoSnapshot) {
 
         snapshot.health.add_issue(issue);
     }
-}
-
-/// Synchronous wrapper for repository authorization check.
-///
-/// Per SPEC.md Section 8E.0.1, this queries the GitHub API to verify that
-/// the authenticated user has access to the repository via an installed
-/// GitHub App.
-///
-/// Uses a blocking runtime to call the async API from the synchronous scanner.
-fn check_repo_authorization_sync(
-    host: &str,
-    owner: &str,
-    repo: &str,
-) -> Result<Option<crate::auth::installations::RepoAuthResult>, crate::auth::AuthError> {
-    use crate::auth::installations::check_repo_authorization;
-    use crate::auth::GitHubAuthManager;
-    use crate::secrets;
-
-    // Create auth manager
-    let store = secrets::create_store(secrets::DEFAULT_PROVIDER)?;
-    let auth_manager = GitHubAuthManager::new(host, store);
-
-    // Create a tokio runtime for the async call
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            crate::auth::AuthError::Internal(format!("failed to create runtime: {}", e))
-        })?;
-
-    // Run the async check
-    rt.block_on(check_repo_authorization(&auth_manager, host, owner, repo))
 }
 
 #[cfg(test)]
