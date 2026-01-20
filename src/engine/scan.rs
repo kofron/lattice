@@ -632,8 +632,14 @@ pub async fn scan_with_remote(git: &Git) -> Result<RepoSnapshot, ScanError> {
     // Check for RepoAuthorized capability (GitHub App installed for repo)
     // This is done here (async context) rather than in scan() to avoid nested runtime panics.
     // Only check if we have both AuthAvailable and RemoteResolved
-    if snapshot.health.capabilities().has(&Capability::AuthAvailable)
-        && snapshot.health.capabilities().has(&Capability::RemoteResolved)
+    if snapshot
+        .health
+        .capabilities()
+        .has(&Capability::AuthAvailable)
+        && snapshot
+            .health
+            .capabilities()
+            .has(&Capability::RemoteResolved)
     {
         if let Ok(Some(remote_url)) = git.remote_url("origin") {
             if let Some((owner, repo)) = crate::forge::github::parse_github_url(&remote_url) {

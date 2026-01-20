@@ -1583,9 +1583,12 @@ impl Git {
     /// }])?;
     /// ```
     pub fn write_tree(&self, entries: &[TreeEntry<'_>]) -> Result<Oid, GitError> {
-        let mut builder = self.repo.treebuilder(None).map_err(|e| GitError::Internal {
-            message: format!("failed to create tree builder: {}", e.message()),
-        })?;
+        let mut builder = self
+            .repo
+            .treebuilder(None)
+            .map_err(|e| GitError::Internal {
+                message: format!("failed to create tree builder: {}", e.message()),
+            })?;
 
         for entry in entries {
             let git_oid = git2::Oid::from_str(entry.oid.as_str())
@@ -1679,8 +1682,8 @@ impl Git {
         message: &str,
     ) -> Result<Oid, GitError> {
         // Get tree object
-        let tree_git_oid =
-            git2::Oid::from_str(tree.as_str()).map_err(|e| GitError::from_git2(e, tree.as_str()))?;
+        let tree_git_oid = git2::Oid::from_str(tree.as_str())
+            .map_err(|e| GitError::from_git2(e, tree.as_str()))?;
 
         let tree_obj = self
             .repo
