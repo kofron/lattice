@@ -86,18 +86,18 @@ impl SubmitCommand {
 
 | Category | Milestone | Status | Priority |
 |----------|-----------|--------|----------|
-| **Correctness** | Gating Integration + Scope Walking | Not started | CRITICAL |
-| **Correctness** | Worktree Occupancy Checks | Not started | CRITICAL |
-| **Correctness** | Journal Rollback Implementation | Not started | CRITICAL |
-| **Correctness** | OpState Full Payload | Not started | HIGH |
-| **Correctness** | Multi-step Journal Continuation | Not started | HIGH |
-| **Correctness** | Executor Post-Verification | Not started | HIGH |
-| **Correctness** | TokenProvider Integration | COMPLETE | HIGH |
-| **Correctness** | Bare Repo Mode Compliance | COMPLETE | MEDIUM |
-| **Correctness** | Journal Fsync Step Boundary | Not started | MEDIUM |
-| **Correctness** | Direct .git File Access Fix | COMPLETE | MEDIUM |
-| **Correctness** | Git Hooks Support | Not started | MEDIUM |
-| **Correctness** | Out-of-Band Drift Harness | Not started | MEDIUM |
+| **Correctness** | 0.1 Gating Integration + Scope Walking | **COMPLETE** (2026-01-20) | CRITICAL |
+| **Correctness** | 0.2+0.6 Worktree Occupancy + Post-Verify | Not started | CRITICAL |
+| **Correctness** | 0.3 Journal Rollback Implementation | **COMPLETE** (2026-01-20) | CRITICAL |
+| **Correctness** | 0.4 OpState Full Payload | **COMPLETE** (2026-01-20) | HIGH |
+| **Correctness** | 0.5 Multi-step Journal Continuation | **COMPLETE** (2026-01-20) | HIGH |
+| **Correctness** | 0.7 TokenProvider Integration | **COMPLETE** (2026-01-20) | HIGH |
+| **Correctness** | 0.8 Bare Repo Mode Compliance | **COMPLETE** (2026-01-20) | MEDIUM |
+| **Correctness** | 0.9 Journal Fsync Step Boundary | Not started | MEDIUM |
+| **Correctness** | 0.10 Direct .git File Access Fix | **COMPLETE** (2026-01-20) | MEDIUM |
+| **Correctness** | 0.11 Git Hooks Support | Not started | MEDIUM |
+| **Correctness** | 0.12 Out-of-Band Drift Harness | Not started | MEDIUM |
+| **Command Migration** | Phase 5 Core Mutating Commands | PARTIAL (1/12) | HIGH |
 | **Foundation** | TTY Detection Fix | Stubbed (from v2) | LOW |
 | **Feature** | Alias Command | Not started (from v2) | MEDIUM |
 | **Feature** | Split By-Hunk | Deferred (from v2) | LOW |
@@ -115,9 +115,11 @@ These issues were discovered during a comprehensive codebase survey. They repres
 
 ### Milestone 0.1: Gating Integration + Scope Walking
 
-**Status:** Not started
+**Status:** COMPLETE (2026-01-20)
 
 **Priority:** CRITICAL - Commands bypass all capability validation
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.1-gating-integration/implementation_notes.md`
 
 **Spec reference:** ARCHITECTURE.md Section 5 "The validated execution model and capability gating"
 
@@ -399,9 +401,11 @@ This keeps architecture clean: gating validates capabilities, occupancy is plan 
 
 ### Milestone 0.3: Journal Rollback Implementation
 
-**Status:** Not started
+**Status:** COMPLETE (2026-01-20)
 
 **Priority:** CRITICAL - Abort doesn't actually roll back
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.3-journal-rollback/implementation_notes.md`
 
 **Spec reference:** SPEC.md Section 4.2.2 "Crash consistency contract"
 
@@ -493,9 +497,11 @@ If rollback succeeds for refs A, B but fails CAS for C:
 
 ### Milestone 0.4: OpState Full Payload
 
-**Status:** COMPLETE
+**Status:** COMPLETE (2026-01-20)
 
 **Priority:** HIGH - Missing required fields
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.4-opstate-full-payload/implementation_notes.md`
 
 **Spec reference:** SPEC.md Section 4.6.5 "Operation state and crash safety"
 
@@ -567,9 +573,11 @@ The `OpState` struct is missing fields required by SPEC.md and needed by rollbac
 
 ### Milestone 0.5: Multi-step Journal Continuation
 
-**Status:** Not started
+**Status:** COMPLETE (2026-01-20)
 
 **Priority:** HIGH - Continue doesn't resume remaining steps
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.5-multi-step-continuation/implementation_notes.md`
 
 **Spec reference:** SPEC.md Section 4.2.1 "Journal structure"
 
@@ -689,6 +697,8 @@ If not, abort with "repository changed; cannot continue safely."
 
 **Priority:** HIGH - No per-request token refresh
 
+**Implementation:** See `.agents/v3/milestones/milestone-0.7-token-provider-integration/implementation_notes.md`
+
 **Spec reference:** SPEC.md Section 8E.1 "Forge abstraction"
 
 **Problem Statement:**
@@ -741,9 +751,11 @@ Per SPEC.md hard rule: tokens never in logs/errors/op-state/journal/ledger. Exis
 
 ### Milestone 0.8: Bare Repo Mode Compliance
 
-**Status:** COMPLETE
+**Status:** COMPLETE (2026-01-20)
 
 **Priority:** MEDIUM - SPEC.md explicit requirements
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.8-bare-repo-compliance/implementation_notes.md`
 
 **Spec reference:** SPEC.md Section 4.6.7 "Bare repo policy for submit/sync/get"
 
@@ -850,6 +862,8 @@ Current journal API allows batching multiple steps before sync, violating the cr
 **Status:** COMPLETE (2026-01-20)
 
 **Priority:** MEDIUM - Violates single-interface principle
+
+**Implementation:** See `.agents/v3/milestones/milestone-0.10-direct-git-file-access-fix/implementation_notes.md`
 
 **Spec reference:** ARCHITECTURE.md Section 10.1 "Single Git interface"
 
@@ -1049,20 +1063,21 @@ Harness uses hook to perform out-of-band mutations, then verifies executor detec
 
 ## Execution Order (Optimized to Reduce Churn)
 
-| Order | Milestone | Notes |
-|-------|-----------|-------|
-| 1 | 0.4 OpState Full Payload | Foundation for rollback + continuation |
-| 2 | 0.1 Gating + Scope Walking | Core architectural fix (includes scope walking) |
-| 3 | 0.2 + 0.6 Occupancy + Post-Verify | Bundle (both touch executor) |
-| 4 | 0.3 Journal Rollback | Needs gating + op-state in place |
-| 5 | 0.9 Journal Fsync | Related to 0.3 |
-| 6 | 0.5 Multi-step Continuation | Needs rollback |
-| 7 | 0.8 Bare Repo Compliance | Uses mode types from 0.1 |
-| 8 | 0.7 TokenProvider | Independent |
-| 9 | 0.10 Direct .git Fix | Independent |
-| 10 | 0.11 Git Hooks | Independent |
-| 11 | 0.12 Drift Harness | Validates all above |
-| 12+ | Foundation, Features, Bootstrap | After correctness complete |
+| Order | Milestone | Status |
+|-------|-----------|--------|
+| 1 | 0.4 OpState Full Payload | ✅ COMPLETE |
+| 2 | 0.1 Gating + Scope Walking | ✅ COMPLETE |
+| 3 | 0.3 Journal Rollback | ✅ COMPLETE |
+| 4 | 0.5 Multi-step Continuation | ✅ COMPLETE |
+| 5 | 0.7 TokenProvider | ✅ COMPLETE |
+| 6 | 0.8 Bare Repo Compliance | ✅ COMPLETE |
+| 7 | 0.10 Direct .git Fix | ✅ COMPLETE |
+| **8** | **0.2 + 0.6 Occupancy + Post-Verify** | **NEXT - CRITICAL** |
+| 9 | 0.9 Journal Fsync | Not started |
+| 10 | 0.11 Git Hooks | Not started |
+| 11 | 0.12 Drift Harness | Not started |
+| 12 | Phase 5 Commands (11 remaining) | PARTIAL - HIGH |
+| 13+ | Foundation, Features, Bootstrap | After correctness complete |
 
 ---
 

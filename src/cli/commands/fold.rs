@@ -1,7 +1,21 @@
-// Legacy journal API - these commands will be migrated to executor pattern
-#![allow(deprecated)]
-
 //! fold command - Merge current branch into parent and delete
+//!
+//! This command implements the `Command` trait for the unified lifecycle.
+//!
+//! # Gating
+//!
+//! Uses `requirements::MUTATING` - requires working directory, trunk known,
+//! no ops in progress, frozen policy satisfied.
+//!
+//! # Plan Generation
+//!
+//! 1. RunGit: checkout parent
+//! 2. RunGit: merge current into parent
+//! 3. PotentialConflictPause
+//! 4. For each child: WriteMetadataCas to reparent
+//! 5. RunGit: git branch -D current
+//! 6. DeleteMetadataCas: remove current's metadata
+//! 7. (If --keep): Additional steps to rename parent to current
 //!
 //! Per SPEC.md 8D.8:
 //!
@@ -15,19 +29,16 @@
 //! - Must re-parent children before deleting
 //! - Metadata updated only after refs succeed
 
-use std::process::Command;
-
 use anyhow::{Context as _, Result};
 
-use crate::cli::commands::phase3_helpers::{check_freeze_affected_set, reparent_children};
-use crate::core::metadata::schema::BranchInfo;
-use crate::core::metadata::store::MetadataStore;
-use crate::core::ops::journal::{Journal, OpState};
-use crate::core::ops::lock::RepoLock;
-use crate::core::paths::LatticePaths;
+use crate::core::metadata::schema::{BaseInfo, BranchInfo, ParentInfo};
+use crate::core::ops::journal::OpId;
 use crate::core::types::BranchName;
-use crate::engine::gate::requirements;
-use crate::engine::scan::scan;
+use crate::engine::command::{Command, CommandOutput, SimpleCommand};
+use crate::engine::exec::ExecuteResult;
+use crate::engine::gate::{requirements, ReadyContext, RequirementSet};
+use crate::engine::plan::{Plan, PlanError, PlanStep};
+use crate::engine::runner::run_command;
 use crate::engine::Context;
 use crate::git::Git;
 
@@ -43,300 +54,242 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let info = git.info()?;
-    let paths = LatticePaths::from_repo_info(&info);
 
-    // Check for in-progress operation
-    if let Some(op_state) = OpState::read(&paths)? {
-        anyhow::bail!(
-            "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
-            op_state.command,
-            op_state.op_id
-        );
-    }
-
-    // Pre-flight gating check
-    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
-        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
-
-    let snapshot = scan(&git).context("Failed to scan repository")?;
-
-    // Ensure trunk is configured
-    let trunk = snapshot
-        .trunk
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?;
-
-    // Get current branch
-    let current = snapshot
-        .current_branch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?
-        .clone();
-
-    // Check if tracked
-    if !snapshot.metadata.contains_key(&current) {
-        anyhow::bail!(
-            "Branch '{}' is not tracked. Use 'lattice track' first.",
-            current
-        );
-    }
-
-    // Get current metadata
-    let current_meta = snapshot
-        .metadata
-        .get(&current)
-        .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", current))?;
-
-    // Get parent
-    let parent_name = if current_meta.metadata.parent.is_trunk() {
-        trunk.clone()
-    } else {
-        BranchName::new(current_meta.metadata.parent.name())
-            .context("Invalid parent name in metadata")?
+    let cmd = FoldCommand {
+        keep,
+        verify: ctx.verify,
     };
 
-    // Cannot fold into trunk (trunk is special)
-    if &parent_name == trunk {
-        anyhow::bail!("Cannot fold into trunk. Use 'lattice merge' instead.");
-    }
-
-    // Build list of branches to check for freeze
-    let mut affected = vec![current.clone(), parent_name.clone()];
-    if let Some(children) = snapshot.graph.children(&current) {
-        affected.extend(children.iter().cloned());
-    }
-
-    // Check freeze policy
-    check_freeze_affected_set(&affected, &snapshot)?;
-
-    // Get parent metadata
-    let parent_meta = snapshot
-        .metadata
-        .get(&parent_name)
-        .ok_or_else(|| anyhow::anyhow!("Parent '{}' is not tracked", parent_name))?;
-
-    if !ctx.quiet {
-        println!("Folding '{}' into '{}'...", current, parent_name);
-    }
-
-    // Acquire lock
-    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
-
-    // Create journal
-    let mut journal = Journal::new("fold");
-
-    // Write op-state
-    #[allow(deprecated)]
-    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
-    op_state.write(&paths)?;
-
-    // Get current and parent tips
-    let current_tip = snapshot
-        .branches
-        .get(&current)
-        .ok_or_else(|| anyhow::anyhow!("Branch '{}' not found", current))?;
-
-    let parent_tip = snapshot
-        .branches
-        .get(&parent_name)
-        .ok_or_else(|| anyhow::anyhow!("Parent branch '{}' not found", parent_name))?;
-
-    // Checkout parent
-    let status = Command::new("git")
-        .args(["checkout", parent_name.as_str()])
-        .current_dir(&cwd)
-        .status()
-        .context("Failed to checkout parent")?;
-
-    if !status.success() {
-        OpState::remove(&paths)?;
-        anyhow::bail!("git checkout failed");
-    }
-
-    // Merge current into parent (fast-forward if possible, otherwise create merge commit)
-    let mut merge_args = vec!["merge"];
-    if !ctx.verify {
-        merge_args.push("--no-verify");
-    }
-    merge_args.extend(["--ff", current.as_str()]);
-    let status = Command::new("git")
-        .args(&merge_args)
-        .current_dir(&cwd)
-        .status()
-        .context("Failed to merge")?;
-
-    if !status.success() {
-        // Try with merge commit
-        let merge_msg = format!("Fold '{}' into '{}'", current, parent_name);
-        let mut merge_args = vec!["merge"];
-        if !ctx.verify {
-            merge_args.push("--no-verify");
+    let output = run_command(&cmd, &git, ctx).map_err(|e| match e {
+        crate::engine::runner::RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
         }
-        merge_args.extend(["--no-ff", "-m", &merge_msg, current.as_str()]);
-        let status = Command::new("git")
-            .args(&merge_args)
-            .current_dir(&cwd)
-            .status()
-            .context("Failed to merge")?;
+        other => anyhow::anyhow!("{}", other),
+    })?;
 
-        if !status.success() {
-            // Restore state
-            let _ = Command::new("git")
-                .args(["checkout", current.as_str()])
-                .current_dir(&cwd)
-                .status();
-            OpState::remove(&paths)?;
-            anyhow::bail!("git merge failed");
+    match output {
+        CommandOutput::Success(()) => {
+            if !ctx.quiet {
+                println!("Fold complete.");
+            }
+            Ok(())
         }
+        CommandOutput::Paused { message } => {
+            println!();
+            println!("{}", message);
+            Ok(())
+        }
+        CommandOutput::Failed { error } => Err(anyhow::anyhow!("{}", error)),
     }
+}
 
-    // Get new parent tip
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&cwd)
-        .output()
-        .context("Failed to get HEAD")?;
+/// Command struct for fold operation.
+pub struct FoldCommand {
+    /// Keep the current branch name by renaming parent.
+    keep: bool,
+    /// Whether to run git hooks.
+    verify: bool,
+}
 
-    let new_parent_tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+impl Command for FoldCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::MUTATING;
+    type Output = ();
 
-    // Record parent ref update
-    journal.record_ref_update(
-        format!("refs/heads/{}", parent_name),
-        Some(parent_tip.to_string()),
-        new_parent_tip,
-    );
+    fn plan(&self, ctx: &ReadyContext) -> Result<Plan, PlanError> {
+        let snapshot = &ctx.snapshot;
 
-    // Reparent children of current to parent
-    let reparented = reparent_children(&current, &parent_name, &snapshot, &git, &mut journal)?;
+        // Get trunk
+        let trunk = snapshot
+            .trunk()
+            .ok_or_else(|| PlanError::MissingData("trunk not configured".to_string()))?;
 
-    if !ctx.quiet && !reparented.is_empty() {
-        println!(
-            "  Reparented {} child(ren) to '{}'",
-            reparented.len(),
-            parent_name
-        );
-    }
+        // Get current branch
+        let current = snapshot
+            .current_branch
+            .as_ref()
+            .ok_or_else(|| PlanError::InvalidState("Not on any branch".to_string()))?;
 
-    let store = MetadataStore::new(&git);
-
-    // Delete current branch
-    let status = Command::new("git")
-        .args(["branch", "-D", current.as_str()])
-        .current_dir(&cwd)
-        .status()
-        .context("Failed to delete current branch")?;
-
-    if !status.success() {
-        OpState::remove(&paths)?;
-        anyhow::bail!("git branch -D failed");
-    }
-
-    journal.record_ref_update(
-        format!("refs/heads/{}", current),
-        Some(current_tip.to_string()),
-        "0000000000000000000000000000000000000000".to_string(),
-    );
-
-    // Delete current metadata
-    store
-        .delete_cas(&current, &current_meta.ref_oid)
-        .with_context(|| format!("Failed to delete metadata for '{}'", current))?;
-
-    journal.record_metadata_delete(current.as_str(), current_meta.ref_oid.to_string());
-
-    if !ctx.quiet {
-        println!("  Deleted '{}'", current);
-    }
-
-    // Handle --keep: rename parent to current's name
-    if keep {
-        if !ctx.quiet {
-            println!("  Renaming '{}' to '{}'...", parent_name, current);
+        // Check if tracked
+        if !snapshot.metadata.contains_key(current) {
+            return Err(PlanError::InvalidState(format!(
+                "Branch '{}' is not tracked",
+                current
+            )));
         }
 
-        // Rename the branch
-        let status = Command::new("git")
-            .args(["branch", "-m", parent_name.as_str(), current.as_str()])
-            .current_dir(&cwd)
-            .status()
-            .context("Failed to rename branch")?;
+        // Get current metadata
+        let current_meta = snapshot.metadata.get(current).ok_or_else(|| {
+            PlanError::MissingData(format!("Metadata not found for '{}'", current))
+        })?;
 
-        if !status.success() {
-            OpState::remove(&paths)?;
-            anyhow::bail!("git branch -m failed");
-        }
-
-        // Get current parent OID (after merge)
-        let output = Command::new("git")
-            .args(["rev-parse", current.as_str()])
-            .current_dir(&cwd)
-            .output()
-            .context("Failed to get new branch OID")?;
-
-        let renamed_oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        journal.record_ref_update(
-            format!("refs/heads/{}", parent_name),
-            Some(renamed_oid.clone()),
-            "0000000000000000000000000000000000000000".to_string(),
-        );
-        journal.record_ref_update(format!("refs/heads/{}", current), None, renamed_oid);
-
-        // Update parent metadata with new name
-        let mut updated_parent_meta = parent_meta.metadata.clone();
-        updated_parent_meta.branch = BranchInfo {
-            name: current.to_string(),
+        // Get parent
+        let parent_name = if current_meta.metadata.parent.is_trunk() {
+            trunk.clone()
+        } else {
+            BranchName::new(current_meta.metadata.parent.name())
+                .map_err(|e| PlanError::MissingData(format!("Invalid parent name: {}", e)))?
         };
-        updated_parent_meta.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
 
-        // Write new metadata under new name
-        let new_ref_oid = store
-            .write_cas(&current, None, &updated_parent_meta)
-            .with_context(|| format!("Failed to write metadata for '{}'", current))?;
+        // Cannot fold into trunk
+        if &parent_name == trunk {
+            return Err(PlanError::InvalidState(
+                "Cannot fold into trunk. Use 'lattice merge' instead.".to_string(),
+            ));
+        }
 
-        journal.record_metadata_write(current.as_str(), None, new_ref_oid);
+        // Check freeze policy on current
+        if current_meta.metadata.freeze.is_frozen() {
+            return Err(PlanError::InvalidState(format!(
+                "Branch '{}' is frozen. Unfreeze it first.",
+                current
+            )));
+        }
 
-        // Delete old parent metadata
-        store
-            .delete_cas(&parent_name, &parent_meta.ref_oid)
-            .with_context(|| format!("Failed to delete metadata for '{}'", parent_name))?;
+        // Get parent metadata
+        let parent_meta = snapshot.metadata.get(&parent_name).ok_or_else(|| {
+            PlanError::InvalidState(format!("Parent '{}' is not tracked", parent_name))
+        })?;
 
-        journal.record_metadata_delete(parent_name.as_str(), parent_meta.ref_oid.to_string());
+        // Check freeze on parent
+        if parent_meta.metadata.freeze.is_frozen() {
+            return Err(PlanError::InvalidState(format!(
+                "Parent branch '{}' is frozen. Unfreeze it first.",
+                parent_name
+            )));
+        }
 
-        // Update children that were just reparented to use new name
-        // (They were reparented to parent_name, but now parent_name is renamed to current)
-        // Actually, we need to update their parent refs again
-        let fresh_snapshot = scan(&git)?;
-        for child in &reparented {
-            if let Some(child_meta) = fresh_snapshot.metadata.get(child) {
-                let mut updated = child_meta.metadata.clone();
-                updated.parent = crate::core::metadata::schema::ParentInfo::Branch {
-                    name: current.to_string(),
-                };
-                updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-                let child_ref_oid = store.write_cas(child, Some(&child_meta.ref_oid), &updated)?;
-
-                journal.record_metadata_write(
-                    child.as_str(),
-                    Some(child_meta.ref_oid.to_string()),
-                    child_ref_oid,
-                );
+        // Check freeze on children
+        if let Some(children) = snapshot.graph.children(current) {
+            for child in children {
+                if let Some(child_meta) = snapshot.metadata.get(child) {
+                    if child_meta.metadata.freeze.is_frozen() {
+                        return Err(PlanError::InvalidState(format!(
+                            "Child branch '{}' is frozen. Unfreeze it first.",
+                            child
+                        )));
+                    }
+                }
             }
         }
+
+        // Build plan
+        let mut plan = Plan::new(OpId::new(), "fold");
+
+        // Step 1: Checkout parent
+        plan = plan.with_step(PlanStep::RunGit {
+            args: vec!["checkout".to_string(), parent_name.to_string()],
+            description: format!("Checkout parent '{}'", parent_name),
+            expected_effects: vec![],
+        });
+
+        // Step 2: Merge current into parent (try fast-forward first)
+        let mut merge_args = vec!["merge".to_string()];
+        if !self.verify {
+            merge_args.push("--no-verify".to_string());
+        }
+        merge_args.extend(["--ff".to_string(), current.to_string()]);
+
+        plan = plan.with_step(PlanStep::RunGit {
+            args: merge_args,
+            description: format!("Merge '{}' into '{}'", current, parent_name),
+            expected_effects: vec![format!("refs/heads/{}", parent_name)],
+        });
+
+        // Step 3: Potential conflict
+        plan = plan.with_step(PlanStep::PotentialConflictPause {
+            branch: parent_name.to_string(),
+            git_operation: "merge".to_string(),
+        });
+
+        // Step 4: Reparent children of current to parent
+        // After fold, the parent will have current's commits merged in, so the parent's
+        // current tip should be valid as the children's new base (conservative approach).
+        // The children's commits are still based on current's work which is now in parent.
+        let parent_tip_oid = snapshot.branch_tip(&parent_name).ok_or_else(|| {
+            PlanError::MissingData(format!("Branch tip not found for parent '{}'", parent_name))
+        })?;
+
+        if let Some(children) = snapshot.graph.children(current) {
+            for child in children {
+                if let Some(child_scanned) = snapshot.metadata.get(child) {
+                    let mut updated = child_scanned.metadata.clone();
+                    // For now, point to parent_name. If --keep, we'll update again.
+                    let new_parent_name = if self.keep {
+                        current.to_string() // Will be renamed to current
+                    } else {
+                        parent_name.to_string()
+                    };
+                    updated.parent = ParentInfo::Branch {
+                        name: new_parent_name,
+                    };
+                    // Update base to the parent's tip (will be valid after merge)
+                    updated.base = BaseInfo {
+                        oid: parent_tip_oid.to_string(),
+                    };
+                    updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
+
+                    plan = plan.with_step(PlanStep::WriteMetadataCas {
+                        branch: child.to_string(),
+                        old_ref_oid: Some(child_scanned.ref_oid.to_string()),
+                        metadata: Box::new(updated),
+                    });
+                }
+            }
+        }
+
+        // Step 5: Delete current branch
+        plan = plan.with_step(PlanStep::RunGit {
+            args: vec!["branch".to_string(), "-D".to_string(), current.to_string()],
+            description: format!("Delete branch '{}'", current),
+            expected_effects: vec![], // Ref no longer exists after delete
+        });
+
+        // Step 6: Delete current's metadata
+        plan = plan.with_step(PlanStep::DeleteMetadataCas {
+            branch: current.to_string(),
+            old_ref_oid: current_meta.ref_oid.to_string(),
+        });
+
+        // Step 7: Handle --keep (rename parent to current's name)
+        if self.keep {
+            // Rename parent branch to current name
+            plan = plan.with_step(PlanStep::RunGit {
+                args: vec![
+                    "branch".to_string(),
+                    "-m".to_string(),
+                    parent_name.to_string(),
+                    current.to_string(),
+                ],
+                description: format!("Rename '{}' to '{}'", parent_name, current),
+                expected_effects: vec![format!("refs/heads/{}", current)], // Only new name exists after rename
+            });
+
+            // Create new metadata under current name (copy from parent with new name)
+            let mut new_metadata = parent_meta.metadata.clone();
+            new_metadata.branch = BranchInfo {
+                name: current.to_string(),
+            };
+            new_metadata.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
+
+            plan = plan.with_step(PlanStep::WriteMetadataCas {
+                branch: current.to_string(),
+                old_ref_oid: None, // Creating new
+                metadata: Box::new(new_metadata),
+            });
+
+            // Delete old parent metadata
+            plan = plan.with_step(PlanStep::DeleteMetadataCas {
+                branch: parent_name.to_string(),
+                old_ref_oid: parent_meta.ref_oid.to_string(),
+            });
+        }
+
+        Ok(plan)
     }
 
-    // Commit journal
-    journal.commit();
-    journal.write(&paths)?;
-
-    // Clear op-state
-    OpState::remove(&paths)?;
-
-    if !ctx.quiet {
-        println!("Fold complete.");
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        self.simple_finish(result)
     }
-
-    Ok(())
 }
+
+impl SimpleCommand for FoldCommand {}
