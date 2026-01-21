@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! reorder command - Editor-driven branch reordering
 //!
 //! Per SPEC.md 8D.5:
@@ -19,7 +22,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{
     check_freeze_affected_set, rebase_onto_with_journal, RebaseOutcome,
@@ -31,6 +34,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -51,12 +55,16 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -75,7 +83,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -133,7 +141,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     if !status.success() {
         fs::remove_file(&temp_file).ok();
-        bail!("Editor exited with error");
+        anyhow::bail!("Editor exited with error");
     }
 
     // Read edited file
@@ -150,7 +158,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Validate: same set, no duplicates
     if new_order.len() != stack.len() {
-        bail!(
+        anyhow::bail!(
             "Invalid edit: expected {} branches, got {}. Do not add or remove branches.",
             stack.len(),
             new_order.len()
@@ -159,7 +167,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     let new_set: std::collections::HashSet<_> = new_order.iter().collect();
     if new_set.len() != new_order.len() {
-        bail!("Invalid edit: duplicate branch names detected");
+        anyhow::bail!("Invalid edit: duplicate branch names detected");
     }
 
     let old_set: std::collections::HashSet<_> = stack.iter().collect();
@@ -168,10 +176,10 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         let added: Vec<_> = new_set.difference(&old_set).collect();
 
         if !missing.is_empty() {
-            bail!("Invalid edit: missing branches: {:?}", missing);
+            anyhow::bail!("Invalid edit: missing branches: {:?}", missing);
         }
         if !added.is_empty() {
-            bail!("Invalid edit: unknown branches: {:?}", added);
+            anyhow::bail!("Invalid edit: unknown branches: {:?}", added);
         }
     }
 
@@ -217,7 +225,8 @@ pub fn reorder(ctx: &Context) -> Result<()> {
     let mut journal = Journal::new("reorder");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Execute rebase sequence

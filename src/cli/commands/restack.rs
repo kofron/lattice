@@ -1,7 +1,15 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! restack command - Rebase tracked branches to align with parent tips
 //!
 //! This is the template command for conflict handling. It demonstrates
 //! the full engine lifecycle with journaling and pause/resume capability.
+//!
+//! # Gating
+//!
+//! Uses `requirements::MUTATING` - requires working directory, trunk known,
+//! no ops in progress, frozen policy satisfied.
 
 use crate::core::metadata::schema::BaseInfo;
 use crate::core::metadata::store::MetadataStore;
@@ -9,10 +17,11 @@ use crate::core::ops::journal::{Journal, OpPhase, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Oid};
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::{Git, GitState};
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use std::process::Command;
 
 /// Rebase tracked branches to align with parent tips.
@@ -34,12 +43,16 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -55,12 +68,12 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
     } else if let Some(ref current) = snapshot.current_branch {
         current.clone()
     } else {
-        bail!("Not on any branch and no branch specified");
+        anyhow::bail!("Not on any branch and no branch specified");
     };
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&target) {
-        bail!("Branch '{}' is not tracked", target);
+        anyhow::bail!("Branch '{}' is not tracked", target);
     }
 
     // Determine scope
@@ -138,8 +151,9 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
     // Create journal
     let mut journal = Journal::new("restack");
 
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    // Write op-state (legacy: restack doesn't use executor pattern yet)
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Execute restacks
@@ -157,14 +171,18 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
         journal.record_checkpoint(format!("restack-{}", branch));
 
         // Run git rebase
+        let mut rebase_args = vec!["rebase"];
+        if !ctx.verify {
+            rebase_args.push("--no-verify");
+        }
+        rebase_args.extend([
+            "--onto",
+            new_base.as_str(),
+            old_base.as_str(),
+            branch.as_str(),
+        ]);
         let status = Command::new("git")
-            .args([
-                "rebase",
-                "--onto",
-                new_base.as_str(),
-                old_base.as_str(),
-                branch.as_str(),
-            ])
+            .args(&rebase_args)
             .current_dir(&cwd)
             .status()
             .context("Failed to run git rebase")?;
@@ -187,7 +205,9 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
                 journal.pause();
                 journal.write(&paths)?;
 
-                let mut op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+                #[allow(deprecated)]
+                let mut op_state =
+                    OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
                 op_state.phase = OpPhase::Paused;
                 op_state.write(&paths)?;
 
@@ -199,7 +219,7 @@ pub fn restack(ctx: &Context, branch: Option<&str>, only: bool, downstack: bool)
             } else {
                 // Some other error
                 OpState::remove(&paths)?;
-                bail!("git rebase failed for '{}'", branch);
+                anyhow::bail!("git rebase failed for '{}'", branch);
             }
         }
 

@@ -1,7 +1,13 @@
 //! navigation commands - up, down, top, bottom
+//!
+//! # Gating
+//!
+//! Uses `requirements::NAVIGATION` - these commands read stack structure
+//! and checkout branches, requiring a working directory.
 
 use crate::core::types::BranchName;
-use crate::engine::scan::scan;
+use crate::engine::gate::requirements;
+use crate::engine::runner::{run_gated, RunError};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
@@ -14,64 +20,91 @@ use std::process::Command;
 ///
 /// * `ctx` - Execution context
 /// * `steps` - Number of steps to move
+///
+/// # Gating
+///
+/// Uses `requirements::NAVIGATION`.
 pub fn up(ctx: &Context, steps: u32) -> Result<()> {
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    let current = snapshot
-        .current_branch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?;
+    run_gated(&git, ctx, &requirements::NAVIGATION, |ready| {
+        let snapshot = &ready.snapshot;
 
-    let mut target = current.clone();
+        let current = snapshot.current_branch.as_ref().ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Not on any branch".to_string(),
+            ))
+        })?;
 
-    for _ in 0..steps {
-        let children = snapshot.graph.children(&target);
+        let mut target = current.clone();
 
-        match children {
-            None => {
-                if !ctx.quiet {
-                    println!("Already at top of stack ({})", target);
+        for _ in 0..steps {
+            let children = snapshot.graph.children(&target);
+
+            match children {
+                None => {
+                    if !ctx.quiet {
+                        println!("Already at top of stack ({})", target);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Some(kids) if kids.is_empty() => {
-                if !ctx.quiet {
-                    println!("Already at top of stack ({})", target);
+                Some(kids) if kids.is_empty() => {
+                    if !ctx.quiet {
+                        println!("Already at top of stack ({})", target);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Some(kids) if kids.len() == 1 => {
-                target = kids.iter().next().unwrap().clone();
-            }
-            Some(kids) => {
-                // Multiple children - need to select
-                if ctx.interactive {
-                    target = select_child(ctx, &kids.iter().cloned().collect::<Vec<_>>())?;
-                } else {
-                    bail!(
-                        "Multiple children from '{}': {}. Run interactively to select.",
-                        target,
-                        kids.iter()
-                            .map(|b| b.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
+                Some(kids) if kids.len() == 1 => {
+                    target = kids.iter().next().unwrap().clone();
+                }
+                Some(kids) => {
+                    // Multiple children - need to select
+                    if ctx.interactive {
+                        target = select_child(ctx, &kids.iter().cloned().collect::<Vec<_>>())
+                            .map_err(|e| {
+                                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                                    "Failed to select child: {}",
+                                    e
+                                )))
+                            })?;
+                    } else {
+                        return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                            format!(
+                                "Multiple children from '{}': {}. Run interactively to select.",
+                                target,
+                                kids.iter()
+                                    .map(|b| b.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )));
+                    }
                 }
             }
         }
-    }
 
-    if &target == current {
-        return Ok(());
-    }
+        if &target == current {
+            return Ok(());
+        }
 
-    // Checkout target
-    checkout_branch(&cwd, &target)
+        // Checkout target
+        checkout_branch(&cwd, &target).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to checkout: {}",
+                e
+            )))
+        })
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Move down to the parent branch.
@@ -80,150 +113,217 @@ pub fn up(ctx: &Context, steps: u32) -> Result<()> {
 ///
 /// * `ctx` - Execution context
 /// * `steps` - Number of steps to move
+///
+/// # Gating
+///
+/// Uses `requirements::NAVIGATION`.
 pub fn down(ctx: &Context, steps: u32) -> Result<()> {
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    let current = snapshot
-        .current_branch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?;
+    run_gated(&git, ctx, &requirements::NAVIGATION, |ready| {
+        let snapshot = &ready.snapshot;
 
-    let mut target = current.clone();
+        let current = snapshot.current_branch.as_ref().ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Not on any branch".to_string(),
+            ))
+        })?;
 
-    for _ in 0..steps {
-        match snapshot.graph.parent(&target) {
-            Some(parent) => {
-                target = parent.clone();
-            }
-            None => {
-                // Check if we're at a trunk-child or untracked
-                if snapshot.metadata.contains_key(&target) {
-                    // We're tracked, so parent is trunk
-                    if let Some(trunk) = &snapshot.trunk {
-                        target = trunk.clone();
-                        break; // Can't go below trunk
+        let mut target = current.clone();
+
+        for _ in 0..steps {
+            match snapshot.graph.parent(&target) {
+                Some(parent) => {
+                    target = parent.clone();
+                }
+                None => {
+                    // Check if we're at a trunk-child or untracked
+                    if snapshot.metadata.contains_key(&target) {
+                        // We're tracked, so parent is trunk
+                        if let Some(trunk) = &snapshot.trunk {
+                            target = trunk.clone();
+                            break; // Can't go below trunk
+                        }
                     }
+                    if !ctx.quiet {
+                        println!("Already at bottom of stack ({})", target);
+                    }
+                    return Ok(());
                 }
-                if !ctx.quiet {
-                    println!("Already at bottom of stack ({})", target);
-                }
-                return Ok(());
             }
         }
-    }
 
-    if &target == current {
-        return Ok(());
-    }
+        if &target == current {
+            return Ok(());
+        }
 
-    // Checkout target
-    checkout_branch(&cwd, &target)
+        // Checkout target
+        checkout_branch(&cwd, &target).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to checkout: {}",
+                e
+            )))
+        })
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Move to the top of the current stack (leaf).
+///
+/// # Gating
+///
+/// Uses `requirements::NAVIGATION`.
 pub fn top(ctx: &Context) -> Result<()> {
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    let current = snapshot
-        .current_branch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?;
+    run_gated(&git, ctx, &requirements::NAVIGATION, |ready| {
+        let snapshot = &ready.snapshot;
 
-    let mut target = current.clone();
+        let current = snapshot.current_branch.as_ref().ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Not on any branch".to_string(),
+            ))
+        })?;
 
-    loop {
-        let children = snapshot.graph.children(&target);
+        let mut target = current.clone();
 
-        match children {
-            None => {
-                break;
-            }
-            Some(kids) if kids.is_empty() => {
-                break;
-            }
-            Some(kids) if kids.len() == 1 => {
-                target = kids.iter().next().unwrap().clone();
-            }
-            Some(kids) => {
-                // Multiple children - need to select
-                if ctx.interactive {
-                    target = select_child(ctx, &kids.iter().cloned().collect::<Vec<_>>())?;
-                } else {
-                    bail!(
-                        "Multiple paths to top from '{}'. Run interactively to select.",
-                        target
-                    );
+        loop {
+            let children = snapshot.graph.children(&target);
+
+            match children {
+                None => {
+                    break;
+                }
+                Some(kids) if kids.is_empty() => {
+                    break;
+                }
+                Some(kids) if kids.len() == 1 => {
+                    target = kids.iter().next().unwrap().clone();
+                }
+                Some(kids) => {
+                    // Multiple children - need to select
+                    if ctx.interactive {
+                        target = select_child(ctx, &kids.iter().cloned().collect::<Vec<_>>())
+                            .map_err(|e| {
+                                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                                    "Failed to select child: {}",
+                                    e
+                                )))
+                            })?;
+                    } else {
+                        return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                            format!(
+                                "Multiple paths to top from '{}'. Run interactively to select.",
+                                target
+                            ),
+                        )));
+                    }
                 }
             }
         }
-    }
 
-    if &target == current {
-        if !ctx.quiet {
-            println!("Already at top of stack ({})", target);
+        if &target == current {
+            if !ctx.quiet {
+                println!("Already at top of stack ({})", target);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    checkout_branch(&cwd, &target)
+        checkout_branch(&cwd, &target).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to checkout: {}",
+                e
+            )))
+        })
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Move to the bottom of the current stack (trunk-child).
+///
+/// # Gating
+///
+/// Uses `requirements::NAVIGATION`.
 pub fn bottom(ctx: &Context) -> Result<()> {
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    let current = snapshot
-        .current_branch
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?;
+    run_gated(&git, ctx, &requirements::NAVIGATION, |ready| {
+        let snapshot = &ready.snapshot;
 
-    // If not tracked, can't navigate
-    if !snapshot.metadata.contains_key(current) {
-        bail!("Current branch '{}' is not tracked", current);
-    }
+        let current = snapshot.current_branch.as_ref().ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Not on any branch".to_string(),
+            ))
+        })?;
 
-    let mut target = current.clone();
-    let mut prev = target.clone();
-
-    // Walk down until we hit trunk or untracked
-    while let Some(parent) = snapshot.graph.parent(&target) {
-        prev = target.clone();
-        target = parent.clone();
-    }
-
-    // target is now trunk (or the root of tracking), we want prev (the trunk-child)
-    // But if current was already the trunk-child, prev == current
-    let final_target = if snapshot.metadata.contains_key(&target) {
-        // target is still tracked, so it's the bottom
-        target
-    } else {
-        // target is trunk (untracked), so prev is the trunk-child
-        prev
-    };
-
-    if &final_target == current {
-        if !ctx.quiet {
-            println!("Already at bottom of stack ({})", current);
+        // If not tracked, can't navigate
+        if !snapshot.metadata.contains_key(current) {
+            return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                format!("Current branch '{}' is not tracked", current),
+            )));
         }
-        return Ok(());
-    }
 
-    checkout_branch(&cwd, &final_target)
+        let mut target = current.clone();
+        let mut prev = target.clone();
+
+        // Walk down until we hit trunk or untracked
+        while let Some(parent) = snapshot.graph.parent(&target) {
+            prev = target.clone();
+            target = parent.clone();
+        }
+
+        // target is now trunk (or the root of tracking), we want prev (the trunk-child)
+        // But if current was already the trunk-child, prev == current
+        let final_target = if snapshot.metadata.contains_key(&target) {
+            // target is still tracked, so it's the bottom
+            target
+        } else {
+            // target is trunk (untracked), so prev is the trunk-child
+            prev
+        };
+
+        if &final_target == current {
+            if !ctx.quiet {
+                println!("Already at bottom of stack ({})", current);
+            }
+            return Ok(());
+        }
+
+        checkout_branch(&cwd, &final_target).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to checkout: {}",
+                e
+            )))
+        })
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Interactively select a child branch.

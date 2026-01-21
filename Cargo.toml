@@ -70,5 +70,6 @@ wiremock = "0.6"
 default = []
 keychain = ["dep:keyring"]  # Enable keychain secret storage
 fault_injection = []    # Enable fault injection for testing
+test_hooks = []         # Enable engine hooks for integration tests (OOB drift harness)
 live_github_tests = []  # Enable live GitHub API tests
 gitlab = []             # Enable GitLab forge (stub for multi-forge scaffolding)

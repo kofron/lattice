@@ -2,6 +2,7 @@
 
 use crate::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
 use crate::core::paths::LatticePaths;
+use crate::engine::gate::requirements;
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
@@ -15,6 +16,10 @@ pub fn undo(ctx: &Context) -> Result<()> {
     let git = Git::open(&cwd).context("Failed to open repository")?;
     let info = git.info()?;
     let paths = LatticePaths::from_repo_info(&info);
+
+    // Pre-flight gating check (RECOVERY is minimal - just RepoOpen)
+    crate::engine::runner::check_requirements(&git, &requirements::RECOVERY)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {

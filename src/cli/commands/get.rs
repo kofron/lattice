@@ -40,6 +40,7 @@ use crate::core::metadata::schema::{
 };
 use crate::core::metadata::store::MetadataStore;
 use crate::core::types::{BranchName, UtcTimestamp};
+use crate::engine::gate::requirements;
 use crate::engine::Context;
 use crate::forge::PullRequest;
 use crate::git::Git;
@@ -58,6 +59,21 @@ pub fn get(
     unfrozen: bool,
     no_checkout: bool,
 ) -> Result<()> {
+    // Pre-flight gating check (use REMOTE_BARE_ALLOWED if --no-checkout, else REMOTE)
+    let cwd = ctx
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    let reqs = if no_checkout {
+        &requirements::REMOTE_BARE_ALLOWED
+    } else {
+        &requirements::REMOTE
+    };
+    crate::engine::runner::check_requirements(&git, reqs)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(get_async(
         ctx,

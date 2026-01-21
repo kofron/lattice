@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! delete command - Delete a branch
 //!
 //! Per SPEC.md 8D.10:
@@ -17,7 +20,7 @@
 use std::io::{self, Write};
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{check_freeze_affected_set, reparent_children};
 use crate::cli::commands::restack::get_ancestors_inclusive;
@@ -26,6 +29,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -56,12 +60,16 @@ pub fn delete(
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -77,17 +85,17 @@ pub fn delete(
     } else if let Some(ref current) = snapshot.current_branch {
         current.clone()
     } else {
-        bail!("Not on any branch and no branch specified");
+        anyhow::bail!("Not on any branch and no branch specified");
     };
 
     // Cannot delete trunk
     if &target == trunk {
-        bail!("Cannot delete trunk branch");
+        anyhow::bail!("Cannot delete trunk branch");
     }
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&target) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'git branch -d' for untracked branches.",
             target
         );
@@ -156,7 +164,8 @@ pub fn delete(
     let mut journal = Journal::new("delete");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Get parent of primary target for reparenting
@@ -229,7 +238,7 @@ pub fn delete(
 
         if !status.success() {
             OpState::remove(&paths)?;
-            bail!("git checkout failed");
+            anyhow::bail!("git checkout failed");
         }
     }
 

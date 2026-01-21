@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! revert command - Create revert branch off trunk
 //!
 //! Per SPEC.md 8D.12:
@@ -13,7 +16,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::core::metadata::schema::{
     BaseInfo, BranchInfo, BranchMetadataV1, FreezeState, ParentInfo, PrState, Timestamps,
@@ -24,6 +27,7 @@ use crate::core::ops::journal::{Journal, OpPhase, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, UtcTimestamp};
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::{Git, GitState};
@@ -45,12 +49,16 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -68,7 +76,7 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
         .context("Failed to verify commit")?;
 
     if !output.status.success() {
-        bail!("'{}' is not a valid commit", sha);
+        anyhow::bail!("'{}' is not a valid commit", sha);
     }
 
     let full_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -79,7 +87,7 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
 
     // Check if branch already exists
     if snapshot.branches.contains_key(&branch_name) {
-        bail!("Branch '{}' already exists", branch_name);
+        anyhow::bail!("Branch '{}' already exists", branch_name);
     }
 
     // Get trunk tip
@@ -101,8 +109,9 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
     // Create journal
     let mut journal = Journal::new("revert");
 
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    // Write op-state (legacy: revert doesn't use executor pattern yet)
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Create new branch off trunk
@@ -114,7 +123,7 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git checkout -b failed");
+        anyhow::bail!("git checkout -b failed");
     }
 
     journal.record_ref_update(
@@ -124,8 +133,13 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
     );
 
     // Execute git revert
+    let mut revert_args = vec!["revert"];
+    if !ctx.verify {
+        revert_args.push("--no-verify");
+    }
+    revert_args.extend(["--no-edit", &full_sha]);
     let status = Command::new("git")
-        .args(["revert", "--no-edit", &full_sha])
+        .args(&revert_args)
         .current_dir(&cwd)
         .status()
         .context("Failed to run git revert")?;
@@ -139,7 +153,9 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
             journal.pause();
             journal.write(&paths)?;
 
-            let mut op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+            #[allow(deprecated)]
+            let mut op_state =
+                OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
             op_state.phase = OpPhase::Paused;
             op_state.write(&paths)?;
 
@@ -159,7 +175,7 @@ pub fn revert(ctx: &Context, sha: &str) -> Result<()> {
                 .current_dir(&cwd)
                 .status();
             OpState::remove(&paths)?;
-            bail!("git revert failed");
+            anyhow::bail!("git revert failed");
         }
     }
 

@@ -3,6 +3,10 @@
 //! These tests exercise the MetadataStore, RepoLock, and Journal
 //! against real Git repositories created with tempfile.
 
+// Allow deprecated record_* methods in tests - these test the legacy API
+// which remains functional but deprecated per Milestone 0.9
+#![allow(deprecated)]
+
 use std::path::Path;
 use std::process::Command;
 
@@ -568,6 +572,7 @@ mod journal {
 // OpState Tests
 // =============================================================================
 
+#[allow(deprecated)] // Tests use from_journal_legacy for simplicity
 mod op_state {
     use super::*;
 
@@ -579,7 +584,7 @@ mod op_state {
         let info = git.info().expect("git info");
 
         let journal = Journal::new("test-cmd");
-        let state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
 
         state.write(&paths).expect("write");
 
@@ -600,7 +605,7 @@ mod op_state {
         assert!(!OpState::exists(&paths));
 
         let journal = Journal::new("test");
-        let state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
         state.write(&paths).expect("write");
 
         assert!(OpState::exists(&paths));
@@ -618,7 +623,7 @@ mod op_state {
         let info = git.info().expect("git info");
 
         let journal = Journal::new("test");
-        let mut state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let mut state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
         state.write(&paths).expect("write");
 
         state.update_phase(OpPhase::Paused, &paths).expect("update");
@@ -632,6 +637,7 @@ mod op_state {
 // Integration: Lock + Metadata + Journal
 // =============================================================================
 
+#[allow(deprecated)] // Tests use from_journal_legacy for simplicity
 mod integration {
     use super::*;
 
@@ -649,7 +655,7 @@ mod integration {
         let mut journal = Journal::new("track");
 
         // 3. Write op-state
-        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
         op_state.write(&paths).expect("write op-state");
 
         // 4. Write metadata
@@ -685,7 +691,7 @@ mod integration {
 
         // Simulate an interrupted operation
         let journal = Journal::new("restack");
-        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
 
         // Write op-state but don't complete the operation
         op_state.write(&paths).expect("write op-state");

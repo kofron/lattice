@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! modify command - Amend commits or create first commit, auto-restack descendants
 //!
 //! This is the simplest Phase 3 rewriting command and establishes patterns
@@ -12,10 +15,15 @@
 //!
 //! - Must never rewrite frozen branches
 //! - Metadata must be updated only after branch refs have moved successfully
+//!
+//! # Gating
+//!
+//! Uses `requirements::MUTATING` - requires working directory, trunk known,
+//! no ops in progress, frozen policy satisfied.
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{
     check_freeze_affected_set, count_commits_in_range, rebase_onto_with_journal, RebaseOutcome,
@@ -26,6 +34,7 @@ use crate::core::metadata::store::MetadataStore;
 use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -60,12 +69,16 @@ pub fn modify(
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -84,7 +97,7 @@ pub fn modify(
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -127,7 +140,7 @@ pub fn modify(
             .context("Failed to run git add -A")?;
 
         if !status.success() {
-            bail!("git add -A failed");
+            anyhow::bail!("git add -A failed");
         }
     } else if update {
         let status = Command::new("git")
@@ -137,7 +150,7 @@ pub fn modify(
             .context("Failed to run git add -u")?;
 
         if !status.success() {
-            bail!("git add -u failed");
+            anyhow::bail!("git add -u failed");
         }
     } else if patch {
         let status = Command::new("git")
@@ -147,7 +160,7 @@ pub fn modify(
             .context("Failed to run git add -p")?;
 
         if !status.success() {
-            bail!("git add -p failed");
+            anyhow::bail!("git add -p failed");
         }
     }
 
@@ -162,10 +175,15 @@ pub fn modify(
     // Build commit command
     let mut commit_args = vec!["commit"];
 
+    // Add --no-verify if hooks are disabled
+    if !ctx.verify {
+        commit_args.push("--no-verify");
+    }
+
     if is_empty_branch || create {
         // Create new commit
         if !has_staged {
-            bail!("No staged changes to commit. Use -a to stage all changes.");
+            anyhow::bail!("No staged changes to commit. Use -a to stage all changes.");
         }
     } else {
         // Amend existing commit
@@ -196,7 +214,8 @@ pub fn modify(
     let mut journal = Journal::new("modify");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Record old tip for journal
@@ -218,9 +237,9 @@ pub fn modify(
         OpState::remove(&paths)?;
 
         if !has_staged && !commit_args.contains(&"--amend") {
-            bail!("No staged changes to commit");
+            anyhow::bail!("No staged changes to commit");
         }
-        bail!("git commit failed");
+        anyhow::bail!("git commit failed");
     }
 
     // Get new tip

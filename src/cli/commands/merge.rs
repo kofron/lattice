@@ -24,8 +24,10 @@
 //! ```
 
 use crate::cli::args::MergeMethodArg;
+use crate::engine::gate::requirements;
 use crate::engine::Context;
-use anyhow::{bail, Result};
+use crate::git::Git;
+use anyhow::{bail, Context as _, Result};
 
 /// Run the merge command.
 ///
@@ -36,6 +38,16 @@ pub fn merge(
     dry_run: bool,
     method: Option<MergeMethodArg>,
 ) -> Result<()> {
+    // Pre-flight gating check (merge uses REMOTE_BARE_ALLOWED since it doesn't modify local)
+    let cwd = ctx
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    crate::engine::runner::check_requirements(&git, &requirements::REMOTE_BARE_ALLOWED)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(merge_async(ctx, confirm, dry_run, method))
 }

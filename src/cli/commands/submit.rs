@@ -55,6 +55,7 @@
 use crate::core::metadata::schema::{BaseInfo, FreezeState, FREEZE_REASON_SYNTHETIC_SNAPSHOT};
 use crate::core::metadata::store::MetadataStore;
 use crate::core::types::{BranchName, Oid};
+use crate::engine::gate::requirements;
 use crate::engine::scan::RepoSnapshot;
 use crate::engine::Context;
 use crate::git::Git;
@@ -225,6 +226,21 @@ pub fn submit(
         view,
     };
 
+    // Pre-flight gating check (use REMOTE_BARE_ALLOWED if --no-restack, else REMOTE)
+    let cwd = ctx
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    let reqs = if no_restack {
+        &requirements::REMOTE_BARE_ALLOWED
+    } else {
+        &requirements::REMOTE
+    };
+    crate::engine::runner::check_requirements(&git, reqs)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     // Use tokio runtime to run async code
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(submit_async(ctx, opts))
@@ -342,11 +358,14 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
         if !ctx.quiet {
             println!("Pushing '{}'...", branch);
         }
-        let push_args = if opts.force {
-            vec!["push", "--force-with-lease", "origin", branch.as_str()]
-        } else {
-            vec!["push", "origin", branch.as_str()]
-        };
+        let mut push_args = vec!["push"];
+        if !ctx.verify {
+            push_args.push("--no-verify");
+        }
+        if opts.force {
+            push_args.push("--force-with-lease");
+        }
+        push_args.extend(["origin", branch.as_str()]);
         let push_result = std::process::Command::new("git")
             .args(&push_args)
             .current_dir(&cwd)

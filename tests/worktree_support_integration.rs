@@ -404,7 +404,8 @@ mod shared_state {
         let op_id = journal.op_id.clone();
         journal.write(&main_paths).expect("failed to write journal");
 
-        let state = OpState::from_journal(&journal, &main_paths, main_info.work_dir.clone());
+        #[allow(deprecated)]
+        let state = OpState::from_journal_legacy(&journal, &main_paths, main_info.work_dir.clone());
         state.write(&main_paths).expect("failed to write op-state");
 
         // Read from worktree - should see the same state
@@ -444,7 +445,8 @@ mod shared_state {
         let journal = Journal::new("test-command".to_string());
         journal.write(&main_paths).expect("failed to write journal");
 
-        let state = OpState::from_journal(&journal, &main_paths, main_info.work_dir.clone());
+        #[allow(deprecated)]
+        let state = OpState::from_journal_legacy(&journal, &main_paths, main_info.work_dir.clone());
         state.write(&main_paths).expect("failed to write op-state");
 
         // Check origin from main - should succeed

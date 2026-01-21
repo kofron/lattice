@@ -735,35 +735,34 @@ impl Git {
         }
     }
 
-    /// Read rebase progress from .git/rebase-merge or .git/rebase-apply.
+    /// Read rebase progress using git2's Rebase API.
+    ///
+    /// Returns (current_step, total_steps) if a rebase is in progress.
+    /// Uses git2's type-safe API instead of reading .git internal files,
+    /// per ARCHITECTURE.md Section 10.1 "Single Git interface".
     fn read_rebase_progress(&self) -> (Option<usize>, Option<usize>) {
-        let git_dir = self.repo.path();
-
-        // Try rebase-merge first (interactive rebase)
-        let rebase_merge = git_dir.join("rebase-merge");
-        if rebase_merge.exists() {
-            let current = std::fs::read_to_string(rebase_merge.join("msgnum"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok());
-            let total = std::fs::read_to_string(rebase_merge.join("end"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok());
-            return (current, total);
+        // Only attempt if we're in a rebase state (already checked by caller,
+        // but defensive check here too)
+        let state = self.repo.state();
+        if !matches!(
+            state,
+            git2::RepositoryState::Rebase
+                | git2::RepositoryState::RebaseInteractive
+                | git2::RepositoryState::RebaseMerge
+        ) {
+            return (None, None);
         }
 
-        // Try rebase-apply (non-interactive rebase)
-        let rebase_apply = git_dir.join("rebase-apply");
-        if rebase_apply.exists() {
-            let current = std::fs::read_to_string(rebase_apply.join("next"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok());
-            let total = std::fs::read_to_string(rebase_apply.join("last"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok());
-            return (current, total);
+        // Open the existing rebase to query progress
+        match self.repo.open_rebase(None) {
+            Ok(mut rebase) => {
+                let total = rebase.len();
+                // operation_current() returns 0-indexed; convert to 1-indexed for display
+                let current = rebase.operation_current().map(|i| i + 1);
+                (current, Some(total))
+            }
+            Err(_) => (None, None),
         }
-
-        (None, None)
     }
 
     /// Check if there are unresolved conflicts in the index.
@@ -1948,25 +1947,34 @@ impl Git {
 
     /// Read the OID from FETCH_HEAD after a fetch operation.
     ///
-    /// FETCH_HEAD contains the OID of the most recently fetched ref.
+    /// Uses git2's `fetchhead_foreach()` API for type-safe access
+    /// that works correctly in all repository contexts including
+    /// linked worktrees, per ARCHITECTURE.md Section 10.1 "Single Git interface".
     fn read_fetch_head(&self) -> Result<Oid, GitError> {
-        let fetch_head_path = self.repo.path().join("FETCH_HEAD");
-        let content =
-            std::fs::read_to_string(&fetch_head_path).map_err(|e| GitError::Internal {
-                message: format!("failed to read FETCH_HEAD: {}", e),
+        use std::cell::RefCell;
+
+        // Use RefCell to capture result from callback
+        let result_oid: RefCell<Option<Oid>> = RefCell::new(None);
+
+        self.repo
+            .fetchhead_foreach(|_refname, _remote_url, oid, is_merge| {
+                let mut result = result_oid.borrow_mut();
+                // Prefer entries marked for merge; otherwise take first entry
+                if result.is_none() || is_merge {
+                    *result = Oid::new(oid.to_string()).ok();
+                }
+                // Continue iteration until we find a merge entry, then stop
+                result.is_none() || !is_merge
+            })
+            .map_err(|e| GitError::Internal {
+                message: format!("failed to read FETCH_HEAD: {}", e.message()),
             })?;
 
-        // FETCH_HEAD format: <oid> <tab> <info>
-        // We just need the first 40 characters (the OID)
-        let oid_str = content
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().next())
-            .ok_or_else(|| GitError::Internal {
-                message: "FETCH_HEAD is empty or malformed".to_string(),
-            })?;
-
-        Oid::new(oid_str).map_err(|e| e.into())
+        result_oid
+            .into_inner()
+            .ok_or_else(|| GitError::RefNotFound {
+                refname: "FETCH_HEAD".to_string(),
+            })
     }
 }
 

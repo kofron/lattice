@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! squash command - Squash all commits in current branch into one
 //!
 //! Per SPEC.md 8D.7:
@@ -14,7 +17,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{
     check_freeze_affected_set, count_commits_in_range, rebase_onto_with_journal, RebaseOutcome,
@@ -26,6 +29,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::Oid;
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -48,12 +52,16 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -72,7 +80,7 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -122,7 +130,8 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
     let mut journal = Journal::new("squash");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Record old tip
@@ -155,13 +164,18 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git reset --soft failed");
+        anyhow::bail!("git reset --soft failed");
     }
 
     // Create new squashed commit
     if let Some(msg) = message {
+        let mut commit_args = vec!["commit"];
+        if !ctx.verify {
+            commit_args.push("--no-verify");
+        }
+        commit_args.extend(["-m", msg]);
         let status = Command::new("git")
-            .args(["commit", "-m", msg])
+            .args(&commit_args)
             .current_dir(&cwd)
             .status()
             .context("Failed to create squashed commit")?;
@@ -173,10 +187,13 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
                 .current_dir(&cwd)
                 .status();
             OpState::remove(&paths)?;
-            bail!("git commit failed");
+            anyhow::bail!("git commit failed");
         }
     } else if edit {
         let mut commit_args = vec!["commit"];
+        if !ctx.verify {
+            commit_args.push("--no-verify");
+        }
         // Use combined messages as template
         // Write to temp file for editor
         let temp_msg_file = paths.git_dir.join("SQUASH_MSG");
@@ -201,7 +218,7 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
                 .current_dir(&cwd)
                 .status();
             OpState::remove(&paths)?;
-            bail!("git commit failed or was aborted");
+            anyhow::bail!("git commit failed or was aborted");
         }
     } else {
         // Use first commit's message as default
@@ -211,8 +228,13 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
             .unwrap_or("Squashed commits")
             .trim();
 
+        let mut commit_args = vec!["commit"];
+        if !ctx.verify {
+            commit_args.push("--no-verify");
+        }
+        commit_args.extend(["-m", first_msg]);
         let status = Command::new("git")
-            .args(["commit", "-m", first_msg])
+            .args(&commit_args)
             .current_dir(&cwd)
             .status()
             .context("Failed to create squashed commit")?;
@@ -224,7 +246,7 @@ pub fn squash(ctx: &Context, message: Option<&str>, edit: bool) -> Result<()> {
                 .current_dir(&cwd)
                 .status();
             OpState::remove(&paths)?;
-            bail!("git commit failed");
+            anyhow::bail!("git commit failed");
         }
     }
 

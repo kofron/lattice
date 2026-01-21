@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! fold command - Merge current branch into parent and delete
 //!
 //! Per SPEC.md 8D.8:
@@ -14,7 +17,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{check_freeze_affected_set, reparent_children};
 use crate::core::metadata::schema::BranchInfo;
@@ -23,6 +26,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::BranchName;
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -44,12 +48,16 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
         );
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -68,7 +76,7 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -90,7 +98,7 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
     // Cannot fold into trunk (trunk is special)
     if &parent_name == trunk {
-        bail!("Cannot fold into trunk. Use 'lattice merge' instead.");
+        anyhow::bail!("Cannot fold into trunk. Use 'lattice merge' instead.");
     }
 
     // Build list of branches to check for freeze
@@ -119,7 +127,8 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
     let mut journal = Journal::new("fold");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Get current and parent tips
@@ -142,26 +151,31 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git checkout failed");
+        anyhow::bail!("git checkout failed");
     }
 
     // Merge current into parent (fast-forward if possible, otherwise create merge commit)
+    let mut merge_args = vec!["merge"];
+    if !ctx.verify {
+        merge_args.push("--no-verify");
+    }
+    merge_args.extend(["--ff", current.as_str()]);
     let status = Command::new("git")
-        .args(["merge", "--ff", current.as_str()])
+        .args(&merge_args)
         .current_dir(&cwd)
         .status()
         .context("Failed to merge")?;
 
     if !status.success() {
         // Try with merge commit
+        let merge_msg = format!("Fold '{}' into '{}'", current, parent_name);
+        let mut merge_args = vec!["merge"];
+        if !ctx.verify {
+            merge_args.push("--no-verify");
+        }
+        merge_args.extend(["--no-ff", "-m", &merge_msg, current.as_str()]);
         let status = Command::new("git")
-            .args([
-                "merge",
-                "--no-ff",
-                "-m",
-                &format!("Fold '{}' into '{}'", current, parent_name),
-                current.as_str(),
-            ])
+            .args(&merge_args)
             .current_dir(&cwd)
             .status()
             .context("Failed to merge")?;
@@ -173,7 +187,7 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
                 .current_dir(&cwd)
                 .status();
             OpState::remove(&paths)?;
-            bail!("git merge failed");
+            anyhow::bail!("git merge failed");
         }
     }
 
@@ -215,7 +229,7 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git branch -D failed");
+        anyhow::bail!("git branch -D failed");
     }
 
     journal.record_ref_update(
@@ -250,7 +264,7 @@ pub fn fold(ctx: &Context, keep: bool) -> Result<()> {
 
         if !status.success() {
             OpState::remove(&paths)?;
-            bail!("git branch -m failed");
+            anyhow::bail!("git branch -m failed");
         }
 
         // Get current parent OID (after merge)

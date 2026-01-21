@@ -10,6 +10,7 @@
 //! - `--cwd <path>`: Run as if in that directory
 //! - `--debug`: Enable debug logging
 //! - `--interactive` / `--no-interactive`: Control prompts
+//! - `--verify` / `--no-verify`: Control git hook execution
 //! - `--quiet` / `-q`: Minimal output
 
 use clap::{Parser, Subcommand};
@@ -40,6 +41,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_interactive: bool,
 
+    /// Enable git hook verification (default behavior)
+    #[arg(long, global = true, conflicts_with = "no_verify")]
+    pub verify: bool,
+
+    /// Disable git hook verification
+    #[arg(long, global = true)]
+    pub no_verify: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -63,6 +72,22 @@ impl Cli {
         } else {
             // Default: interactive if stdin is a TTY
             atty_check()
+        }
+    }
+
+    /// Determine if git hook verification is explicitly set.
+    ///
+    /// Returns:
+    /// - `Some(true)` if `--verify` was explicitly set
+    /// - `Some(false)` if `--no-verify` was explicitly set
+    /// - `None` if neither was specified (use default from config or true)
+    pub fn verify_flag(&self) -> Option<bool> {
+        if self.verify {
+            Some(true)
+        } else if self.no_verify {
+            Some(false)
+        } else {
+            None
         }
     }
 }
@@ -1533,4 +1558,27 @@ pub enum Shell {
     Zsh,
     Fish,
     PowerShell,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_flag_returns_some_true_when_verify_set() {
+        let cli = Cli::parse_from(["lt", "--verify", "log"]);
+        assert_eq!(cli.verify_flag(), Some(true));
+    }
+
+    #[test]
+    fn verify_flag_returns_some_false_when_no_verify_set() {
+        let cli = Cli::parse_from(["lt", "--no-verify", "log"]);
+        assert_eq!(cli.verify_flag(), Some(false));
+    }
+
+    #[test]
+    fn verify_flag_returns_none_when_neither_set() {
+        let cli = Cli::parse_from(["lt", "log"]);
+        assert_eq!(cli.verify_flag(), None);
+    }
 }

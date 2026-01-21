@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! phase3_helpers - Shared helpers for Phase 3 commands
 //!
 //! This module provides reusable functions for the Phase 3 advanced
@@ -113,7 +116,7 @@ pub fn check_freeze(branch: &BranchName, snapshot: &RepoSnapshot) -> Result<()> 
 /// * `journal` - Journal for recording state
 /// * `remaining_branches` - Branches remaining to process after this one
 /// * `paths` - LatticePaths for repository paths
-/// * `_ctx` - Execution context (for quiet/debug flags)
+/// * `ctx` - Execution context (for quiet/debug/verify flags)
 ///
 /// # Returns
 ///
@@ -130,7 +133,7 @@ pub fn rebase_onto_with_journal(
     journal: &mut Journal,
     remaining_branches: Vec<String>,
     paths: &LatticePaths,
-    _ctx: &Context,
+    ctx: &Context,
 ) -> Result<RebaseOutcome> {
     // Record checkpoint before rebase
     journal.record_checkpoint(format!("rebase-{}", branch));
@@ -152,14 +155,18 @@ pub fn rebase_onto_with_journal(
     );
 
     // Run git rebase
+    let mut rebase_args = vec!["rebase"];
+    if !ctx.verify {
+        rebase_args.push("--no-verify");
+    }
+    rebase_args.extend([
+        "--onto",
+        new_base.as_str(),
+        old_base.as_str(),
+        branch.as_str(),
+    ]);
     let status = Command::new("git")
-        .args([
-            "rebase",
-            "--onto",
-            new_base.as_str(),
-            old_base.as_str(),
-            branch.as_str(),
-        ])
+        .args(&rebase_args)
         .current_dir(cwd)
         .status()
         .context("Failed to run git rebase")?;
@@ -185,7 +192,8 @@ pub fn rebase_onto_with_journal(
             journal.pause();
             journal.write(paths)?;
 
-            let mut op_state = OpState::from_journal(journal, paths, None);
+            #[allow(deprecated)]
+            let mut op_state = OpState::from_journal_legacy(journal, paths, None);
             op_state.phase = OpPhase::Paused;
             op_state.write(paths)?;
 

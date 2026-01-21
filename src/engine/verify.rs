@@ -102,6 +102,13 @@ pub enum VerifyError {
     /// Git operation failed during verification.
     #[error("git error during verification: {0}")]
     Git(String),
+
+    /// Scan failed during verification.
+    ///
+    /// This can occur when the executor's post-verification attempts
+    /// to re-scan the repository after execution.
+    #[error("scan failed during verification: {0}")]
+    ScanFailed(String),
 }
 
 /// Fast verification of core invariants.

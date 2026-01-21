@@ -34,8 +34,10 @@
 //! lattice sync --no-restack
 //! ```
 
+use crate::engine::gate::requirements;
 use crate::engine::Context;
-use anyhow::{bail, Result};
+use crate::git::Git;
+use anyhow::{bail, Context as _, Result};
 
 use super::stack_comment_ops::update_stack_comments_for_branches;
 
@@ -43,6 +45,21 @@ use super::stack_comment_ops::update_stack_comments_for_branches;
 ///
 /// This is a synchronous wrapper that uses tokio to run the async implementation.
 pub fn sync(ctx: &Context, force: bool, restack: bool) -> Result<()> {
+    // Pre-flight gating check (use REMOTE_BARE_ALLOWED if not restacking, else REMOTE)
+    let cwd = ctx
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    let reqs = if restack {
+        &requirements::REMOTE
+    } else {
+        &requirements::REMOTE_BARE_ALLOWED
+    };
+    crate::engine::runner::check_requirements(&git, reqs)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(sync_async(ctx, force, restack))
 }
@@ -127,9 +144,15 @@ async fn sync_async(ctx: &Context, force: bool, restack: bool) -> Result<()> {
                 bail!("git checkout failed");
             }
 
+            let remote_ref = format!("origin/{}", trunk);
+            let mut merge_args = vec!["merge"];
+            if !ctx.verify {
+                merge_args.push("--no-verify");
+            }
+            merge_args.extend(["--ff-only", &remote_ref]);
             let merge_status = Command::new("git")
                 .current_dir(&cwd)
-                .args(["merge", "--ff-only", &format!("origin/{}", trunk)])
+                .args(&merge_args)
                 .status()?;
 
             if !merge_status.success() {

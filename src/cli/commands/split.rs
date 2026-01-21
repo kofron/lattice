@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! split command - Split current branch
 //!
 //! Per SPEC.md 8D.6:
@@ -15,7 +18,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{check_freeze, get_commits_in_range};
 use crate::core::metadata::schema::{
@@ -27,6 +30,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Oid, UtcTimestamp};
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -49,7 +53,7 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
@@ -58,12 +62,16 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
 
     // Validate flags
     if !by_commit && by_file.is_empty() {
-        bail!("Must specify --by-commit or --by-file <paths>");
+        anyhow::bail!("Must specify --by-commit or --by-file <paths>");
     }
 
     if by_commit && !by_file.is_empty() {
-        bail!("Cannot use both --by-commit and --by-file");
+        anyhow::bail!("Cannot use both --by-commit and --by-file");
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -82,7 +90,7 @@ pub fn split(ctx: &Context, by_commit: bool, by_file: Vec<String>) -> Result<()>
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -172,8 +180,9 @@ fn split_by_commit(
     // Create journal
     let mut journal = Journal::new("split");
 
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, paths, None);
+    // Write op-state (legacy: split doesn't use executor pattern yet)
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, paths, None);
     op_state.write(paths)?;
 
     let store = MetadataStore::new(git);
@@ -205,7 +214,7 @@ fn split_by_commit(
 
     if !status.success() {
         OpState::remove(paths)?;
-        bail!("git checkout --detach failed");
+        anyhow::bail!("git checkout --detach failed");
     }
 
     for (i, commit) in commits.iter().enumerate() {
@@ -234,7 +243,7 @@ fn split_by_commit(
 
         if !status.success() {
             OpState::remove(paths)?;
-            bail!("git branch -f failed for '{}'", branch_name);
+            anyhow::bail!("git branch -f failed for '{}'", branch_name);
         }
 
         journal.record_ref_update(
@@ -375,13 +384,13 @@ fn split_by_file(
         .context("Failed to get file diff")?;
 
     if !output.status.success() {
-        bail!("git diff failed");
+        anyhow::bail!("git diff failed");
     }
 
     let file_diff = String::from_utf8_lossy(&output.stdout).to_string();
 
     if file_diff.trim().is_empty() {
-        bail!("No changes to specified files in this branch");
+        anyhow::bail!("No changes to specified files in this branch");
     }
 
     // Get diff for remaining files
@@ -410,8 +419,9 @@ fn split_by_file(
     // Create journal
     let mut journal = Journal::new("split");
 
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, paths, None);
+    // Write op-state (legacy: split doesn't use executor pattern yet)
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, paths, None);
     op_state.write(paths)?;
 
     let store = MetadataStore::new(git);
@@ -422,7 +432,7 @@ fn split_by_file(
     // Check if new branch name already exists
     if snapshot.branches.contains_key(&new_branch_name) {
         OpState::remove(paths)?;
-        bail!("Branch '{}' already exists", new_branch_name);
+        anyhow::bail!("Branch '{}' already exists", new_branch_name);
     }
 
     // Get parent info
@@ -446,7 +456,7 @@ fn split_by_file(
 
     if !status.success() {
         OpState::remove(paths)?;
-        bail!("git checkout -b failed");
+        anyhow::bail!("git checkout -b failed");
     }
 
     journal.record_ref_update(
@@ -488,23 +498,25 @@ fn split_by_file(
             .current_dir(cwd)
             .status();
         OpState::remove(paths)?;
-        bail!("Failed to apply file changes: {}", stderr);
+        anyhow::bail!("Failed to apply file changes: {}", stderr);
     }
 
     // Commit the changes
+    let commit_msg = format!("Split from '{}': changes to {:?}", current, files);
+    let mut commit_args = vec!["commit"];
+    if !ctx.verify {
+        commit_args.push("--no-verify");
+    }
+    commit_args.extend(["-m", &commit_msg]);
     let status = Command::new("git")
-        .args([
-            "commit",
-            "-m",
-            &format!("Split from '{}': changes to {:?}", current, files),
-        ])
+        .args(&commit_args)
         .current_dir(cwd)
         .status()
         .context("Failed to commit")?;
 
     if !status.success() {
         OpState::remove(paths)?;
-        bail!("git commit failed");
+        anyhow::bail!("git commit failed");
     }
 
     // Get new branch tip
@@ -562,7 +574,7 @@ fn split_by_file(
         .status()?;
 
     if !status.success() {
-        bail!("Failed to checkout original branch");
+        anyhow::bail!("Failed to checkout original branch");
     }
 
     // Reset to base
@@ -572,7 +584,7 @@ fn split_by_file(
         .status()?;
 
     if !status.success() {
-        bail!("git reset failed");
+        anyhow::bail!("git reset failed");
     }
 
     // Apply remaining diff if any
@@ -593,8 +605,13 @@ fn split_by_file(
 
         if output.status.success() {
             // Commit remaining changes
+            let mut commit_args = vec!["commit"];
+            if !ctx.verify {
+                commit_args.push("--no-verify");
+            }
+            commit_args.extend(["-m", "Remaining changes after split"]);
             let status = Command::new("git")
-                .args(["commit", "-m", "Remaining changes after split"])
+                .args(&commit_args)
                 .current_dir(cwd)
                 .status()?;
 

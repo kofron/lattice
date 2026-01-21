@@ -1,3 +1,6 @@
+// Legacy journal API - these commands will be migrated to executor pattern
+#![allow(deprecated)]
+
 //! pop command - Delete branch but keep changes uncommitted
 //!
 //! Per SPEC.md 8D.9:
@@ -14,7 +17,7 @@
 
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
 use crate::cli::commands::phase3_helpers::{
     check_freeze_affected_set, get_net_diff, is_working_tree_clean, reparent_children,
@@ -24,6 +27,7 @@ use crate::core::ops::journal::{Journal, OpState};
 use crate::core::ops::lock::RepoLock;
 use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Oid};
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -44,7 +48,7 @@ pub fn pop(ctx: &Context) -> Result<()> {
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
+        anyhow::bail!(
             "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
             op_state.command,
             op_state.op_id
@@ -53,8 +57,12 @@ pub fn pop(ctx: &Context) -> Result<()> {
 
     // Require clean working tree
     if !is_working_tree_clean(&cwd)? {
-        bail!("Working tree is not clean. Commit or stash your changes first.");
+        anyhow::bail!("Working tree is not clean. Commit or stash your changes first.");
     }
+
+    // Pre-flight gating check
+    crate::engine::runner::check_requirements(&git, &requirements::MUTATING)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
@@ -73,7 +81,7 @@ pub fn pop(ctx: &Context) -> Result<()> {
 
     // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -130,7 +138,8 @@ pub fn pop(ctx: &Context) -> Result<()> {
     let mut journal = Journal::new("pop");
 
     // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+    #[allow(deprecated)]
+    let op_state = OpState::from_journal_legacy(&journal, &paths, info.work_dir.clone());
     op_state.write(&paths)?;
 
     // Reparent children first (before we delete)
@@ -153,7 +162,7 @@ pub fn pop(ctx: &Context) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git checkout failed");
+        anyhow::bail!("git checkout failed");
     }
 
     // Delete current branch
@@ -165,7 +174,7 @@ pub fn pop(ctx: &Context) -> Result<()> {
 
     if !status.success() {
         OpState::remove(&paths)?;
-        bail!("git branch -D failed");
+        anyhow::bail!("git branch -D failed");
     }
 
     journal.record_ref_update(

@@ -1,9 +1,15 @@
 //! init command - Initialize Lattice in this repository
+//!
+//! # Gating
+//!
+//! Uses `requirements::MINIMAL` (just `RepoOpen`) - this is the command that
+//! sets up trunk configuration, so it can't require `TrunkKnown`.
 
 use crate::core::config::{Config, RepoConfig};
 use crate::core::metadata::store::MetadataStore;
 use crate::core::types::BranchName;
-use crate::engine::scan::scan;
+use crate::engine::gate::requirements;
+use crate::engine::runner::{run_gated, RunError};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
@@ -17,15 +23,19 @@ use std::io::{self, Write};
 /// * `trunk` - Set trunk branch
 /// * `reset` - Clear all metadata and reconfigure
 /// * `force` - Skip confirmation prompts
+///
+/// # Gating
+///
+/// Uses `requirements::MINIMAL` since trunk may not be configured yet.
 pub fn init(ctx: &Context, trunk: Option<&str>, reset: bool, force: bool) -> Result<()> {
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let git_dir = git.git_dir();
+    let git_dir = git.git_dir().to_path_buf();
 
-    // Check if already initialized
+    // Check if already initialized (before gating - this is a quick file check)
     let config_path = git_dir.join("lattice/config.toml");
     let already_initialized = config_path.exists();
 
@@ -37,7 +47,7 @@ pub fn init(ctx: &Context, trunk: Option<&str>, reset: bool, force: bool) -> Res
         return Ok(());
     }
 
-    // Handle reset
+    // Handle reset - this needs gating
     if reset {
         if !force && ctx.interactive {
             print!("This will delete all branch metadata. Continue? [y/N] ");
@@ -77,83 +87,126 @@ pub fn init(ctx: &Context, trunk: Option<&str>, reset: bool, force: bool) -> Res
         }
     }
 
-    // Determine trunk branch
-    let trunk_name = if let Some(name) = trunk {
-        // Validate branch exists
-        let branch = BranchName::new(name).context("Invalid trunk branch name")?;
-        let snapshot = scan(&git).context("Failed to scan repository")?;
-        if !snapshot.branches.contains_key(&branch) {
-            bail!("Branch '{}' does not exist", name);
-        }
-        branch
-    } else if ctx.interactive {
-        // Interactive selection
-        let snapshot = scan(&git).context("Failed to scan repository")?;
-        let branches: Vec<_> = snapshot.branches.keys().collect();
+    // Run through gating with MINIMAL requirements (just RepoOpen)
+    run_gated(&git, ctx, &requirements::MINIMAL, |ready| {
+        let snapshot = &ready.snapshot;
 
-        if branches.is_empty() {
-            bail!("No branches found in repository");
-        }
+        // Determine trunk branch
+        let trunk_name = if let Some(name) = trunk {
+            // Validate branch exists
+            let branch = BranchName::new(name).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Invalid trunk branch name: {}",
+                    e
+                )))
+            })?;
+            if !snapshot.branches.contains_key(&branch) {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    format!("Branch '{}' does not exist", name),
+                )));
+            }
+            branch
+        } else if ctx.interactive {
+            // Interactive selection
+            let branches: Vec<_> = snapshot.branches.keys().collect();
 
-        println!("Select trunk branch:");
-        for (i, branch) in branches.iter().enumerate() {
-            println!("  {}. {}", i + 1, branch);
-        }
-        print!("Enter number [1]: ");
-        io::stdout().flush()?;
+            if branches.is_empty() {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    "No branches found in repository".to_string(),
+                )));
+            }
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+            println!("Select trunk branch:");
+            for (i, branch) in branches.iter().enumerate() {
+                println!("  {}. {}", i + 1, branch);
+            }
+            print!("Enter number [1]: ");
+            io::stdout().flush().map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to flush stdout: {}",
+                    e
+                )))
+            })?;
 
-        let idx = if input.is_empty() {
-            0
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to read input: {}",
+                    e
+                )))
+            })?;
+            let input = input.trim();
+
+            let idx = if input.is_empty() {
+                0
+            } else {
+                input.parse::<usize>().map_err(|_| {
+                    RunError::Scan(crate::engine::scan::ScanError::Internal(
+                        "Invalid selection".to_string(),
+                    ))
+                })?.saturating_sub(1)
+            };
+
+            if idx >= branches.len() {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    "Invalid selection".to_string(),
+                )));
+            }
+
+            branches[idx].clone()
         } else {
-            input
-                .parse::<usize>()
-                .context("Invalid selection")?
-                .saturating_sub(1)
+            // Default to main or master
+            if let Some(main) = snapshot.branches.keys().find(|b| b.as_str() == "main") {
+                main.clone()
+            } else if let Some(master) = snapshot.branches.keys().find(|b| b.as_str() == "master") {
+                master.clone()
+            } else {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    "No trunk specified and could not find 'main' or 'master' branch. Use --trunk to specify.".to_string()
+                )));
+            }
         };
 
-        if idx >= branches.len() {
-            bail!("Invalid selection");
+        // Create config directory
+        let lattice_dir = git_dir.join("lattice");
+        std::fs::create_dir_all(&lattice_dir).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to create .git/lattice directory: {}",
+                e
+            )))
+        })?;
+
+        // Write config
+        let config = RepoConfig {
+            trunk: Some(trunk_name.to_string()),
+            ..Default::default()
+        };
+        Config::write_repo(&cwd, &config).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to write config: {}",
+                e
+            )))
+        })?;
+
+        if !ctx.quiet {
+            println!("Initialized Lattice with trunk: {}", trunk_name);
         }
 
-        branches[idx].clone()
-    } else {
-        // Default to main or master
-        let snapshot = scan(&git).context("Failed to scan repository")?;
-        if let Some(main) = snapshot.branches.keys().find(|b| b.as_str() == "main") {
-            main.clone()
-        } else if let Some(master) = snapshot.branches.keys().find(|b| b.as_str() == "master") {
-            master.clone()
-        } else {
-            bail!("No trunk specified and could not find 'main' or 'master' branch. Use --trunk to specify.");
+        Ok(trunk_name)
+    })
+    .map(|trunk_name| {
+        // Show bootstrap hint after successful init (non-fatal, skip on reset)
+        // Per Milestone 5.6: hint is purely informational and never blocks init
+        if !reset && !ctx.quiet {
+            show_bootstrap_hint_sync(&git, &trunk_name);
         }
-    };
-
-    // Create config directory
-    let lattice_dir = git_dir.join("lattice");
-    std::fs::create_dir_all(&lattice_dir).context("Failed to create .git/lattice directory")?;
-
-    // Write config
-    let config = RepoConfig {
-        trunk: Some(trunk_name.to_string()),
-        ..Default::default()
-    };
-    Config::write_repo(&cwd, &config).context("Failed to write config")?;
-
-    if !ctx.quiet {
-        println!("Initialized Lattice with trunk: {}", trunk_name);
-    }
-
-    // Show bootstrap hint after successful init (non-fatal, skip on reset)
-    // Per Milestone 5.6: hint is purely informational and never blocks init
-    if !reset && !ctx.quiet {
-        show_bootstrap_hint_sync(&git);
-    }
-
-    Ok(())
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Show a hint about open PRs that can be imported via `lattice doctor`.
@@ -168,7 +221,7 @@ pub fn init(ctx: &Context, trunk: Option<&str>, reset: bool, force: bool) -> Res
 /// - Auth-gated: Only shown when GitHub auth is available
 /// - Lightweight: Uses small limit (10) to quickly detect presence of PRs
 /// - No mutations: Only reads remote state, never writes anything
-fn show_bootstrap_hint_sync(git: &Git) {
+fn show_bootstrap_hint_sync(git: &Git, _trunk: &BranchName) {
     // Build a minimal tokio runtime for the async hint check
     // This is acceptable because:
     // 1. It's a one-shot operation at the end of init
@@ -219,13 +272,15 @@ async fn try_show_bootstrap_hint(git: &Git) -> Result<()> {
     let (owner, repo) =
         parse_github_url(&remote_url).ok_or_else(|| anyhow::anyhow!("not a GitHub remote"))?;
 
-    // Get a bearer token for API calls
+    // Create forge with TokenProvider for automatic refresh
+    use std::sync::Arc;
+
     let store = crate::secrets::create_store(crate::secrets::DEFAULT_PROVIDER)?;
     let auth_manager = crate::auth::GitHubAuthManager::new("github.com", store);
-    let token = auth_manager.bearer_token().await?;
+    let provider: Arc<dyn TokenProvider> = Arc::new(auth_manager);
 
     // Create forge and check for open PRs (small limit for quick detection)
-    let forge = GitHubForge::new(token, owner, repo);
+    let forge = GitHubForge::new_with_provider(provider, owner, repo);
     let opts = ListPullsOpts::with_limit(10);
     let result = forge.list_open_prs(opts).await?;
 
