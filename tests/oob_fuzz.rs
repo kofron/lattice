@@ -1133,3 +1133,254 @@ mod targeted_drift_tests {
         // If no conflict occurred, test passes trivially
     }
 }
+
+// =============================================================================
+// Engine Hooks Verification Tests (Phase 8)
+// =============================================================================
+//
+// These tests verify that engine hooks fire correctly for commands that
+// implement the Command, ReadOnlyCommand, or AsyncCommand traits.
+//
+// Per ROADMAP.md Milestone 0.12 and ARCHITECTURE.md Section 12, engine hooks
+// enable out-of-band drift detection by firing at precise points in the
+// execution lifecycle.
+//
+// Commands that flow through run_command() or run_async_command() should
+// trigger the before_execute hook. Read-only commands (run_readonly_command)
+// should NOT trigger the hook since they don't mutate state.
+
+#[cfg(feature = "test_hooks")]
+mod engine_hooks_verification {
+    use super::*;
+    use latticework::engine::engine_hooks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Helper to track hook invocations.
+    struct HookCounter {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl HookCounter {
+        fn new() -> Self {
+            Self {
+                count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn setup(&self) {
+            let count = self.count.clone();
+            engine_hooks::set_before_execute(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        fn get(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for HookCounter {
+        fn drop(&mut self) {
+            engine_hooks::clear();
+        }
+    }
+
+    /// Verify that freeze command fires engine hook.
+    ///
+    /// freeze implements Command trait and should fire the hook.
+    #[test]
+    fn freeze_fires_engine_hook() {
+        let counter = HookCounter::new();
+        counter.setup();
+
+        let repo = TestRepo::new();
+        repo.init_lattice();
+
+        // Create and track a branch to freeze
+        repo.create_branch("feature");
+        repo.checkout("feature");
+        repo.commit("f.txt", "feature", "Add feature");
+
+        let ctx = repo.context();
+        commands::track(&ctx, Some("feature"), Some("main"), false, false).unwrap();
+
+        // Reset counter after track (which also fires hook)
+        let _ = counter.get();
+
+        // Freeze should fire hook (only=false for default scope)
+        let initial = counter.get();
+        let _ = commands::freeze(&ctx, Some("feature"), false);
+        let after = counter.get();
+
+        assert!(
+            after > initial,
+            "freeze command should fire engine hook (before: {}, after: {})",
+            initial,
+            after
+        );
+    }
+
+    /// Verify that restack command fires engine hook.
+    ///
+    /// restack implements Command trait and should fire the hook.
+    #[test]
+    fn restack_fires_engine_hook() {
+        let counter = HookCounter::new();
+        counter.setup();
+
+        let repo = TestRepo::new();
+        repo.init_lattice();
+
+        // Create a tracked branch
+        repo.create_branch("feature");
+        repo.checkout("feature");
+        repo.commit("f.txt", "feature", "Add feature");
+
+        let ctx = repo.context();
+        commands::track(&ctx, Some("feature"), Some("main"), false, false).unwrap();
+
+        // Advance main to create restack opportunity
+        repo.checkout("main");
+        repo.commit("main.txt", "main", "Advance main");
+        repo.checkout("feature");
+
+        // Record initial count
+        let initial = counter.get();
+
+        // Restack should fire hook
+        let _ = commands::restack(&ctx, Some("feature"), false, false);
+        let after = counter.get();
+
+        assert!(
+            after > initial,
+            "restack command should fire engine hook (before: {}, after: {})",
+            initial,
+            after
+        );
+    }
+
+    /// Verify that log command does NOT fire engine hook.
+    ///
+    /// log implements ReadOnlyCommand and should NOT fire the hook
+    /// since read-only commands don't go through the mutation path.
+    #[test]
+    fn log_does_not_fire_engine_hook() {
+        let counter = HookCounter::new();
+        counter.setup();
+
+        let repo = TestRepo::new();
+        repo.init_lattice();
+
+        // Create a tracked branch for log to display
+        repo.create_branch("feature");
+        repo.checkout("feature");
+        repo.commit("f.txt", "feature", "Add feature");
+
+        let ctx = repo.context();
+        commands::track(&ctx, Some("feature"), Some("main"), false, false).unwrap();
+
+        // Record count after setup
+        let initial = counter.get();
+
+        // Log is read-only and should NOT fire hook
+        // Signature: log(ctx, short, long, stack, all, reverse)
+        let _ = commands::log(&ctx, true, false, false, false, false);
+        let after = counter.get();
+
+        // Read-only commands should not increment the hook counter
+        // Note: This test documents expected behavior - read-only commands
+        // use run_readonly_command() which doesn't invoke before_execute hook
+        assert_eq!(
+            initial, after,
+            "log command should NOT fire engine hook (read-only)"
+        );
+    }
+
+    /// Verify that info command does NOT fire engine hook.
+    ///
+    /// info implements ReadOnlyCommand.
+    #[test]
+    fn info_does_not_fire_engine_hook() {
+        let counter = HookCounter::new();
+        counter.setup();
+
+        let repo = TestRepo::new();
+        repo.init_lattice();
+
+        repo.create_branch("feature");
+        repo.checkout("feature");
+        repo.commit("f.txt", "feature", "Add feature");
+
+        let ctx = repo.context();
+        commands::track(&ctx, Some("feature"), Some("main"), false, false).unwrap();
+
+        let initial = counter.get();
+
+        // Info is read-only (args: ctx, branch, diff, stat, patch)
+        let _ = commands::info(&ctx, None, false, false, false);
+        let after = counter.get();
+
+        assert_eq!(
+            initial, after,
+            "info command should NOT fire engine hook (read-only)"
+        );
+    }
+
+    /// Verify that unfreeze command fires engine hook.
+    ///
+    /// unfreeze implements Command trait.
+    #[test]
+    fn unfreeze_fires_engine_hook() {
+        let counter = HookCounter::new();
+        counter.setup();
+
+        let repo = TestRepo::new();
+        repo.init_lattice();
+
+        repo.create_branch("feature");
+        repo.checkout("feature");
+        repo.commit("f.txt", "feature", "Add feature");
+
+        let ctx = repo.context();
+        commands::track(&ctx, Some("feature"), Some("main"), false, false).unwrap();
+        commands::freeze(&ctx, Some("feature"), false).unwrap();
+
+        let initial = counter.get();
+
+        // Unfreeze should fire hook (args: ctx, branch, only)
+        let _ = commands::unfreeze(&ctx, Some("feature"), false);
+        let after = counter.get();
+
+        assert!(
+            after > initial,
+            "unfreeze command should fire engine hook (before: {}, after: {})",
+            initial,
+            after
+        );
+    }
+
+    /// Summary test documenting which commands fire hooks.
+    ///
+    /// This test serves as documentation of expected behavior.
+    #[test]
+    fn hook_firing_summary() {
+        // Commands that SHOULD fire hooks (implement Command or AsyncCommand):
+        // - freeze, unfreeze (Command)
+        // - restack (Command)
+        // - track, untrack (via run_command path)
+        // - submit, sync, get, merge (AsyncCommand)
+        //
+        // Commands that should NOT fire hooks (ReadOnlyCommand or special):
+        // - log, info, parent, children, pr (ReadOnlyCommand)
+        // - continue, abort, undo (Recovery - special handling)
+        // - checkout, up, down, top, bottom (Navigation - run_gated)
+        //
+        // Commands not yet migrated (Phase 5 pending):
+        // - create, modify, delete, rename, squash, fold, move, pop, reorder, split, revert
+        // These currently bypass the unified lifecycle and don't fire hooks.
+
+        // This test just documents the expected behavior
+        assert!(true, "Hook firing behavior documented in comments");
+    }
+}

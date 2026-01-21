@@ -165,6 +165,18 @@ pub enum Event {
         /// Timestamp.
         timestamp: String,
     },
+
+    /// Undo was applied.
+    ///
+    /// Recorded after successfully undoing a previous operation.
+    UndoApplied {
+        /// Operation ID of the operation that was undone.
+        undone_op_id: String,
+        /// Number of refs that were restored.
+        refs_restored: usize,
+        /// Timestamp.
+        timestamp: String,
+    },
 }
 
 impl Event {
@@ -234,12 +246,22 @@ impl Event {
         }
     }
 
+    /// Create an UndoApplied event.
+    pub fn undo_applied(undone_op_id: impl Into<String>, refs_restored: usize) -> Self {
+        Event::UndoApplied {
+            undone_op_id: undone_op_id.into(),
+            refs_restored,
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+
     /// Get the operation ID if this event has one.
     pub fn op_id(&self) -> Option<&str> {
         match self {
             Event::IntentRecorded { op_id, .. } => Some(op_id),
             Event::Committed { op_id, .. } => Some(op_id),
             Event::Aborted { op_id, .. } => Some(op_id),
+            Event::UndoApplied { undone_op_id, .. } => Some(undone_op_id),
             Event::DivergenceObserved { .. } => None,
             Event::DoctorProposed { .. } => None,
             Event::DoctorApplied { .. } => None,

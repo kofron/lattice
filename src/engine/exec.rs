@@ -371,10 +371,15 @@ impl<'a> Executor<'a> {
 
         // Post-execution verification (per ARCHITECTURE.md §6.2)
         // The executor MUST verify invariants after successful execution
+        // Use scoped verification to only check branches touched by this plan
+        let touched_branches = plan.touched_branches();
         if ctx.debug {
-            eprintln!("[debug] Running post-execution verification");
+            eprintln!(
+                "[debug] Running post-execution verification for {} branches",
+                touched_branches.len()
+            );
         }
-        if let Err(verify_error) = self.post_verify() {
+        if let Err(verify_error) = self.post_verify(&touched_branches) {
             if ctx.debug {
                 eprintln!(
                     "[debug] Verification failed: {}, attempting rollback",
@@ -592,18 +597,10 @@ impl<'a> Executor<'a> {
                 // Execute the git command
                 let result = self.git.run_command(args)?;
 
-                if !result.success {
-                    return Ok(StepResult::Abort {
-                        error: format!(
-                            "git {} failed (exit code {}): {}",
-                            args.first().unwrap_or(&String::new()),
-                            result.exit_code,
-                            result.stderr.trim()
-                        ),
-                    });
-                }
-
-                // Check for conflicts after git command (rebase/merge/cherry-pick)
+                // Check for conflicts BEFORE checking success status.
+                // Git rebase/merge/cherry-pick return non-zero exit codes when
+                // conflicts occur, but leave git in a special state we can detect.
+                // We want to pause for user resolution, not abort.
                 let git_state = self.git.state();
                 if git_state.is_in_progress() {
                     // Conflict occurred - need to pause for user resolution
@@ -613,6 +610,18 @@ impl<'a> Executor<'a> {
                         .unwrap_or("unknown")
                         .to_string();
                     return Ok(StepResult::Pause { branch, git_state });
+                }
+
+                // No conflict state, so non-zero exit is a real failure
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git {} failed (exit code {}): {}",
+                            args.first().unwrap_or(&String::new()),
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
                 }
 
                 // Verify expected effects (refs were created/updated as expected)
@@ -728,6 +737,96 @@ impl<'a> Executor<'a> {
 
                 Ok(StepResult::Continue)
             }
+
+            // ================================================================
+            // Forge/Remote Steps (Phase 6)
+            //
+            // These steps interact with remote forges (GitHub, etc.) and
+            // require async execution. The synchronous executor cannot handle
+            // them - they must be executed through the async executor path.
+            //
+            // For now, we return an error if these steps reach the sync executor.
+            // The async command runner will handle these through a separate path.
+            // ================================================================
+            PlanStep::ForgeFetch { remote, .. } => {
+                // Fetch can be done synchronously via git
+                let mut args = vec!["fetch".to_string(), remote.clone()];
+                if let PlanStep::ForgeFetch {
+                    refspec: Some(ref spec),
+                    ..
+                } = step
+                {
+                    args.push(spec.clone());
+                }
+
+                journal.append_git_process(
+                    paths,
+                    args.clone(),
+                    format!("fetch from {}", remote),
+                )?;
+
+                let result = self.git.run_command(&args)?;
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git fetch from '{}' failed (exit code {}): {}",
+                            remote,
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                Ok(StepResult::Continue)
+            }
+
+            PlanStep::ForgePush {
+                branch,
+                force,
+                remote,
+                reason,
+            } => {
+                // Push can be done synchronously via git
+                let mut args = vec!["push".to_string()];
+                if *force {
+                    args.push("--force-with-lease".to_string());
+                }
+                args.push(remote.clone());
+                args.push(branch.clone());
+
+                journal.append_git_process(paths, args.clone(), reason)?;
+
+                let result = self.git.run_command(&args)?;
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git push '{}' to '{}' failed (exit code {}): {}",
+                            branch,
+                            remote,
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                Ok(StepResult::Continue)
+            }
+
+            // The following forge steps require async API calls and cannot
+            // be executed in the synchronous executor. They will be handled
+            // by a separate async execution path in the command runner.
+            PlanStep::ForgeCreatePr { .. }
+            | PlanStep::ForgeUpdatePr { .. }
+            | PlanStep::ForgeDraftToggle { .. }
+            | PlanStep::ForgeRequestReviewers { .. }
+            | PlanStep::ForgeMergePr { .. } => {
+                // These steps require async forge API calls.
+                // For now, return an error - these will be executed through
+                // the async runner which has access to the forge client.
+                Err(ExecuteError::Internal(
+                    "Forge API steps require async execution".to_string(),
+                ))
+            }
         }
     }
 
@@ -737,16 +836,29 @@ impl<'a> Executor<'a> {
     /// after successful execution. This is now self-enforcing - it cannot
     /// be bypassed by callers.
     ///
+    /// # Arguments
+    ///
+    /// * `touched_branches` - Branches that were modified by the plan. If provided,
+    ///   only these branches are verified (scoped verification). If empty, falls
+    ///   back to full repository verification.
+    ///
     /// # Returns
     ///
     /// `Ok(())` if all invariants hold, `Err(VerifyError)` otherwise.
-    fn post_verify(&self) -> Result<(), super::verify::VerifyError> {
+    fn post_verify(
+        &self,
+        touched_branches: &[BranchName],
+    ) -> Result<(), super::verify::VerifyError> {
         // Re-scan repository
         let snapshot = super::scan::scan(self.git)
             .map_err(|e| super::verify::VerifyError::ScanFailed(e.to_string()))?;
 
-        // Run fast verification
-        super::verify::fast_verify(self.git, &snapshot)
+        // Use scoped verification if branches were specified, otherwise full verify
+        if touched_branches.is_empty() {
+            super::verify::fast_verify(self.git, &snapshot)
+        } else {
+            super::verify::verify_branches(self.git, &snapshot, touched_branches)
+        }
     }
 
     /// Attempt to rollback changes using journal.

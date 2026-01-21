@@ -79,9 +79,13 @@ impl HookRepoInfo {
     }
 }
 
+/// Type alias for hook function to reduce complexity.
+type HookFn = Box<dyn Fn(&HookRepoInfo) + Send + Sync>;
+
 /// Container for engine hooks.
 ///
 /// All fields are optional; if None, no action is taken at that hook point.
+#[derive(Default)]
 pub struct EngineHooks {
     /// Called after plan generation, before lock acquisition.
     ///
@@ -89,15 +93,7 @@ pub struct EngineHooks {
     /// failures. The plan has been generated with expected OIDs, but the
     /// lock has NOT been acquired yet. Any mutations here will be detected
     /// by the executor's CAS checks.
-    pub before_execute: Option<Box<dyn Fn(&HookRepoInfo) + Send + Sync>>,
-}
-
-impl Default for EngineHooks {
-    fn default() -> Self {
-        Self {
-            before_execute: None,
-        }
-    }
+    pub before_execute: Option<HookFn>,
 }
 
 thread_local! {

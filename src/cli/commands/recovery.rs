@@ -4,18 +4,37 @@
 //! - `continue`: Resume a paused operation after resolving conflicts
 //! - `abort`: Cancel a paused operation and restore pre-operation state
 //!
-//! Per SPEC.md Section 4.6.5, these must run from the originating worktree
-//! when the operation is paused due to Git conflicts.
+//! # Worktree Origin Validation
+//!
+//! Per SPEC.md Section 4.6.5, these commands must run from the originating
+//! worktree when the operation is paused due to Git conflicts. This is validated
+//! immediately after loading op-state, before any Git operations are attempted.
 //!
 //! # Multi-step Continuation (Milestone 0.5)
 //!
 //! When an operation pauses due to a conflict (e.g., restack with 5 branches
 //! pausing on branch 2), `continue` now:
-//! 1. Completes the immediate git operation (finish the rebase)
-//! 2. Loads remaining steps from the journal
-//! 3. Executes remaining steps in sequence
-//! 4. Handles nested conflicts (pause again if needed)
-//! 5. Clears op-state only after all steps complete
+//! 1. Validates origin worktree (per SPEC.md §4.6.5)
+//! 2. Completes the immediate git operation (finish the rebase)
+//! 3. Loads remaining steps from the journal
+//! 4. Executes remaining steps in sequence
+//! 5. Handles nested conflicts (pause again if needed)
+//! 6. Clears op-state only after all steps complete
+//!
+//! # Forge Step Limitations (Phase 6/7)
+//!
+//! Forge API steps (PR creation, updates, merges) cannot be continued through
+//! the synchronous recovery path. If the operation paused before completing
+//! a forge API step, `continue` will fail with a clear error message guiding
+//! the user to re-run the original command.
+//!
+//! Git-based forge steps (`ForgeFetch`, `ForgePush`) can be continued normally.
+//!
+//! # Remote Operation Warnings
+//!
+//! When aborting an operation that included remote changes (pushes), the abort
+//! command warns the user that remote branches cannot be rolled back. Local refs
+//! are restored, but manual intervention may be needed for remote state.
 
 use crate::core::ops::journal::{AwaitingReason, Journal, OpPhase, OpState, PLAN_SCHEMA_VERSION};
 use crate::core::ops::lock::RepoLock;
@@ -34,10 +53,11 @@ use std::process::Command;
 /// Continue a paused operation after resolving conflicts.
 ///
 /// Per Milestone 0.5, this now properly resumes multi-step operations:
-/// 1. Completes the immediate git operation
-/// 2. Loads and executes remaining steps from the journal
-/// 3. Handles nested conflicts
-/// 4. Only clears op-state after all steps complete
+/// 1. Validates origin worktree (per SPEC.md §4.6.5)
+/// 2. Completes the immediate git operation
+/// 3. Loads and executes remaining steps from the journal
+/// 4. Handles nested conflicts
+/// 5. Only clears op-state after all steps complete
 ///
 /// # Arguments
 ///
@@ -52,6 +72,10 @@ pub fn continue_op(ctx: &Context, all: bool) -> Result<()> {
     let info = git.info()?;
     let paths = LatticePaths::from_repo_info(&info);
 
+    if ctx.debug {
+        eprintln!("[debug] continue: opening repository at {:?}", cwd);
+    }
+
     // Pre-flight gating check (RECOVERY is minimal - just RepoOpen)
     crate::engine::runner::check_requirements(&git, &requirements::RECOVERY)
         .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
@@ -60,12 +84,32 @@ pub fn continue_op(ctx: &Context, all: bool) -> Result<()> {
     let op_state =
         OpState::read(&paths)?.ok_or_else(|| anyhow::anyhow!("No operation in progress"))?;
 
+    if ctx.debug {
+        eprintln!(
+            "[debug] continue: found operation '{}' (phase: {:?})",
+            op_state.command, op_state.phase
+        );
+    }
+
     if op_state.phase != OpPhase::Paused {
         bail!(
             "Operation '{}' is not paused (phase: {:?})",
             op_state.command,
             op_state.phase
         );
+    }
+
+    // Validate origin worktree IMMEDIATELY after loading op-state
+    // Per SPEC.md §4.6.5, continue must run from the originating worktree
+    // when the operation is paused due to Git conflicts.
+    if ctx.debug {
+        eprintln!(
+            "[debug] continue: validating origin worktree (origin={:?}, current={:?})",
+            op_state.origin_git_dir, info.git_dir
+        );
+    }
+    if let Err(msg) = op_state.check_origin_worktree(&info.git_dir) {
+        bail!("{}", msg);
     }
 
     // Verify plan schema version compatibility (SPEC.md §4.6.5)
@@ -240,6 +284,8 @@ fn abort_git_operation(git: &Git, cwd: &Path) -> Result<()> {
 }
 
 /// Roll back ref changes using journal.
+///
+/// Also warns about remote operations that cannot be rolled back.
 fn rollback_refs(
     git: &Git,
     paths: &LatticePaths,
@@ -258,6 +304,22 @@ fn rollback_refs(
             return Ok(RollbackResult::new());
         }
     };
+
+    // Warn about remote operations that cannot be rolled back (Phase 7)
+    if journal.has_remote_operations() {
+        let remote_ops = journal.remote_operation_descriptions();
+        if !remote_ops.is_empty() {
+            eprintln!();
+            eprintln!("Warning: This operation included remote changes that cannot be undone:");
+            for desc in &remote_ops {
+                eprintln!("  - {}", desc);
+            }
+            eprintln!();
+            eprintln!("Local refs will be restored, but remote branches remain as-is.");
+            eprintln!("You may need to force-push or manually revert changes on the remote.");
+            eprintln!();
+        }
+    }
 
     // Check if there are any ref updates to roll back
     let rollback_entries = journal.ref_updates_for_rollback();
@@ -614,6 +676,117 @@ fn execute_single_step(
 
             Ok(ContinueStepResult::Continue)
         }
+
+        // ====================================================================
+        // Forge/Remote Steps (Phase 6)
+        //
+        // These steps may appear in remaining_steps during continuation.
+        // Fetch and Push can be executed synchronously via git commands.
+        // API-based steps (PR creation, etc.) cannot be continued through
+        // the synchronous recovery path.
+        // ====================================================================
+        PlanStep::ForgeFetch { remote, refspec } => {
+            let mut args = vec!["fetch".to_string(), remote.clone()];
+            if let Some(spec) = refspec {
+                args.push(spec.clone());
+            }
+
+            journal.append_git_process(paths, args.clone(), format!("fetch from {}", remote))?;
+
+            let result = git.run_command(&args)?;
+            if !result.success {
+                return Ok(ContinueStepResult::Abort {
+                    error: format!(
+                        "git fetch from '{}' failed (exit code {}): {}",
+                        remote,
+                        result.exit_code,
+                        result.stderr.trim()
+                    ),
+                });
+            }
+
+            Ok(ContinueStepResult::Continue)
+        }
+
+        PlanStep::ForgePush {
+            branch,
+            force,
+            remote,
+            reason,
+        } => {
+            let mut args = vec!["push".to_string()];
+            if *force {
+                args.push("--force-with-lease".to_string());
+            }
+            args.push(remote.clone());
+            args.push(branch.clone());
+
+            journal.append_git_process(paths, args.clone(), reason)?;
+
+            let result = git.run_command(&args)?;
+            if !result.success {
+                return Ok(ContinueStepResult::Abort {
+                    error: format!(
+                        "git push '{}' to '{}' failed (exit code {}): {}",
+                        branch,
+                        remote,
+                        result.exit_code,
+                        result.stderr.trim()
+                    ),
+                });
+            }
+
+            Ok(ContinueStepResult::Continue)
+        }
+
+        // Forge API steps cannot be continued through the sync recovery path.
+        // These require the async command runner with forge client access.
+        // Provide specific, actionable error messages for each step type.
+        PlanStep::ForgeCreatePr { head, base, .. } => Ok(ContinueStepResult::Abort {
+            error: format!(
+                "Cannot continue PR creation for '{}' → '{}' through recovery.\n\
+                 The operation paused before the PR could be created on GitHub.\n\
+                 Please re-run the original command (e.g., 'lattice submit').",
+                head, base
+            ),
+        }),
+
+        PlanStep::ForgeUpdatePr { number, .. } => Ok(ContinueStepResult::Abort {
+            error: format!(
+                "Cannot continue PR update (#{}) through recovery.\n\
+                 The operation paused before the PR could be updated on GitHub.\n\
+                 Please re-run the original command (e.g., 'lattice submit').",
+                number
+            ),
+        }),
+
+        PlanStep::ForgeDraftToggle { number, draft } => Ok(ContinueStepResult::Abort {
+            error: format!(
+                "Cannot continue draft toggle (PR #{} → {}) through recovery.\n\
+                 The operation paused before the PR status could be changed on GitHub.\n\
+                 Please re-run the original command (e.g., 'lattice submit --publish').",
+                number,
+                if *draft { "draft" } else { "ready" }
+            ),
+        }),
+
+        PlanStep::ForgeRequestReviewers { number, .. } => Ok(ContinueStepResult::Abort {
+            error: format!(
+                "Cannot continue reviewer request (PR #{}) through recovery.\n\
+                 The operation paused before reviewers could be requested on GitHub.\n\
+                 Please re-run the original command (e.g., 'lattice submit --reviewers ...').",
+                number
+            ),
+        }),
+
+        PlanStep::ForgeMergePr { number, method } => Ok(ContinueStepResult::Abort {
+            error: format!(
+                "Cannot continue PR merge (#{}, method: {}) through recovery.\n\
+                 The operation paused before the PR could be merged on GitHub.\n\
+                 Please re-run the original command (e.g., 'lattice merge').",
+                number, method
+            ),
+        }),
     }
 }
 

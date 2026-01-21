@@ -148,6 +148,45 @@ pub fn fast_verify(git: &Git, snapshot: &RepoSnapshot) -> Result<(), VerifyError
     Ok(())
 }
 
+/// Verify only a specific set of branches.
+///
+/// This is used for scoped verification after partial operations (like restack)
+/// where only certain branches were modified. Verifying the entire repository
+/// would fail on branches that are now "stale" but weren't touched.
+///
+/// # Arguments
+///
+/// * `git` - Git interface for ancestry checks
+/// * `snapshot` - Current repository snapshot
+/// * `branches` - Set of branch names to verify
+///
+/// # Invariants Checked
+///
+/// 1. Each specified branch exists as a local ref
+/// 2. Each specified branch's metadata is parseable
+/// 3. Each specified branch's base is ancestor of its tip
+/// 4. Each specified branch's base is reachable from parent's tip
+/// 5. Global cycle check (affects all branches)
+///
+/// # Returns
+///
+/// `Ok(())` if all invariants hold for the specified branches.
+pub fn verify_branches(
+    git: &Git,
+    snapshot: &RepoSnapshot,
+    branches: &[BranchName],
+) -> Result<(), VerifyError> {
+    // Always check for cycles (global invariant)
+    verify_no_cycles(&snapshot.graph)?;
+
+    // Verify each specified branch
+    for branch in branches {
+        verify_branch(git, snapshot, branch)?;
+    }
+
+    Ok(())
+}
+
 /// Verify the stack graph has no cycles.
 fn verify_no_cycles(graph: &StackGraph) -> Result<(), VerifyError> {
     if let Some(cycle_branch) = graph.find_cycle() {

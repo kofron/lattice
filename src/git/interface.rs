@@ -1296,6 +1296,62 @@ impl Git {
         Ok(())
     }
 
+    /// Update a ref unconditionally (force update, no CAS).
+    ///
+    /// Unlike `update_ref_cas`, this method does not check the current value
+    /// of the ref. Use this only for recovery operations like `undo` where
+    /// you need to restore a ref to a known state regardless of its current value.
+    ///
+    /// # Safety
+    ///
+    /// This bypasses CAS protection. Only use when you explicitly need to
+    /// overwrite a ref unconditionally (e.g., undo operations).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Restore a ref to a known state during undo
+    /// git.update_ref_force(
+    ///     "refs/branch-metadata/feature",
+    ///     &old_oid,
+    ///     "undo: restore metadata"
+    /// )?;
+    /// ```
+    pub fn update_ref_force(
+        &self,
+        refname: &str,
+        new_oid: &Oid,
+        message: &str,
+    ) -> Result<(), GitError> {
+        let oid = git2::Oid::from_str(new_oid.as_str())
+            .map_err(|e| GitError::from_git2(e, new_oid.as_str()))?;
+
+        self.repo
+            .reference(refname, oid, true, message)
+            .map_err(|e| GitError::from_git2(e, refname))?;
+
+        Ok(())
+    }
+
+    /// Delete a ref unconditionally (force delete, no CAS).
+    ///
+    /// Unlike `delete_ref_cas`, this method does not check the current value
+    /// of the ref. Use this only for recovery operations.
+    ///
+    /// Returns `Ok(())` if the ref was deleted or didn't exist.
+    pub fn delete_ref_force(&self, refname: &str) -> Result<(), GitError> {
+        match self.repo.find_reference(refname) {
+            Ok(mut reference) => {
+                reference
+                    .delete()
+                    .map_err(|e| GitError::from_git2(e, refname))?;
+                Ok(())
+            }
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(()), // Already doesn't exist
+            Err(e) => Err(GitError::from_git2(e, refname)),
+        }
+    }
+
     /// Resolve a ref to its target OID without peeling to commit.
     ///
     /// Unlike `resolve_ref` which peels through tags to commits, this method

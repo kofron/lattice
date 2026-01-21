@@ -435,6 +435,237 @@ pub fn run_readonly_command<C: super::command::ReadOnlyCommand>(
     command.execute(&ready).map_err(RunError::Plan)
 }
 
+// ============================================================================
+// Async Command Runners
+// ============================================================================
+
+/// Run an async command through the full lifecycle.
+///
+/// This is the entry point for commands that implement `AsyncCommand`.
+/// It handles the async planning phase and follows the same lifecycle as
+/// synchronous commands: Scan -> Gate -> Plan -> Execute -> Verify.
+///
+/// # Lifecycle
+///
+/// 1. **Scan**: Read repository state
+/// 2. **Gate**: Verify requirements using `C::REQUIREMENTS`
+/// 3. **Plan (async)**: Call `command.plan()` with validated context
+/// 4. **Execute**: Apply plan through executor
+/// 5. **Verify**: Re-scan and verify invariants
+/// 6. **Finish**: Call `command.finish()` with result
+///
+/// # Type Parameters
+///
+/// * `C` - The command type (must implement `AsyncCommand`)
+///
+/// # Arguments
+///
+/// * `command` - The async command to execute
+/// * `git` - Git interface
+/// * `ctx` - Execution context
+///
+/// # Returns
+///
+/// `CommandOutput<C::Output>` on success, or `RunError` on failure.
+///
+/// # Example
+///
+/// ```ignore
+/// use latticework::engine::runner::run_async_command;
+/// use latticework::engine::command::AsyncCommand;
+///
+/// let cmd = MergeCommand { method: MergeMethod::Squash };
+/// let rt = tokio::runtime::Runtime::new()?;
+/// let result = rt.block_on(run_async_command(&cmd, &git, &ctx))?;
+/// ```
+pub async fn run_async_command<C: super::command::AsyncCommand>(
+    command: &C,
+    git: &Git,
+    ctx: &Context,
+) -> Result<CommandOutput<C::Output>, RunError> {
+    run_async_command_internal(command, git, ctx, C::REQUIREMENTS, None).await
+}
+
+/// Run an async command with explicit requirements.
+///
+/// This is useful for commands with mode-dependent requirements (like submit).
+/// Instead of using `C::REQUIREMENTS`, the caller provides the requirements.
+///
+/// # Arguments
+///
+/// * `command` - The async command to execute
+/// * `git` - Git interface
+/// * `ctx` - Execution context
+/// * `requirements` - Requirement set to use for gating
+///
+/// # Example
+///
+/// ```ignore
+/// let mode = SubmitMode::resolve(args.no_restack, is_bare)?;
+/// let rt = tokio::runtime::Runtime::new()?;
+/// let result = rt.block_on(run_async_command_with_requirements(
+///     &cmd, &git, &ctx, mode.requirements()
+/// ))?;
+/// ```
+pub async fn run_async_command_with_requirements<C: super::command::AsyncCommand>(
+    command: &C,
+    git: &Git,
+    ctx: &Context,
+    requirements: &'static RequirementSet,
+) -> Result<CommandOutput<C::Output>, RunError> {
+    run_async_command_internal(command, git, ctx, requirements, None).await
+}
+
+/// Run an async command with scope resolution.
+///
+/// Like `run_async_command`, but also resolves the target scope for commands
+/// that operate on a branch and its stack (like submit).
+///
+/// # Arguments
+///
+/// * `command` - The async command to execute
+/// * `git` - Git interface
+/// * `ctx` - Execution context
+/// * `target` - Target branch for scope resolution (None = current branch)
+///
+/// # Scope Resolution
+///
+/// The scope includes:
+/// - The target branch
+/// - All ancestors up to trunk
+///
+/// This scope is available in `ReadyContext.data` as `ValidatedData::StackScope`.
+pub async fn run_async_command_with_scope<C: super::command::AsyncCommand>(
+    command: &C,
+    git: &Git,
+    ctx: &Context,
+    target: Option<&BranchName>,
+) -> Result<CommandOutput<C::Output>, RunError> {
+    run_async_command_internal(command, git, ctx, C::REQUIREMENTS, target).await
+}
+
+/// Run an async command with explicit requirements and scope.
+///
+/// Combines `run_async_command_with_scope` and `run_async_command_with_requirements`.
+pub async fn run_async_command_with_requirements_and_scope<C: super::command::AsyncCommand>(
+    command: &C,
+    git: &Git,
+    ctx: &Context,
+    requirements: &'static RequirementSet,
+    target: Option<&BranchName>,
+) -> Result<CommandOutput<C::Output>, RunError> {
+    run_async_command_internal(command, git, ctx, requirements, target).await
+}
+
+/// Internal implementation of async command running.
+async fn run_async_command_internal<C: super::command::AsyncCommand>(
+    command: &C,
+    git: &Git,
+    ctx: &Context,
+    requirements: &RequirementSet,
+    target: Option<&BranchName>,
+) -> Result<CommandOutput<C::Output>, RunError> {
+    if ctx.debug {
+        eprintln!("[debug] Starting async command lifecycle");
+        eprintln!("[debug] Requirements: {}", requirements.name);
+    }
+
+    // Step 1: Scan
+    if ctx.debug {
+        eprintln!("[debug] Step 1: Scan");
+    }
+    let snapshot = scan(git)?;
+
+    // Step 2: Gate
+    if ctx.debug {
+        eprintln!("[debug] Step 2: Gate");
+    }
+    let ready = if target.is_some() {
+        match gate_with_scope(snapshot, requirements, target) {
+            GateResult::Ready(ctx) => *ctx,
+            GateResult::NeedsRepair(bundle) => {
+                if ctx.debug {
+                    eprintln!(
+                        "[debug] Gating failed: {} missing capabilities",
+                        bundle.missing_capabilities.len()
+                    );
+                }
+                return Err(RunError::NeedsRepair(bundle));
+            }
+        }
+    } else {
+        match gate(snapshot, requirements) {
+            GateResult::Ready(ctx) => *ctx,
+            GateResult::NeedsRepair(bundle) => {
+                if ctx.debug {
+                    eprintln!(
+                        "[debug] Gating failed: {} missing capabilities",
+                        bundle.missing_capabilities.len()
+                    );
+                }
+                return Err(RunError::NeedsRepair(bundle));
+            }
+        }
+    };
+
+    // Step 3: Plan (async)
+    if ctx.debug {
+        eprintln!("[debug] Step 3: Async Plan");
+    }
+    let plan = command.plan(&ready).await?;
+
+    if ctx.debug {
+        eprintln!("[debug] Plan has {} steps", plan.step_count());
+    }
+
+    // Early return for empty plans
+    if plan.is_empty() {
+        if ctx.debug {
+            eprintln!("[debug] Empty plan, skipping execution");
+        }
+        let result = ExecuteResult::Success {
+            fingerprint: ready.snapshot.fingerprint.clone(),
+        };
+        return Ok(command.finish(result));
+    }
+
+    // Test hook: Allows drift harness to inject out-of-band mutations between
+    // planning (which captures expected OIDs) and execution (which validates
+    // them with CAS). Per ROADMAP.md Anti-Drift Mechanisms item 5.
+    // No-op in production builds.
+    #[cfg(any(test, feature = "fault_injection", feature = "test_hooks"))]
+    {
+        if let Ok(info) = git.info() {
+            engine_hooks::invoke_before_execute(&info);
+        }
+    }
+
+    // Step 3.5: Pre-execution occupancy check (nice UX before acquiring lock)
+    // Per SPEC.md §4.6.8, refuse if any touched branch is checked out elsewhere
+    if plan.touches_branch_refs() {
+        if ctx.debug {
+            eprintln!("[debug] Step 3.5: Pre-execution occupancy check");
+        }
+        check_occupancy_for_plan(git, &plan)?;
+    }
+
+    // Step 4: Execute
+    // Note: Executor also revalidates occupancy under lock and runs post-verification
+    // per ARCHITECTURE.md §6.2 (self-enforcing)
+    if ctx.debug {
+        eprintln!("[debug] Step 4: Execute");
+    }
+    let executor = Executor::new(git);
+    let result = executor.execute(&plan, ctx)?;
+
+    // Step 5: Finish
+    // Note: Verification is now inside executor (self-enforcing per ARCHITECTURE.md §6.2)
+    if ctx.debug {
+        eprintln!("[debug] Step 5: Finish");
+    }
+    Ok(command.finish(result))
+}
+
 /// Check worktree occupancy for a plan before execution.
 ///
 /// This is the "nice UX" check before acquiring the lock. It provides

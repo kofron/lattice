@@ -54,9 +54,19 @@
 //! }
 //! ```
 
+use std::future::Future;
+use std::pin::Pin;
+
 use super::exec::ExecuteResult;
 use super::gate::{ReadyContext, RequirementSet};
 use super::plan::{Plan, PlanError};
+
+/// Type alias for async plan futures.
+///
+/// This represents the return type of `AsyncCommand::plan()`, which is an
+/// async function that produces a `Plan`. The lifetime `'a` ties the future
+/// to the command and context references.
+pub type PlanFut<'a> = Pin<Box<dyn Future<Output = Result<Plan, PlanError>> + Send + 'a>>;
 
 /// Output from a command after execution.
 ///
@@ -269,6 +279,138 @@ pub trait ReadOnlyCommand {
     ///
     /// The command output, or an error if execution fails.
     fn execute(&self, ctx: &ReadyContext) -> Result<Self::Output, PlanError>;
+}
+
+/// An async command that performs network operations.
+///
+/// Async commands differ from synchronous commands in that:
+/// - The `plan()` method may perform async operations (API queries, token refresh)
+/// - The plan may include remote operations (push, PR create/update)
+/// - Execution may involve both local and remote phases
+///
+/// This trait is used for commands that interact with remote forges like GitHub,
+/// including `submit`, `sync`, `get`, and `merge`.
+///
+/// # Lifecycle
+///
+/// Async commands follow the same lifecycle as sync commands:
+/// 1. Scan repository state
+/// 2. Gate on requirements
+/// 3. Plan (async - may query forge APIs)
+/// 4. Execute plan
+/// 5. Verify and return
+///
+/// The key difference is that planning may be async to allow querying existing
+/// PR state, checking remote branch status, or refreshing auth tokens.
+///
+/// # Example
+///
+/// ```ignore
+/// use latticework::engine::command::{AsyncCommand, CommandOutput, PlanFut};
+/// use latticework::engine::gate::{RequirementSet, ReadyContext, requirements};
+/// use latticework::engine::plan::{Plan, PlanError, PlanStep};
+/// use latticework::engine::exec::ExecuteResult;
+/// use latticework::core::ops::journal::OpId;
+///
+/// struct SubmitCommand {
+///     draft: bool,
+///     force: bool,
+/// }
+///
+/// impl AsyncCommand for SubmitCommand {
+///     const REQUIREMENTS: &'static RequirementSet = &requirements::REMOTE;
+///     type Output = SubmitResult;
+///
+///     fn plan<'a>(&'a self, ctx: &'a ReadyContext) -> PlanFut<'a> {
+///         Box::pin(async move {
+///             let mut plan = Plan::new(OpId::new(), "submit");
+///
+///             // Query forge for existing PRs (async operation)
+///             // ... add ForgePush and ForgeCreatePr steps ...
+///
+///             Ok(plan)
+///         })
+///     }
+///
+///     fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+///         match result {
+///             ExecuteResult::Success { .. } => CommandOutput::Success(SubmitResult { /* ... */ }),
+///             ExecuteResult::Paused { branch, .. } => CommandOutput::Paused {
+///                 message: format!("Conflict on '{}'. Resolve and run 'lattice continue'.", branch),
+///             },
+///             ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+///         }
+///     }
+/// }
+/// ```
+pub trait AsyncCommand: Send + Sync {
+    /// The requirement set for this command.
+    ///
+    /// Async commands typically use `requirements::REMOTE` or
+    /// `requirements::REMOTE_BARE_ALLOWED` for bare-repo compatible operations.
+    const REQUIREMENTS: &'static RequirementSet;
+
+    /// Output type produced by this command.
+    type Output;
+
+    /// Generate a plan asynchronously from validated context.
+    ///
+    /// Unlike `Command::plan()`, this may perform async operations:
+    /// - Query forge for existing PRs
+    /// - Refresh authentication tokens
+    /// - Resolve remote branch state
+    /// - Check PR merge status
+    ///
+    /// The returned plan may contain both local steps (rebase, metadata update)
+    /// and remote steps (push, PR create/update).
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - Validated context containing snapshot and scope data
+    ///
+    /// # Returns
+    ///
+    /// A `Plan` describing the mutations to apply, or an error if
+    /// planning fails.
+    fn plan<'a>(&'a self, ctx: &'a ReadyContext) -> PlanFut<'a>;
+
+    /// Process execution result into command output.
+    ///
+    /// Same semantics as `Command::finish()`. This is called after the
+    /// executor finishes (whether successfully, paused, or aborted).
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - The result from the executor
+    ///
+    /// # Returns
+    ///
+    /// A `CommandOutput` that will be shown to the user.
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output>;
+}
+
+/// Marker trait for async commands that don't produce meaningful output.
+///
+/// Similar to `SimpleCommand` for sync commands, this provides a convenient
+/// default implementation of `finish()` for async commands that just succeed
+/// or fail without returning data.
+pub trait SimpleAsyncCommand: AsyncCommand<Output = ()> {
+    /// Default implementation of finish for simple async commands.
+    fn simple_finish(&self, result: ExecuteResult) -> CommandOutput<()> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(()),
+            ExecuteResult::Paused {
+                branch, git_state, ..
+            } => CommandOutput::Paused {
+                message: format!(
+                    "Paused for {} on '{}'. Resolve and run 'lattice continue', or 'lattice abort'.",
+                    git_state.description(),
+                    branch
+                ),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
 }
 
 #[cfg(test)]

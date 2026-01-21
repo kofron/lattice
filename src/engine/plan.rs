@@ -166,6 +166,100 @@ pub enum PlanStep {
         /// Human-readable reason for the checkout.
         reason: String,
     },
+
+    // ========================================================================
+    // Forge/Remote Steps (Phase 6)
+    // ========================================================================
+    /// Fetch from a remote repository.
+    ///
+    /// This step fetches refs from the specified remote. It may fetch
+    /// all branches or a specific refspec.
+    ForgeFetch {
+        /// Remote name (e.g., "origin").
+        remote: String,
+        /// Specific refspec to fetch (optional, defaults to all).
+        refspec: Option<String>,
+    },
+
+    /// Push a branch to a remote.
+    ///
+    /// This step pushes a local branch to the remote. It uses
+    /// `--force-with-lease` for safety when force is enabled.
+    ForgePush {
+        /// Branch to push.
+        branch: String,
+        /// Use force push (with lease for safety).
+        force: bool,
+        /// Remote name (e.g., "origin").
+        remote: String,
+        /// Human-readable reason for the push.
+        reason: String,
+    },
+
+    /// Create a pull request on the forge.
+    ///
+    /// This step creates a new PR via the forge API (e.g., GitHub).
+    /// The created PR's number and URL are captured for subsequent steps.
+    ForgeCreatePr {
+        /// Head branch (the branch being merged).
+        head: String,
+        /// Base branch (the target branch, e.g., "main").
+        base: String,
+        /// PR title.
+        title: String,
+        /// PR body (optional).
+        body: Option<String>,
+        /// Create as draft PR.
+        draft: bool,
+    },
+
+    /// Update an existing pull request.
+    ///
+    /// This step updates PR metadata via the forge API. All fields
+    /// are optional - only specified fields are updated.
+    ForgeUpdatePr {
+        /// PR number to update.
+        number: u64,
+        /// New base branch (optional).
+        base: Option<String>,
+        /// New title (optional).
+        title: Option<String>,
+        /// New body (optional).
+        body: Option<String>,
+    },
+
+    /// Toggle PR draft status.
+    ///
+    /// This step changes a PR between draft and ready-for-review states.
+    /// Requires GraphQL API for GitHub.
+    ForgeDraftToggle {
+        /// PR number.
+        number: u64,
+        /// Set to draft (true) or ready for review (false).
+        draft: bool,
+    },
+
+    /// Request reviewers on a PR.
+    ///
+    /// This step requests review from users and/or teams.
+    ForgeRequestReviewers {
+        /// PR number.
+        number: u64,
+        /// User logins to request review from.
+        users: Vec<String>,
+        /// Team slugs to request review from.
+        teams: Vec<String>,
+    },
+
+    /// Merge a PR via the forge API.
+    ///
+    /// This step merges a PR using the specified merge method.
+    ForgeMergePr {
+        /// PR number to merge.
+        number: u64,
+        /// Merge method: "merge", "squash", or "rebase".
+        method: String,
+    },
 }
 
 impl PlanStep {
@@ -196,6 +290,18 @@ impl PlanStep {
                 // Checkout modifies HEAD but doesn't touch branch refs
                 vec![]
             }
+            // Forge steps don't touch local refs directly (except ForgePush which
+            // pushes existing refs). The effects are remote-side.
+            PlanStep::ForgeFetch { .. } => vec![],
+            PlanStep::ForgePush { branch, .. } => {
+                // Push reads the local branch ref
+                vec![branch.as_str()]
+            }
+            PlanStep::ForgeCreatePr { .. } => vec![],
+            PlanStep::ForgeUpdatePr { .. } => vec![],
+            PlanStep::ForgeDraftToggle { .. } => vec![],
+            PlanStep::ForgeRequestReviewers { .. } => vec![],
+            PlanStep::ForgeMergePr { .. } => vec![],
         }
     }
 
@@ -210,6 +316,14 @@ impl PlanStep {
                 | PlanStep::RunGit { .. }
                 | PlanStep::CreateSnapshotBranch { .. }
                 | PlanStep::Checkout { .. }
+                // Forge steps that perform mutations (remote-side effects)
+                | PlanStep::ForgeFetch { .. }
+                | PlanStep::ForgePush { .. }
+                | PlanStep::ForgeCreatePr { .. }
+                | PlanStep::ForgeUpdatePr { .. }
+                | PlanStep::ForgeDraftToggle { .. }
+                | PlanStep::ForgeRequestReviewers { .. }
+                | PlanStep::ForgeMergePr { .. }
         )
     }
 
@@ -252,6 +366,58 @@ impl PlanStep {
             }
             PlanStep::Checkout { branch, reason } => {
                 format!("Checkout '{}': {}", branch, reason)
+            }
+            // Forge step descriptions
+            PlanStep::ForgeFetch { remote, refspec } => {
+                if let Some(spec) = refspec {
+                    format!("Fetch '{}' from {}", spec, remote)
+                } else {
+                    format!("Fetch from {}", remote)
+                }
+            }
+            PlanStep::ForgePush {
+                branch,
+                force,
+                remote,
+                reason,
+            } => {
+                if *force {
+                    format!("Force push '{}' to {}: {}", branch, remote, reason)
+                } else {
+                    format!("Push '{}' to {}: {}", branch, remote, reason)
+                }
+            }
+            PlanStep::ForgeCreatePr {
+                head, base, draft, ..
+            } => {
+                if *draft {
+                    format!("Create draft PR: {} -> {}", head, base)
+                } else {
+                    format!("Create PR: {} -> {}", head, base)
+                }
+            }
+            PlanStep::ForgeUpdatePr { number, .. } => {
+                format!("Update PR #{}", number)
+            }
+            PlanStep::ForgeDraftToggle { number, draft } => {
+                if *draft {
+                    format!("Convert PR #{} to draft", number)
+                } else {
+                    format!("Mark PR #{} ready for review", number)
+                }
+            }
+            PlanStep::ForgeRequestReviewers {
+                number,
+                users,
+                teams,
+            } => {
+                let mut reviewers = Vec::new();
+                reviewers.extend(users.iter().cloned());
+                reviewers.extend(teams.iter().map(|t| format!("@{}", t)));
+                format!("Request review on PR #{}: {}", number, reviewers.join(", "))
+            }
+            PlanStep::ForgeMergePr { number, method } => {
+                format!("Merge PR #{} ({})", number, method)
             }
         }
     }

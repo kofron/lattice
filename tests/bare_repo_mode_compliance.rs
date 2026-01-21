@@ -213,8 +213,8 @@ mod submit_bare_repo {
         );
 
         // Should either succeed (dry run) or fail for auth reasons, not bare repo reasons
-        if result.is_err() {
-            let err_msg = result.unwrap_err().to_string();
+        if let Err(e) = result {
+            let err_msg = e.to_string();
             // Error should NOT be about bare repo since --no-restack was provided
             assert!(
                 !err_msg.contains("bare repository requires")
@@ -280,8 +280,8 @@ mod sync_bare_repo {
         let result = commands::sync(&bare_ctx, false, false); // restack=false
 
         // Either succeeds or fails for non-bare-repo reasons
-        if result.is_err() {
-            let err_msg = result.unwrap_err().to_string();
+        if let Err(e) = result {
+            let err_msg = e.to_string();
             assert!(
                 !err_msg.contains("bare repository") || err_msg.contains("--no-restack"),
                 "Should not fail due to bare repo when not restacking: {}",
@@ -385,8 +385,8 @@ mod get_bare_repo {
         );
 
         // This may fail for auth/remote reasons but should not fail due to bare repo
-        if result.is_err() {
-            let err_msg = result.unwrap_err().to_string();
+        if let Err(e) = &result {
+            let err_msg = e.to_string();
             // Should not be a bare repo error since --no-checkout was provided
             assert!(
                 !err_msg.contains("bare repository requires")
@@ -394,7 +394,8 @@ mod get_bare_repo {
                 "Should not fail due to bare repo when --no-checkout is set: {}",
                 err_msg
             );
-        } else {
+        }
+        if result.is_ok() {
             // If it succeeds, verify the branch is tracked with frozen state
             let git = Git::open(bare_dir.path()).expect("failed to open bare repo");
             let snapshot = scan(&git).expect("scan failed");
@@ -536,8 +537,8 @@ mod alignment_checks {
         // The alignment check should detect the issue
         // Note: May pass gating but fail alignment, or may fail for auth reasons first
         // We're primarily testing that the alignment logic exists
-        if result.is_err() {
-            let err_msg = result.unwrap_err().to_string();
+        if let Err(e) = result {
+            let err_msg = e.to_string();
             // If it fails for alignment reasons, that's expected
             // If it fails for auth reasons, that's also OK for this test
             println!("Submit result (expected failure): {}", err_msg);

@@ -662,8 +662,7 @@ impl Journal {
         // Check for fault injection (test-only)
         #[cfg(any(test, feature = "fault_injection"))]
         if fault_injection::should_crash() {
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(JournalError::Io(std::io::Error::other(
                 "simulated crash for fault injection testing",
             )));
         }
@@ -901,6 +900,61 @@ impl Journal {
                 }
             })
             .unwrap_or(&[])
+    }
+
+    // =========================================================================
+    // Remote operation detection (Phase 7)
+    // =========================================================================
+
+    /// Check if this journal contains any remote/forge operations.
+    ///
+    /// Remote operations include:
+    /// - Git push commands
+    /// - Git fetch commands (less common to track, but included for completeness)
+    ///
+    /// Note: Forge API calls (PR creation, etc.) are not recorded in the journal
+    /// as `GitProcess` steps since they use the HTTP API, not git commands.
+    /// However, push operations ARE recorded, and those cannot be undone.
+    ///
+    /// # Returns
+    ///
+    /// `true` if any step represents a remote operation that cannot be undone.
+    pub fn has_remote_operations(&self) -> bool {
+        self.steps.iter().any(|step| {
+            if let StepKind::GitProcess { args, .. } = &step.kind {
+                Self::is_remote_git_command(args)
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Get descriptions of all remote operations in this journal.
+    ///
+    /// Returns a list of human-readable descriptions for display in warnings.
+    pub fn remote_operation_descriptions(&self) -> Vec<String> {
+        self.steps
+            .iter()
+            .filter_map(|step| {
+                if let StepKind::GitProcess { args, description } = &step.kind {
+                    if Self::is_remote_git_command(args) {
+                        Some(description.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Check if a git command is a remote operation.
+    fn is_remote_git_command(args: &[String]) -> bool {
+        if args.is_empty() {
+            return false;
+        }
+        matches!(args[0].as_str(), "push" | "fetch")
     }
 }
 
@@ -2452,10 +2506,9 @@ mod tests {
             let paths = create_test_paths(&temp);
 
             // Test each append method with crash injection
-            let methods: Vec<(
-                &str,
-                Box<dyn Fn(&mut Journal, &LatticePaths) -> Result<(), JournalError>>,
-            )> = vec![
+            type AppendMethod =
+                Box<dyn Fn(&mut Journal, &LatticePaths) -> Result<(), JournalError>>;
+            let methods: Vec<(&str, AppendMethod)> = vec![
                 (
                     "append_ref_update",
                     Box::new(|j, p| j.append_ref_update(p, "refs/heads/x", None, "oid")),

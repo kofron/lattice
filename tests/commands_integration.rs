@@ -1297,3 +1297,241 @@ fn abort_without_paused_op_fails() {
     // Should fail because there's no operation in progress
     assert!(result.is_err(), "abort without paused op should fail");
 }
+
+// =============================================================================
+// Phase 7: Recovery Command Improvements Tests
+// =============================================================================
+
+#[test]
+fn abort_records_event_in_ledger() {
+    use latticework::engine::ledger::{Event, EventLedger};
+
+    let repo = TestRepo::new();
+    repo.init_lattice();
+
+    // Create a feature branch with a file
+    repo.create_branch("feature");
+    repo.checkout("feature");
+    repo.commit(
+        "shared.txt",
+        "feature content",
+        "Add shared file on feature",
+    );
+    repo.track_branch("feature", "main");
+
+    // Go back to main and create a conflicting change
+    repo.checkout("main");
+    repo.commit("shared.txt", "main content", "Add shared file on main");
+
+    // Restack to trigger conflict
+    repo.checkout("feature");
+    let ctx = repo.context();
+    commands::restack(&ctx, Some("feature"), true, false).expect("restack should pause");
+
+    // Get the ledger state before abort
+    let git = repo.git();
+    let ledger = EventLedger::new(&git);
+    let events_before = ledger.recent(100).expect("read ledger");
+
+    // Abort the operation
+    commands::abort(&ctx).expect("abort should succeed");
+
+    // Check that an Aborted event was recorded
+    let events_after = ledger.recent(100).expect("read ledger");
+    assert!(
+        events_after.len() > events_before.len(),
+        "abort should record an event in the ledger"
+    );
+
+    // The most recent event should be Aborted
+    let latest = events_after.first().expect("should have events");
+    match &latest.event {
+        Event::Aborted { reason, .. } => {
+            assert!(
+                reason.contains("abort"),
+                "abort reason should mention abort"
+            );
+        }
+        _ => panic!(
+            "expected Aborted event, got {:?}",
+            std::mem::discriminant(&latest.event)
+        ),
+    }
+}
+
+#[test]
+fn undo_records_event_in_ledger() {
+    use latticework::engine::ledger::{Event, EventLedger};
+
+    let repo = TestRepo::new();
+    repo.init_lattice();
+
+    // Create a feature branch and track it
+    repo.create_branch("feature");
+    repo.checkout("feature");
+    repo.commit("feature.txt", "feature content", "Add feature");
+    repo.track_branch("feature", "main");
+
+    // Record the original base oid
+    let git = repo.git();
+    let store = MetadataStore::new(&git);
+    let branch = BranchName::new("feature").unwrap();
+    let original_metadata = store.read(&branch).unwrap().expect("metadata");
+    let original_base = original_metadata.metadata.base.oid.clone();
+
+    // Add a commit to main to make feature out of date
+    repo.checkout("main");
+    repo.commit("main-update.txt", "update", "Update main");
+    let new_main_oid = repo.head_oid();
+
+    // Restack feature - this creates a journal that can be undone
+    repo.checkout("feature");
+    let ctx = repo.context();
+    commands::restack(&ctx, Some("feature"), true, false).expect("restack should succeed");
+
+    // Verify restack changed the base
+    let metadata_after_restack = store.read(&branch).unwrap().expect("metadata");
+    assert_eq!(
+        metadata_after_restack.metadata.base.oid, new_main_oid,
+        "base should be updated after restack"
+    );
+
+    // Get the ledger state before undo
+    let ledger = EventLedger::new(&git);
+    let events_before = ledger.recent(100).expect("read ledger");
+
+    // Undo the restack operation
+    commands::undo(&ctx).expect("undo should succeed");
+
+    // Check that an UndoApplied event was recorded
+    let events_after = ledger.recent(100).expect("read ledger");
+    assert!(
+        events_after.len() > events_before.len(),
+        "undo should record an event in the ledger"
+    );
+
+    // The most recent event should be UndoApplied
+    let latest = events_after.first().expect("should have events");
+    match &latest.event {
+        Event::UndoApplied { refs_restored, .. } => {
+            assert!(
+                *refs_restored > 0,
+                "undo should have restored at least one ref"
+            );
+        }
+        _ => panic!(
+            "expected UndoApplied event, got {:?}",
+            std::mem::discriminant(&latest.event)
+        ),
+    }
+
+    // Verify the base was restored to the original
+    let metadata_after_undo = store.read(&branch).unwrap().expect("metadata");
+    assert_eq!(
+        metadata_after_undo.metadata.base.oid, original_base,
+        "base should be restored to original after undo"
+    );
+}
+
+#[test]
+fn undo_without_operations_fails() {
+    let repo = TestRepo::new();
+    repo.init_lattice();
+
+    let ctx = repo.context();
+    let result = commands::undo(&ctx);
+
+    // Should fail because there's no operation to undo
+    assert!(result.is_err(), "undo without operations should fail");
+}
+
+#[test]
+fn undo_while_operation_in_progress_fails() {
+    let repo = TestRepo::new();
+    repo.init_lattice();
+
+    // Create a feature branch with a file
+    repo.create_branch("feature");
+    repo.checkout("feature");
+    repo.commit(
+        "shared.txt",
+        "feature content",
+        "Add shared file on feature",
+    );
+    repo.track_branch("feature", "main");
+
+    // Go back to main and create a conflicting change
+    repo.checkout("main");
+    repo.commit("shared.txt", "main content", "Add shared file on main");
+
+    // Restack to trigger conflict (operation now in progress)
+    repo.checkout("feature");
+    let ctx = repo.context();
+    commands::restack(&ctx, Some("feature"), true, false).expect("restack should pause");
+
+    // Try to undo while operation is in progress
+    let result = commands::undo(&ctx);
+    assert!(
+        result.is_err(),
+        "undo should fail while operation is in progress"
+    );
+
+    // Error message should mention abort
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("abort"),
+        "error should mention using abort first"
+    );
+
+    // Clean up
+    run_git(repo.path(), &["rebase", "--abort"]);
+}
+
+#[test]
+fn undo_restores_metadata_refs() {
+    let repo = TestRepo::new();
+    repo.init_lattice();
+
+    // Create and track a feature branch
+    repo.create_branch("feature");
+    repo.checkout("feature");
+    repo.commit("feature.txt", "feature content", "Add feature");
+    repo.track_branch("feature", "main");
+
+    // Verify metadata exists and record the original base
+    let git = repo.git();
+    let store = MetadataStore::new(&git);
+    let branch = BranchName::new("feature").unwrap();
+    let original_metadata = store
+        .read(&branch)
+        .unwrap()
+        .expect("metadata should exist after track");
+    let original_base = original_metadata.metadata.base.oid.clone();
+
+    // Add commit to main to trigger a restack
+    repo.checkout("main");
+    repo.commit("main-update.txt", "update", "Update main");
+
+    // Restack feature - this creates a journal and changes metadata
+    repo.checkout("feature");
+    let ctx = repo.context();
+    commands::restack(&ctx, Some("feature"), true, false).expect("restack should succeed");
+
+    // Verify metadata changed (base updated)
+    let metadata_after_restack = store.read(&branch).unwrap().expect("metadata");
+    assert_ne!(
+        metadata_after_restack.metadata.base.oid, original_base,
+        "base should have changed after restack"
+    );
+
+    // Undo the restack operation
+    commands::undo(&ctx).expect("undo should succeed");
+
+    // Verify metadata ref was restored to original
+    let store = MetadataStore::new(&git);
+    let metadata_after_undo = store.read(&branch).unwrap().expect("metadata should exist");
+    assert_eq!(
+        metadata_after_undo.metadata.base.oid, original_base,
+        "metadata base should be restored to original after undo"
+    );
+}

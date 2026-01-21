@@ -11,7 +11,13 @@
 //! - Tracks fetched branch (frozen by default)
 //! - Optionally restacks after fetching
 //!
-//! # Bare Repository Support
+//! # Architecture
+//!
+//! The get command implements `AsyncCommand` per the Phase 6 command migration.
+//! It uses mode dispatch (`GetMode`) for bare repository handling:
+//!
+//! - `WithCheckout`: Normal mode, requires working directory
+//! - `NoCheckout`: Bare-repo compatible, skips checkout
 //!
 //! Per SPEC.md Section 4.6.7, in bare repositories:
 //! - `lattice get` MUST refuse unless `--no-checkout` is provided
@@ -39,17 +45,145 @@ use crate::core::metadata::schema::{
     Timestamps, METADATA_KIND, SCHEMA_VERSION,
 };
 use crate::core::metadata::store::MetadataStore;
+use crate::core::ops::journal::OpId;
 use crate::core::types::{BranchName, UtcTimestamp};
+use crate::engine::command::{AsyncCommand, CommandOutput, PlanFut};
+use crate::engine::exec::ExecuteResult;
 use crate::engine::gate::requirements;
+use crate::engine::gate::{ReadyContext, RequirementSet};
+use crate::engine::modes::{GetMode, ModeError};
+use crate::engine::plan::{Plan, PlanStep};
 use crate::engine::Context;
 use crate::forge::PullRequest;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
 use std::process::Command;
 
+/// Result of a get operation.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct GetResult {
+    /// The branch that was fetched.
+    pub branch: BranchName,
+    /// Whether the branch was newly tracked.
+    pub newly_tracked: bool,
+}
+
+/// Get command arguments.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct GetArgs {
+    /// Target branch name or PR number.
+    pub target: String,
+    /// Fetch downstack branches (not yet implemented).
+    pub downstack: bool,
+    /// Force overwrite existing branch.
+    pub force: bool,
+    /// Restack after fetching (not yet implemented).
+    pub restack: bool,
+    /// Create unfrozen (editable) branch.
+    pub unfrozen: bool,
+    /// Skip checkout (for bare repos).
+    pub no_checkout: bool,
+    /// Quiet mode.
+    pub quiet: bool,
+}
+
+/// The get command for normal (with checkout) mode.
+pub struct GetWithCheckoutCommand {
+    args: GetArgs,
+}
+
+impl GetWithCheckoutCommand {
+    /// Create a new get command with checkout mode.
+    pub fn new(args: GetArgs) -> Self {
+        Self { args }
+    }
+}
+
+impl AsyncCommand for GetWithCheckoutCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::REMOTE;
+    type Output = GetResult;
+
+    fn plan<'a>(&'a self, _ready: &'a ReadyContext) -> PlanFut<'a> {
+        Box::pin(async move {
+            // Build a plan with ForgeFetch step
+            // The actual fetch and tracking logic will be executed after gating
+            let mut plan = Plan::new(OpId::new(), "get");
+
+            plan = plan.with_step(PlanStep::ForgeFetch {
+                remote: "origin".to_string(),
+                refspec: Some(self.args.target.clone()),
+            });
+
+            Ok(plan)
+        })
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(GetResult {
+                branch: BranchName::new(&self.args.target)
+                    .unwrap_or_else(|_| BranchName::new("unknown").unwrap()),
+                newly_tracked: false,
+            }),
+            ExecuteResult::Paused { branch, .. } => CommandOutput::Paused {
+                message: format!("Get paused at '{}'. This shouldn't happen.", branch),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
+}
+
+/// The get command for no-checkout mode (bare repo compatible).
+pub struct GetNoCheckoutCommand {
+    args: GetArgs,
+}
+
+impl GetNoCheckoutCommand {
+    /// Create a new get command without checkout mode.
+    pub fn new(args: GetArgs) -> Self {
+        Self { args }
+    }
+}
+
+impl AsyncCommand for GetNoCheckoutCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::REMOTE_BARE_ALLOWED;
+    type Output = GetResult;
+
+    fn plan<'a>(&'a self, _ready: &'a ReadyContext) -> PlanFut<'a> {
+        Box::pin(async move {
+            // Build a plan with ForgeFetch step
+            let mut plan = Plan::new(OpId::new(), "get");
+
+            plan = plan.with_step(PlanStep::ForgeFetch {
+                remote: "origin".to_string(),
+                refspec: Some(self.args.target.clone()),
+            });
+
+            Ok(plan)
+        })
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(GetResult {
+                branch: BranchName::new(&self.args.target)
+                    .unwrap_or_else(|_| BranchName::new("unknown").unwrap()),
+                newly_tracked: false,
+            }),
+            ExecuteResult::Paused { branch, .. } => CommandOutput::Paused {
+                message: format!("Get paused at '{}'. This shouldn't happen.", branch),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
+}
+
 /// Run the get command.
 ///
 /// This is a synchronous wrapper that uses tokio to run the async implementation.
+/// It uses mode dispatch for bare repository handling per SPEC.md §4.6.7.
 pub fn get(
     ctx: &Context,
     target: &str,
@@ -59,67 +193,132 @@ pub fn get(
     unfrozen: bool,
     no_checkout: bool,
 ) -> Result<()> {
-    // Pre-flight gating check (use REMOTE_BARE_ALLOWED if --no-checkout, else REMOTE)
     let cwd = ctx
         .cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
 
-    let reqs = if no_checkout {
-        &requirements::REMOTE_BARE_ALLOWED
-    } else {
-        &requirements::REMOTE
-    };
-    crate::engine::runner::check_requirements(&git, reqs)
-        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+    // Resolve mode from flags and repo context
+    let is_bare = git.info()?.work_dir.is_none();
+    let mode = GetMode::resolve(no_checkout, is_bare).map_err(|e| match e {
+        ModeError::BareRepoRequiresFlag {
+            command,
+            required_flag,
+        } => {
+            anyhow::anyhow!(
+                "This is a bare repository. The `{}` command requires a working directory.\n\n\
+                 To fetch and track the branch without checkout, use:\n\n\
+                     lattice get {} {}\n\n\
+                 After tracking, you can create a worktree to work on it:\n\n\
+                     git worktree add <path> {}",
+                command,
+                required_flag,
+                target,
+                target
+            )
+        }
+    })?;
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(get_async(
-        ctx,
-        target,
+    let args = GetArgs {
+        target: target.to_string(),
         downstack,
         force,
         restack,
         unfrozen,
         no_checkout,
-    ))
+        quiet: ctx.quiet,
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    match mode {
+        GetMode::WithCheckout => rt.block_on(get_with_checkout_impl(&git, ctx, args)),
+        GetMode::NoCheckout => rt.block_on(get_no_checkout_impl(&git, ctx, args)),
+    }
 }
 
-/// Async implementation of get.
-async fn get_async(
-    ctx: &Context,
-    target: &str,
-    _downstack: bool,
-    force: bool,
-    _restack: bool,
-    unfrozen: bool,
-    no_checkout: bool,
-) -> Result<()> {
+/// Async implementation for WithCheckout mode.
+///
+/// Uses run_async_command for proper gating, then executes fetch and tracking.
+async fn get_with_checkout_impl(git: &Git, ctx: &Context, args: GetArgs) -> Result<()> {
+    use crate::engine::runner::run_async_command;
+
+    let command = GetWithCheckoutCommand::new(args.clone());
+
+    // Run through async command lifecycle for gating
+    let result = run_async_command(&command, git, ctx).await;
+
+    match result {
+        Ok(output) => match output {
+            CommandOutput::Success(_) => {
+                // Gating passed, now execute the actual fetch
+                execute_get_fetch(git, ctx, &args).await?;
+                Ok(())
+            }
+            CommandOutput::Paused { message } => bail!("Unexpected pause: {}", message),
+            CommandOutput::Failed { error } => bail!("{}", error),
+        },
+        Err(e) => bail!("Get failed: {}", e),
+    }
+}
+
+/// Async implementation for NoCheckout mode.
+///
+/// Uses run_async_command for proper gating, then executes fetch and tracking.
+async fn get_no_checkout_impl(git: &Git, ctx: &Context, args: GetArgs) -> Result<()> {
+    use crate::engine::runner::run_async_command;
+
+    let command = GetNoCheckoutCommand::new(args.clone());
+
+    // Run through async command lifecycle for gating
+    let result = run_async_command(&command, git, ctx).await;
+
+    match result {
+        Ok(output) => match output {
+            CommandOutput::Success(_) => {
+                // Gating passed, now execute fetch and handle no-checkout tracking
+                let pr_info = execute_get_fetch(git, ctx, &args).await?;
+
+                // In no-checkout mode, also track the branch
+                let branch_name = resolve_branch_name(&args.target, pr_info.as_ref());
+                handle_no_checkout_mode(ctx, git, &branch_name, pr_info.as_ref(), args.unfrozen)
+                    .await
+            }
+            CommandOutput::Paused { message } => bail!("Unexpected pause: {}", message),
+            CommandOutput::Failed { error } => bail!("{}", error),
+        },
+        Err(e) => bail!("Get failed: {}", e),
+    }
+}
+
+/// Resolve branch name from target (may be PR number or branch name).
+fn resolve_branch_name(target: &str, pr_info: Option<&PullRequest>) -> String {
+    if let Some(pr) = pr_info {
+        pr.head.clone()
+    } else {
+        target.to_string()
+    }
+}
+
+/// Execute the actual fetch operation.
+///
+/// This is called after gating succeeds. Returns PR info if target was a PR number.
+async fn execute_get_fetch(
+    git: &Git,
+    _ctx: &Context,
+    args: &GetArgs,
+) -> Result<Option<PullRequest>> {
     use crate::cli::commands::auth::get_github_token;
 
-    let cwd = ctx
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let git = Git::open(&cwd)?;
-
-    // Per SPEC.md §4.6.7: get MUST refuse in bare repos unless --no-checkout
-    let is_bare = git.info()?.work_dir.is_none();
-    if is_bare && !no_checkout {
-        bail!(
-            "This is a bare repository. The `get` command requires a working directory.\n\n\
-             To fetch and track the branch without checkout, use:\n\n\
-                 lattice get --no-checkout {}\n\n\
-             After tracking, you can create a worktree to work on it:\n\n\
-                 git worktree add <path> {}",
-            target,
-            target
-        );
-    }
+    let cwd = git
+        .info()?
+        .git_dir
+        .parent()
+        .unwrap_or(&git.info()?.git_dir)
+        .to_path_buf();
 
     // Determine if target is a PR number or branch name
-    let (branch_name, pr_info) = if let Ok(pr_number) = target.parse::<u64>() {
+    let (branch_name, pr_info) = if let Ok(pr_number) = args.target.parse::<u64>() {
         // It's a PR number - fetch details from API
         let token = get_github_token()?;
         let remote_url = git
@@ -128,7 +327,7 @@ async fn get_async(
 
         let forge = crate::forge::create_forge(&remote_url, &token, None)?;
 
-        if !ctx.quiet {
+        if !args.quiet {
             println!("Fetching PR #{}...", pr_number);
         }
 
@@ -136,14 +335,14 @@ async fn get_async(
         (pr.head.clone(), Some(pr))
     } else {
         // It's a branch name
-        (target.to_string(), None)
+        (args.target.clone(), None)
     };
 
     // Check if branch already exists locally
     let local_ref = format!("refs/heads/{}", branch_name);
     let exists_locally = git.resolve_ref(&local_ref).is_ok();
 
-    if exists_locally && !force {
+    if exists_locally && !args.force {
         bail!(
             "Branch '{}' already exists locally. Use --force to overwrite.",
             branch_name
@@ -151,7 +350,7 @@ async fn get_async(
     }
 
     // Fetch the branch from remote
-    if !ctx.quiet {
+    if !args.quiet {
         println!("Fetching branch '{}'...", branch_name);
     }
 
@@ -178,7 +377,7 @@ async fn get_async(
         // Create local branch tracking remote
         let origin_ref = format!("origin/{}", branch_name);
         let mut branch_args = vec!["branch"];
-        if force {
+        if args.force {
             branch_args.push("-f");
         }
         branch_args.push(&branch_name);
@@ -194,23 +393,20 @@ async fn get_async(
         }
     }
 
-    // Handle no-checkout mode (required for bare repos)
-    if no_checkout {
-        return handle_no_checkout_mode(ctx, &git, &branch_name, pr_info.as_ref(), unfrozen).await;
+    // For WithCheckout mode, just print guidance (no auto-tracking)
+    if !args.no_checkout {
+        let freeze_note = if args.unfrozen { "unfrozen" } else { "frozen" };
+        if !args.quiet {
+            println!(
+                "Fetched '{}'. Run 'lattice track {}' to track it ({} by default).",
+                branch_name,
+                if args.unfrozen { "--force" } else { "" },
+                freeze_note
+            );
+        }
     }
 
-    // Normal mode: Note about tracking
-    let freeze_note = if unfrozen { "unfrozen" } else { "frozen" };
-    if !ctx.quiet {
-        println!(
-            "Fetched '{}'. Run 'lattice track {}' to track it ({} by default).",
-            branch_name,
-            if unfrozen { "--force" } else { "" },
-            freeze_note
-        );
-    }
-
-    Ok(())
+    Ok(pr_info)
 }
 
 /// Handle no-checkout mode for bare repositories.
