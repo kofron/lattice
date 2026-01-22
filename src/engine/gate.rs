@@ -314,10 +314,28 @@ impl RepairBundle {
     /// Get a summary message.
     pub fn summary(&self) -> String {
         let n = self.blocking_issues.len();
-        if n == 1 {
-            format!("1 issue blocking {}", self.command)
+        let cap_count = self.missing_capabilities.len();
+
+        if n > 0 {
+            if n == 1 {
+                format!("1 issue blocking {}", self.command)
+            } else {
+                format!("{} issues blocking {}", n, self.command)
+            }
+        } else if cap_count > 0 {
+            // No issues, but missing capabilities - show them
+            let cap_names: Vec<&str> = self
+                .missing_capabilities
+                .iter()
+                .map(|c| c.description())
+                .collect();
+            format!(
+                "missing capabilities for {}: {}",
+                self.command,
+                cap_names.join(", ")
+            )
         } else {
-            format!("{} issues blocking {}", n, self.command)
+            format!("gating failed for {} (unknown reason)", self.command)
         }
     }
 }

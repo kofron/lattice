@@ -37,7 +37,7 @@ use super::command::{Command, CommandOutput};
 use super::exec::{ExecuteResult, Executor};
 use super::gate::{gate, gate_with_scope, GateResult, RepairBundle, RequirementSet};
 use super::plan::Plan;
-use super::scan::scan;
+use super::scan::{scan, scan_with_remote};
 use super::Context;
 use crate::core::types::BranchName;
 use crate::git::Git;
@@ -570,11 +570,13 @@ async fn run_async_command_internal<C: super::command::AsyncCommand>(
         eprintln!("[debug] Requirements: {}", requirements.name);
     }
 
-    // Step 1: Scan
+    // Step 1: Scan (async version for remote capability checks)
+    // Use scan_with_remote() since we're in an async context - this enables
+    // RepoAuthorized capability checking which requires async API calls.
     if ctx.debug {
-        eprintln!("[debug] Step 1: Scan");
+        eprintln!("[debug] Step 1: Async Scan (with remote capabilities)");
     }
-    let snapshot = scan(git)?;
+    let snapshot = scan_with_remote(git).await?;
 
     // Step 2: Gate
     if ctx.debug {
