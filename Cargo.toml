@@ -1,6 +1,6 @@
 [package]
 name = "latticework"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "CLI for stacked branches and PRs"
 license = "MIT"
