@@ -859,6 +859,7 @@ mod live_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn live_get_nonexistent_pr() {
         let Some(token) = get_test_token() else {
             eprintln!("Skipping: GITHUB_TOKEN not set");
@@ -870,7 +871,7 @@ mod live_tests {
             return;
         };
 
-        let forge = GitHubForge::new(owner, repo, token);
+        let forge = GitHubForge::new(token, owner, repo);
 
         // PR 999999999 should not exist
         let result = forge.get_pr(999999999).await;
@@ -878,6 +879,7 @@ mod live_tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn live_find_pr_by_nonexistent_head() {
         let Some(token) = get_test_token() else {
             eprintln!("Skipping: GITHUB_TOKEN not set");
@@ -889,7 +891,7 @@ mod live_tests {
             return;
         };
 
-        let forge = GitHubForge::new(owner, repo, token);
+        let forge = GitHubForge::new(token, owner, repo);
 
         let result = forge
             .find_pr_by_head("definitely-does-not-exist-xyz-123")

@@ -11,7 +11,13 @@
 //! - Optionally restacks before submitting
 //! - Generates stack comments in PR descriptions
 //!
-//! # Bare Repository Support
+//! # Architecture
+//!
+//! The submit command implements `AsyncCommand` per the Phase 6 command migration.
+//! It uses mode dispatch (`SubmitMode`) for bare repository handling:
+//!
+//! - `WithRestack`: May restack before submit, requires working directory
+//! - `NoRestack`: Bare-repo compatible, requires ancestry alignment
 //!
 //! Per SPEC.md Section 4.6.7, in bare repositories:
 //! - `lattice submit` MUST refuse unless `--no-restack` is provided
@@ -54,7 +60,13 @@
 
 use crate::core::metadata::schema::{BaseInfo, FreezeState, FREEZE_REASON_SYNTHETIC_SNAPSHOT};
 use crate::core::metadata::store::MetadataStore;
+use crate::core::ops::journal::OpId;
 use crate::core::types::{BranchName, Oid};
+use crate::engine::command::{AsyncCommand, CommandOutput, PlanFut};
+use crate::engine::exec::ExecuteResult;
+use crate::engine::gate::{requirements, ReadyContext, RequirementSet};
+use crate::engine::modes::{ModeError, SubmitMode};
+use crate::engine::plan::{Plan, PlanStep};
 use crate::engine::scan::RepoSnapshot;
 use crate::engine::Context;
 use crate::git::Git;
@@ -174,9 +186,9 @@ fn check_current_branch_not_snapshot(current: &BranchName, snapshot: &RepoSnapsh
 // ============================================================================
 
 /// Submit options parsed from CLI arguments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct SubmitOptions<'a> {
+pub struct SubmitOptions {
     pub stack: bool,
     pub draft: bool,
     pub publish: bool,
@@ -185,15 +197,118 @@ pub struct SubmitOptions<'a> {
     pub force: bool,
     pub always: bool,
     pub update_only: bool,
-    pub reviewers: Option<&'a str>,
-    pub team_reviewers: Option<&'a str>,
+    pub reviewers: Option<String>,
+    pub team_reviewers: Option<String>,
     pub no_restack: bool,
     pub view: bool,
+    pub quiet: bool,
+    pub verify: bool,
+}
+
+/// Result of a submit operation.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SubmitResult {
+    /// Number of PRs created.
+    pub prs_created: usize,
+    /// Number of PRs updated.
+    pub prs_updated: usize,
+    /// Branches that were submitted.
+    pub submitted_branches: Vec<BranchName>,
+}
+
+/// The submit command for WithRestack mode.
+pub struct SubmitWithRestackCommand {
+    #[allow(dead_code)]
+    opts: SubmitOptions,
+}
+
+impl SubmitWithRestackCommand {
+    /// Create a new submit command with restack mode.
+    pub fn new(opts: SubmitOptions) -> Self {
+        Self { opts }
+    }
+}
+
+impl AsyncCommand for SubmitWithRestackCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::REMOTE;
+    type Output = SubmitResult;
+
+    fn plan<'a>(&'a self, _ready: &'a ReadyContext) -> PlanFut<'a> {
+        Box::pin(async move {
+            // Build a minimal plan - the actual operations happen in execute_submit
+            let plan = Plan::new(OpId::new(), "submit").with_step(PlanStep::ForgeFetch {
+                remote: "origin".to_string(),
+                refspec: None,
+            });
+
+            Ok(plan)
+        })
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(SubmitResult {
+                prs_created: 0,
+                prs_updated: 0,
+                submitted_branches: vec![],
+            }),
+            ExecuteResult::Paused { branch, .. } => CommandOutput::Paused {
+                message: format!("Submit paused at '{}'. This shouldn't happen.", branch),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
+}
+
+/// The submit command for NoRestack mode (bare repo compatible).
+pub struct SubmitNoRestackCommand {
+    #[allow(dead_code)]
+    opts: SubmitOptions,
+}
+
+impl SubmitNoRestackCommand {
+    /// Create a new submit command without restack mode.
+    pub fn new(opts: SubmitOptions) -> Self {
+        Self { opts }
+    }
+}
+
+impl AsyncCommand for SubmitNoRestackCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::REMOTE_BARE_ALLOWED;
+    type Output = SubmitResult;
+
+    fn plan<'a>(&'a self, _ready: &'a ReadyContext) -> PlanFut<'a> {
+        Box::pin(async move {
+            // Build a minimal plan - the actual operations happen in execute_submit
+            let plan = Plan::new(OpId::new(), "submit").with_step(PlanStep::ForgeFetch {
+                remote: "origin".to_string(),
+                refspec: None,
+            });
+
+            Ok(plan)
+        })
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(SubmitResult {
+                prs_created: 0,
+                prs_updated: 0,
+                submitted_branches: vec![],
+            }),
+            ExecuteResult::Paused { branch, .. } => CommandOutput::Paused {
+                message: format!("Submit paused at '{}'. This shouldn't happen.", branch),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
 }
 
 /// Run the submit command.
 ///
 /// This is a synchronous wrapper that uses tokio to run the async implementation.
+/// It uses mode dispatch for bare repository handling per SPEC.md §4.6.7.
 #[allow(clippy::too_many_arguments)]
 pub fn submit(
     ctx: &Context,
@@ -210,6 +325,28 @@ pub fn submit(
     no_restack: bool,
     view: bool,
 ) -> Result<()> {
+    let cwd = ctx
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    // Resolve mode from flags and repo context
+    let is_bare = git.info()?.work_dir.is_none();
+    let mode = SubmitMode::resolve(no_restack, is_bare).map_err(|e| match e {
+        ModeError::BareRepoRequiresFlag { command, required_flag } => {
+            anyhow::anyhow!(
+                "This is a bare repository. The `{}` command requires a working directory for restacking.\n\n\
+                 To submit without restacking (branches must be properly aligned), use:\n\n\
+                     lattice submit {}\n\n\
+                 Note: Branches must satisfy ancestry alignment (parent tip is ancestor of branch tip).\n\
+                 If alignment fails, you'll need to restack from a worktree first.",
+                command,
+                required_flag
+            )
+        }
+    })?;
+
     let opts = SubmitOptions {
         stack,
         draft,
@@ -219,40 +356,78 @@ pub fn submit(
         force,
         always,
         update_only,
-        reviewers,
-        team_reviewers,
+        reviewers: reviewers.map(|s| s.to_string()),
+        team_reviewers: team_reviewers.map(|s| s.to_string()),
         no_restack,
         view,
+        quiet: ctx.quiet,
+        verify: ctx.verify,
     };
 
-    // Use tokio runtime to run async code
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(submit_async(ctx, opts))
+    match mode {
+        SubmitMode::WithRestack => rt.block_on(submit_with_restack_impl(&git, ctx, opts)),
+        SubmitMode::NoRestack => rt.block_on(submit_no_restack_impl(&git, ctx, opts)),
+    }
 }
 
-/// Async implementation of submit.
-async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
+/// Async implementation for WithRestack mode.
+async fn submit_with_restack_impl(git: &Git, ctx: &Context, opts: SubmitOptions) -> Result<()> {
+    use crate::engine::runner::run_async_command;
+
+    let command = SubmitWithRestackCommand::new(opts.clone());
+
+    // Run through async command lifecycle for gating
+    let result = run_async_command(&command, git, ctx).await;
+
+    match result {
+        Ok(output) => match output {
+            CommandOutput::Success(_) => {
+                // Gating passed, now execute submit operations
+                execute_submit(git, ctx, &opts).await
+            }
+            CommandOutput::Paused { message } => bail!("Unexpected pause: {}", message),
+            CommandOutput::Failed { error } => bail!("{}", error),
+        },
+        Err(e) => bail!("Submit failed: {}", e),
+    }
+}
+
+/// Async implementation for NoRestack mode.
+async fn submit_no_restack_impl(git: &Git, ctx: &Context, opts: SubmitOptions) -> Result<()> {
+    use crate::engine::runner::run_async_command;
+
+    let command = SubmitNoRestackCommand::new(opts.clone());
+
+    // Run through async command lifecycle for gating
+    let result = run_async_command(&command, git, ctx).await;
+
+    match result {
+        Ok(output) => match output {
+            CommandOutput::Success(_) => {
+                // Gating passed, now execute submit operations (with alignment check)
+                execute_submit(git, ctx, &opts).await
+            }
+            CommandOutput::Paused { message } => bail!("Unexpected pause: {}", message),
+            CommandOutput::Failed { error } => bail!("{}", error),
+        },
+        Err(e) => bail!("Submit failed: {}", e),
+    }
+}
+
+/// Execute submit operations after gating has passed.
+///
+/// This function performs the actual submit work: pushing branches and creating/updating PRs.
+/// The gating and mode dispatch have already been handled by `submit_with_restack_impl` or
+/// `submit_no_restack_impl`.
+async fn execute_submit(git: &Git, ctx: &Context, opts: &SubmitOptions) -> Result<()> {
     use crate::cli::commands::auth::get_github_token;
     use crate::engine::scan::scan;
 
-    let cwd = ctx
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
-    let git = Git::open(&cwd)?;
-    let snapshot = scan(&git)?;
+    let snapshot = scan(git)?;
 
-    // Per SPEC.md §4.6.7: submit MUST refuse in bare repos unless --no-restack
+    // Check if we're in bare repo mode (for alignment check)
     let is_bare = git.info()?.work_dir.is_none();
-    if is_bare && !opts.no_restack {
-        bail!(
-            "This is a bare repository. The `submit` command requires a working directory for restacking.\n\n\
-             To submit without restacking (branches must be properly aligned), use:\n\n\
-                 lattice submit --no-restack\n\n\
-             Note: Branches must satisfy ancestry alignment (parent tip is ancestor of branch tip).\n\
-             If alignment fails, you'll need to restack from a worktree first."
-        );
-    }
 
     // Check authentication
     let token = match get_github_token() {
@@ -295,7 +470,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
 
     // Filter out snapshot branches (Milestone 5.10)
     let (branches, excluded) = filter_snapshot_branches(branches, &snapshot);
-    report_excluded_snapshots(&excluded, ctx.quiet);
+    report_excluded_snapshots(&excluded, opts.quiet);
 
     // Check we have branches to submit after filtering
     if branches.is_empty() {
@@ -307,7 +482,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
 
     // Per SPEC.md §4.6.7: Even with --no-restack, check alignment in bare repos
     if is_bare && opts.no_restack {
-        check_and_normalize_alignment(ctx, &git, &snapshot, &branches)?;
+        check_and_normalize_alignment(opts.quiet, git, &snapshot, &branches)?;
     }
 
     if opts.dry_run {
@@ -327,11 +502,19 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
     // Submit each branch
     use crate::forge::CreatePrRequest;
 
+    // Get working directory for git push commands
+    let cwd = git
+        .info()?
+        .work_dir
+        .clone()
+        .or_else(|| ctx.cwd.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+
     for branch in &branches {
         let scanned = match snapshot.metadata.get(branch) {
             Some(s) => s,
             None => {
-                if !ctx.quiet {
+                if !opts.quiet {
                     println!("Skipping untracked branch '{}'", branch);
                 }
                 continue;
@@ -339,14 +522,17 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
         };
 
         // Push branch to remote before creating/updating PR
-        if !ctx.quiet {
+        if !opts.quiet {
             println!("Pushing '{}'...", branch);
         }
-        let push_args = if opts.force {
-            vec!["push", "--force-with-lease", "origin", branch.as_str()]
-        } else {
-            vec!["push", "origin", branch.as_str()]
-        };
+        let mut push_args = vec!["push"];
+        if !opts.verify {
+            push_args.push("--no-verify");
+        }
+        if opts.force {
+            push_args.push("--force-with-lease");
+        }
+        push_args.extend(["origin", branch.as_str()]);
         let push_result = std::process::Command::new("git")
             .args(&push_args)
             .current_dir(&cwd)
@@ -369,7 +555,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
         match &scanned.metadata.pr {
             PrState::Linked { number, .. } => {
                 // Update existing PR
-                if !ctx.quiet {
+                if !opts.quiet {
                     println!("Updating PR #{} for '{}'...", number, branch);
                 }
 
@@ -386,7 +572,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
 
                 match forge.update_pr(update_req).await {
                     Ok(pr) => {
-                        if !ctx.quiet {
+                        if !opts.quiet {
                             println!("  Updated: {}", pr.url);
                         }
                     }
@@ -408,7 +594,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
             }
             PrState::None => {
                 if opts.update_only {
-                    if !ctx.quiet {
+                    if !opts.quiet {
                         println!("Skipping '{}' (no existing PR, --update-only)", branch);
                     }
                     continue;
@@ -417,7 +603,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                 // Try to find existing PR by head
                 match forge.find_pr_by_head(branch.as_str()).await? {
                     Some(existing) => {
-                        if !ctx.quiet {
+                        if !opts.quiet {
                             println!(
                                 "Found existing PR #{} for '{}', linking...",
                                 existing.number, branch
@@ -427,7 +613,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                     }
                     None => {
                         // Create new PR
-                        if !ctx.quiet {
+                        if !opts.quiet {
                             println!("Creating PR for '{}'...", branch);
                         }
 
@@ -446,7 +632,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
 
                         match forge.create_pr(create_req).await {
                             Ok(pr) => {
-                                if !ctx.quiet {
+                                if !opts.quiet {
                                     println!("  Created: {}", pr.url);
                                 }
                                 // Would update metadata with PR linkage here
@@ -456,12 +642,14 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
                                     let reviewers = crate::forge::Reviewers {
                                         users: opts
                                             .reviewers
+                                            .as_deref()
                                             .map(|r| {
                                                 r.split(',').map(|s| s.trim().to_string()).collect()
                                             })
                                             .unwrap_or_default(),
                                         teams: opts
                                             .team_reviewers
+                                            .as_deref()
                                             .map(|r| {
                                                 r.split(',').map(|s| s.trim().to_string()).collect()
                                             })
@@ -487,7 +675,7 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
     // After all PRs are created/updated, refresh stack comments for all PRs
     // This ensures newly created PRs are reflected in existing PR descriptions
     if !opts.dry_run {
-        if !ctx.quiet {
+        if !opts.quiet {
             println!("Refreshing stack comments...");
         }
 
@@ -496,11 +684,11 @@ async fn submit_async(ctx: &Context, opts: SubmitOptions<'_>) -> Result<()> {
             forge.as_ref(),
             &snapshot,
             &branches,
-            ctx.quiet,
+            opts.quiet,
         )
         .await?;
 
-        if updated > 0 && !ctx.quiet {
+        if updated > 0 && !opts.quiet {
             println!("  Updated {} PR description(s)", updated);
         }
     }
@@ -647,7 +835,7 @@ fn normalize_base_metadata(
 /// - If aligned with stale base: normalize metadata and print message
 /// - If not aligned: bail with restack required message
 fn check_and_normalize_alignment(
-    ctx: &Context,
+    quiet: bool,
     git: &Git,
     snapshot: &RepoSnapshot,
     branches: &[BranchName],
@@ -662,7 +850,7 @@ fn check_and_normalize_alignment(
             let count = normalizations.len();
             normalize_base_metadata(git, snapshot, &normalizations)?;
 
-            if !ctx.quiet {
+            if !quiet {
                 println!(
                     "Updated base metadata for {} branch(es) (no history changes).",
                     count
@@ -702,6 +890,8 @@ mod tests {
             team_reviewers: None,
             no_restack: false,
             view: false,
+            quiet: false,
+            verify: true,
         };
         assert!(!opts.stack);
         assert!(!opts.draft);

@@ -42,8 +42,10 @@
 
 use super::capabilities::{Capability, CapabilitySet};
 use super::health::Issue;
-use super::scan::RepoSnapshot;
+use super::scan::{RepoSnapshot, ScannedMetadata};
+use crate::core::graph::StackGraph;
 use crate::core::types::BranchName;
+use std::collections::HashMap;
 
 /// Requirements for a command to execute.
 ///
@@ -312,11 +314,35 @@ impl RepairBundle {
     /// Get a summary message.
     pub fn summary(&self) -> String {
         let n = self.blocking_issues.len();
-        if n == 1 {
-            format!("1 issue blocking {}", self.command)
+        let cap_count = self.missing_capabilities.len();
+
+        if n > 0 {
+            if n == 1 {
+                format!("1 issue blocking {}", self.command)
+            } else {
+                format!("{} issues blocking {}", n, self.command)
+            }
+        } else if cap_count > 0 {
+            // No issues, but missing capabilities - show them
+            let cap_names: Vec<&str> = self
+                .missing_capabilities
+                .iter()
+                .map(|c| c.description())
+                .collect();
+            format!(
+                "missing capabilities for {}: {}",
+                self.command,
+                cap_names.join(", ")
+            )
         } else {
-            format!("{} issues blocking {}", n, self.command)
+            format!("gating failed for {} (unknown reason)", self.command)
         }
+    }
+}
+
+impl std::fmt::Display for RepairBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.summary())
     }
 }
 
@@ -411,9 +437,8 @@ pub fn gate_with_scope(
 
     let data = match target_branch {
         Some(branch) => {
-            // Get all branches in scope (upstack from target)
-            let branches = vec![branch.clone()];
-            // TODO: Walk graph to find all upstack branches
+            // Get all branches in scope using scope walking
+            let branches = compute_stack_scope(&branch, &snapshot.graph, &trunk);
             ValidatedData::StackScope { trunk, branches }
         }
         None => ValidatedData::StackScope {
@@ -423,6 +448,142 @@ pub fn gate_with_scope(
     };
 
     GateResult::Ready(Box::new(ReadyContext { snapshot, data }))
+}
+
+/// Compute the stack scope for a branch operation.
+///
+/// Returns all branches that would be in scope for an operation on `target`:
+/// - The target branch itself
+/// - All ancestors up to (but not including) trunk
+///
+/// The returned list is in topological order (closest to trunk first),
+/// which is the correct order for restack operations.
+///
+/// # Arguments
+///
+/// * `target` - The branch being operated on
+/// * `graph` - The stack graph
+/// * `trunk` - The trunk branch name
+///
+/// # Example
+///
+/// ```ignore
+/// // Graph: trunk -> A -> B -> C (target)
+/// let scope = compute_stack_scope(&c, &graph, &trunk);
+/// // Returns: [A, B, C] (in topological order)
+/// ```
+pub fn compute_stack_scope(
+    target: &BranchName,
+    graph: &StackGraph,
+    trunk: &BranchName,
+) -> Vec<BranchName> {
+    let mut scope = Vec::new();
+
+    // Walk from target up to trunk, collecting ancestors
+    let mut current = Some(target.clone());
+    while let Some(branch) = current {
+        if &branch == trunk {
+            // Don't include trunk in the scope
+            break;
+        }
+        scope.push(branch.clone());
+        current = graph.parent(&branch).cloned();
+    }
+
+    // Reverse to get topological order (closest to trunk first)
+    scope.reverse();
+    scope
+}
+
+/// Compute the freeze scope for a branch operation.
+///
+/// Per SPEC.md §8B.4, freeze applies to "the target branch and its
+/// downstack ancestors up to trunk."
+///
+/// This function returns all branches that must be checked for frozen state
+/// before an operation that would modify the target branch.
+///
+/// # Arguments
+///
+/// * `target` - The branch being operated on
+/// * `graph` - The stack graph
+/// * `trunk` - The trunk branch name
+/// * `include_descendants` - Whether to include descendants (for upstack operations)
+///
+/// # Returns
+///
+/// List of branches to check for frozen state.
+pub fn compute_freeze_scope(
+    target: &BranchName,
+    graph: &StackGraph,
+    trunk: &BranchName,
+    include_descendants: bool,
+) -> Vec<BranchName> {
+    let mut scope = Vec::new();
+
+    // Always include target
+    scope.push(target.clone());
+
+    // Walk downstack (ancestors) to trunk
+    let mut current = graph.parent(target).cloned();
+    while let Some(branch) = current {
+        if &branch == trunk {
+            break;
+        }
+        scope.push(branch.clone());
+        current = graph.parent(&branch).cloned();
+    }
+
+    // Optionally include descendants (upstack)
+    if include_descendants {
+        let descendants = graph.descendants(target);
+        scope.extend(descendants);
+    }
+
+    scope
+}
+
+/// Check if frozen policy is satisfied for a scope.
+///
+/// Returns `Ok(())` if no branches in the scope are frozen,
+/// or `Err(frozen_branches)` with the list of frozen branches.
+///
+/// # Arguments
+///
+/// * `scope` - Branches to check
+/// * `metadata` - Metadata for tracked branches
+///
+/// # Example
+///
+/// ```ignore
+/// let scope = compute_freeze_scope(&target, &graph, &trunk, true);
+/// match check_frozen_policy(&scope, &snapshot.metadata) {
+///     Ok(()) => { /* proceed */ }
+///     Err(frozen) => {
+///         println!("Cannot proceed: branches {:?} are frozen", frozen);
+///     }
+/// }
+/// ```
+pub fn check_frozen_policy(
+    scope: &[BranchName],
+    metadata: &HashMap<BranchName, ScannedMetadata>,
+) -> Result<(), Vec<BranchName>> {
+    let frozen: Vec<BranchName> = scope
+        .iter()
+        .filter(|b| {
+            metadata
+                .get(*b)
+                .map(|m| m.metadata.freeze.is_frozen())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    if frozen.is_empty() {
+        Ok(())
+    } else {
+        Err(frozen)
+    }
 }
 
 #[cfg(test)]
@@ -846,6 +1007,133 @@ mod tests {
                 }
                 _ => panic!("wrong variant"),
             }
+        }
+    }
+
+    mod scope_walking {
+        use super::*;
+        use crate::core::graph::StackGraph;
+
+        fn make_graph() -> (StackGraph, BranchName, BranchName, BranchName, BranchName) {
+            // Build graph: main -> a -> b -> c
+            let mut graph = StackGraph::new();
+            let main = BranchName::new("main").unwrap();
+            let a = BranchName::new("a").unwrap();
+            let b = BranchName::new("b").unwrap();
+            let c = BranchName::new("c").unwrap();
+
+            graph.add_edge(a.clone(), main.clone());
+            graph.add_edge(b.clone(), a.clone());
+            graph.add_edge(c.clone(), b.clone());
+
+            (graph, main, a, b, c)
+        }
+
+        #[test]
+        fn compute_stack_scope_includes_target() {
+            let (graph, main, a, _, _) = make_graph();
+            let scope = compute_stack_scope(&a, &graph, &main);
+            assert!(scope.contains(&a));
+        }
+
+        #[test]
+        fn compute_stack_scope_includes_ancestors() {
+            let (graph, main, a, b, c) = make_graph();
+            let scope = compute_stack_scope(&c, &graph, &main);
+
+            // Should include a, b, c but not main (trunk)
+            assert!(scope.contains(&a));
+            assert!(scope.contains(&b));
+            assert!(scope.contains(&c));
+            assert!(!scope.contains(&main));
+        }
+
+        #[test]
+        fn compute_stack_scope_topological_order() {
+            let (graph, main, a, b, c) = make_graph();
+            let scope = compute_stack_scope(&c, &graph, &main);
+
+            // Order should be a, b, c (closest to trunk first)
+            let a_pos = scope.iter().position(|x| x == &a).unwrap();
+            let b_pos = scope.iter().position(|x| x == &b).unwrap();
+            let c_pos = scope.iter().position(|x| x == &c).unwrap();
+
+            assert!(a_pos < b_pos);
+            assert!(b_pos < c_pos);
+        }
+
+        #[test]
+        fn compute_stack_scope_single_branch() {
+            let (graph, main, a, _, _) = make_graph();
+            let scope = compute_stack_scope(&a, &graph, &main);
+
+            // Only a, since its parent is trunk
+            assert_eq!(scope.len(), 1);
+            assert_eq!(scope[0], a);
+        }
+
+        #[test]
+        fn compute_freeze_scope_without_descendants() {
+            let (graph, main, a, b, c) = make_graph();
+            let scope = compute_freeze_scope(&b, &graph, &main, false);
+
+            // Should include b (target) and a (ancestor), but not c (descendant)
+            assert!(scope.contains(&b));
+            assert!(scope.contains(&a));
+            assert!(!scope.contains(&c));
+            assert!(!scope.contains(&main));
+        }
+
+        #[test]
+        fn compute_freeze_scope_with_descendants() {
+            let (graph, main, a, b, c) = make_graph();
+            let scope = compute_freeze_scope(&b, &graph, &main, true);
+
+            // Should include b (target), a (ancestor), and c (descendant)
+            assert!(scope.contains(&b));
+            assert!(scope.contains(&a));
+            assert!(scope.contains(&c));
+            assert!(!scope.contains(&main));
+        }
+
+        #[test]
+        fn check_frozen_policy_passes_when_no_frozen() {
+            let scope = vec![BranchName::new("a").unwrap(), BranchName::new("b").unwrap()];
+            let metadata = HashMap::new(); // No metadata = no frozen branches
+
+            let result = check_frozen_policy(&scope, &metadata);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn check_frozen_policy_fails_when_frozen() {
+            use crate::core::metadata::schema::{
+                BranchMetadataV1, FreezeScope as FreezeScopeEnum, FreezeState,
+            };
+            use crate::core::types::Oid;
+
+            let a = BranchName::new("a").unwrap();
+            let b = BranchName::new("b").unwrap();
+            let scope = vec![a.clone(), b.clone()];
+
+            // Create metadata with 'a' frozen
+            let mut metadata = HashMap::new();
+            let mut meta_a =
+                BranchMetadataV1::new(a.clone(), BranchName::new("main").unwrap(), Oid::zero());
+            meta_a.freeze = FreezeState::frozen(FreezeScopeEnum::Single, Some("test".to_string()));
+            metadata.insert(
+                a.clone(),
+                ScannedMetadata {
+                    ref_oid: Oid::zero(),
+                    metadata: meta_a,
+                },
+            );
+
+            let result = check_frozen_policy(&scope, &metadata);
+            assert!(result.is_err());
+            let frozen = result.unwrap_err();
+            assert_eq!(frozen.len(), 1);
+            assert!(frozen.contains(&a));
         }
     }
 }

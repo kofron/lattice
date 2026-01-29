@@ -28,12 +28,15 @@ use anyhow::Result;
 pub fn run() -> Result<()> {
     let cli = Cli::parse_args();
 
-    // Create context from CLI flags
+    // Create context from CLI flags.
+    // Note: verify defaults to true (hooks honored) per ARCHITECTURE.md §10.2.
+    // Config-based defaults could be added later, but CLI flag always takes precedence.
     let ctx = engine::Context {
         cwd: cli.cwd.clone(),
         debug: cli.debug,
         quiet: cli.quiet,
         interactive: cli.interactive(),
+        verify: cli.verify_flag().unwrap_or(true),
     };
 
     // Dispatch to command handler

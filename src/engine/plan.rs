@@ -45,7 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::core::metadata::schema::BranchMetadataV1;
-use crate::core::ops::journal::OpId;
+use crate::core::ops::journal::{OpId, TouchedRef};
+use crate::core::types::BranchName;
 
 /// A typed plan step.
 ///
@@ -151,6 +152,114 @@ pub enum PlanStep {
         /// Current OID of the head branch (for ancestry validation).
         head_oid: String,
     },
+
+    /// Switch to a different branch (checkout).
+    ///
+    /// This step changes the working directory's HEAD to point to the specified
+    /// branch. Unlike ref updates, this modifies the working directory state
+    /// rather than refs directly.
+    ///
+    /// Used by navigation commands (checkout, up, down, top, bottom).
+    Checkout {
+        /// Branch to check out.
+        branch: String,
+        /// Human-readable reason for the checkout.
+        reason: String,
+    },
+
+    // ========================================================================
+    // Forge/Remote Steps (Phase 6)
+    // ========================================================================
+    /// Fetch from a remote repository.
+    ///
+    /// This step fetches refs from the specified remote. It may fetch
+    /// all branches or a specific refspec.
+    ForgeFetch {
+        /// Remote name (e.g., "origin").
+        remote: String,
+        /// Specific refspec to fetch (optional, defaults to all).
+        refspec: Option<String>,
+    },
+
+    /// Push a branch to a remote.
+    ///
+    /// This step pushes a local branch to the remote. It uses
+    /// `--force-with-lease` for safety when force is enabled.
+    ForgePush {
+        /// Branch to push.
+        branch: String,
+        /// Use force push (with lease for safety).
+        force: bool,
+        /// Remote name (e.g., "origin").
+        remote: String,
+        /// Human-readable reason for the push.
+        reason: String,
+    },
+
+    /// Create a pull request on the forge.
+    ///
+    /// This step creates a new PR via the forge API (e.g., GitHub).
+    /// The created PR's number and URL are captured for subsequent steps.
+    ForgeCreatePr {
+        /// Head branch (the branch being merged).
+        head: String,
+        /// Base branch (the target branch, e.g., "main").
+        base: String,
+        /// PR title.
+        title: String,
+        /// PR body (optional).
+        body: Option<String>,
+        /// Create as draft PR.
+        draft: bool,
+    },
+
+    /// Update an existing pull request.
+    ///
+    /// This step updates PR metadata via the forge API. All fields
+    /// are optional - only specified fields are updated.
+    ForgeUpdatePr {
+        /// PR number to update.
+        number: u64,
+        /// New base branch (optional).
+        base: Option<String>,
+        /// New title (optional).
+        title: Option<String>,
+        /// New body (optional).
+        body: Option<String>,
+    },
+
+    /// Toggle PR draft status.
+    ///
+    /// This step changes a PR between draft and ready-for-review states.
+    /// Requires GraphQL API for GitHub.
+    ForgeDraftToggle {
+        /// PR number.
+        number: u64,
+        /// Set to draft (true) or ready for review (false).
+        draft: bool,
+    },
+
+    /// Request reviewers on a PR.
+    ///
+    /// This step requests review from users and/or teams.
+    ForgeRequestReviewers {
+        /// PR number.
+        number: u64,
+        /// User logins to request review from.
+        users: Vec<String>,
+        /// Team slugs to request review from.
+        teams: Vec<String>,
+    },
+
+    /// Merge a PR via the forge API.
+    ///
+    /// This step merges a PR using the specified merge method.
+    ForgeMergePr {
+        /// PR number to merge.
+        number: u64,
+        /// Merge method: "merge", "squash", or "rebase".
+        method: String,
+    },
 }
 
 impl PlanStep {
@@ -177,6 +286,22 @@ impl PlanStep {
                 // Will create refs/heads/{branch_name}
                 vec![branch_name.as_str()]
             }
+            PlanStep::Checkout { .. } => {
+                // Checkout modifies HEAD but doesn't touch branch refs
+                vec![]
+            }
+            // Forge steps don't touch local refs directly (except ForgePush which
+            // pushes existing refs). The effects are remote-side.
+            PlanStep::ForgeFetch { .. } => vec![],
+            PlanStep::ForgePush { branch, .. } => {
+                // Push reads the local branch ref
+                vec![branch.as_str()]
+            }
+            PlanStep::ForgeCreatePr { .. } => vec![],
+            PlanStep::ForgeUpdatePr { .. } => vec![],
+            PlanStep::ForgeDraftToggle { .. } => vec![],
+            PlanStep::ForgeRequestReviewers { .. } => vec![],
+            PlanStep::ForgeMergePr { .. } => vec![],
         }
     }
 
@@ -190,6 +315,15 @@ impl PlanStep {
                 | PlanStep::DeleteMetadataCas { .. }
                 | PlanStep::RunGit { .. }
                 | PlanStep::CreateSnapshotBranch { .. }
+                | PlanStep::Checkout { .. }
+                // Forge steps that perform mutations (remote-side effects)
+                | PlanStep::ForgeFetch { .. }
+                | PlanStep::ForgePush { .. }
+                | PlanStep::ForgeCreatePr { .. }
+                | PlanStep::ForgeUpdatePr { .. }
+                | PlanStep::ForgeDraftToggle { .. }
+                | PlanStep::ForgeRequestReviewers { .. }
+                | PlanStep::ForgeMergePr { .. }
         )
     }
 
@@ -229,6 +363,61 @@ impl PlanStep {
                     "Create snapshot branch '{}' from PR #{}",
                     branch_name, pr_number
                 )
+            }
+            PlanStep::Checkout { branch, reason } => {
+                format!("Checkout '{}': {}", branch, reason)
+            }
+            // Forge step descriptions
+            PlanStep::ForgeFetch { remote, refspec } => {
+                if let Some(spec) = refspec {
+                    format!("Fetch '{}' from {}", spec, remote)
+                } else {
+                    format!("Fetch from {}", remote)
+                }
+            }
+            PlanStep::ForgePush {
+                branch,
+                force,
+                remote,
+                reason,
+            } => {
+                if *force {
+                    format!("Force push '{}' to {}: {}", branch, remote, reason)
+                } else {
+                    format!("Push '{}' to {}: {}", branch, remote, reason)
+                }
+            }
+            PlanStep::ForgeCreatePr {
+                head, base, draft, ..
+            } => {
+                if *draft {
+                    format!("Create draft PR: {} -> {}", head, base)
+                } else {
+                    format!("Create PR: {} -> {}", head, base)
+                }
+            }
+            PlanStep::ForgeUpdatePr { number, .. } => {
+                format!("Update PR #{}", number)
+            }
+            PlanStep::ForgeDraftToggle { number, draft } => {
+                if *draft {
+                    format!("Convert PR #{} to draft", number)
+                } else {
+                    format!("Mark PR #{} ready for review", number)
+                }
+            }
+            PlanStep::ForgeRequestReviewers {
+                number,
+                users,
+                teams,
+            } => {
+                let mut reviewers = Vec::new();
+                reviewers.extend(users.iter().cloned());
+                reviewers.extend(teams.iter().map(|t| format!("@{}", t)));
+                format!("Request review on PR #{}: {}", number, reviewers.join(", "))
+            }
+            PlanStep::ForgeMergePr { number, method } => {
+                format!("Merge PR #{} ({})", number, method)
             }
         }
     }
@@ -350,6 +539,152 @@ impl Plan {
     /// Get all touched refs.
     pub fn touched_refs(&self) -> &[String] {
         &self.touched_refs
+    }
+
+    /// Get touched refs with their expected old OIDs for CAS validation.
+    ///
+    /// This extracts the CAS preconditions from all plan steps, returning
+    /// a list of `TouchedRef` entries suitable for storing in `OpState`.
+    ///
+    /// Per SPEC.md §4.6.5, this information is needed for rollback CAS.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::engine::plan::{Plan, PlanStep};
+    /// use latticework::core::ops::journal::OpId;
+    ///
+    /// let plan = Plan::new(OpId::new(), "test")
+    ///     .with_step(PlanStep::UpdateRefCas {
+    ///         refname: "refs/heads/feature".to_string(),
+    ///         old_oid: Some("abc123".to_string()),
+    ///         new_oid: "def456".to_string(),
+    ///         reason: "test".to_string(),
+    ///     });
+    ///
+    /// let touched = plan.touched_refs_with_oids();
+    /// assert_eq!(touched.len(), 1);
+    /// assert_eq!(touched[0].refname, "refs/heads/feature");
+    /// assert_eq!(touched[0].expected_old, Some("abc123".to_string()));
+    /// ```
+    pub fn touched_refs_with_oids(&self) -> Vec<TouchedRef> {
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for step in &self.steps {
+            match step {
+                PlanStep::UpdateRefCas {
+                    refname, old_oid, ..
+                } => {
+                    if seen.insert(refname.clone()) {
+                        result.push(TouchedRef::new(refname.clone(), old_oid.clone()));
+                    }
+                }
+                PlanStep::DeleteRefCas {
+                    refname, old_oid, ..
+                } => {
+                    if seen.insert(refname.clone()) {
+                        result.push(TouchedRef::new(refname.clone(), Some(old_oid.clone())));
+                    }
+                }
+                PlanStep::WriteMetadataCas {
+                    branch,
+                    old_ref_oid,
+                    ..
+                } => {
+                    let refname = format!("refs/branch-metadata/{}", branch);
+                    if seen.insert(refname.clone()) {
+                        result.push(TouchedRef::new(refname, old_ref_oid.clone()));
+                    }
+                }
+                PlanStep::DeleteMetadataCas {
+                    branch,
+                    old_ref_oid,
+                    ..
+                } => {
+                    let refname = format!("refs/branch-metadata/{}", branch);
+                    if seen.insert(refname.clone()) {
+                        result.push(TouchedRef::new(refname, Some(old_ref_oid.clone())));
+                    }
+                }
+                // RunGit, Checkpoint, PotentialConflictPause, CreateSnapshotBranch
+                // don't have explicit old OIDs - they're derived from expected_effects
+                // or don't touch refs directly
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    /// Get all branch refs that will be touched by this plan.
+    ///
+    /// Returns branch names (not full refs) for branches under `refs/heads/`.
+    /// This is used for worktree occupancy checking - branches checked out
+    /// in other worktrees cannot be mutated.
+    ///
+    /// # Note
+    ///
+    /// Metadata refs (`refs/branch-metadata/`) are NOT included because
+    /// metadata-only operations don't require occupancy checks per SPEC.md §4.6.8.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::engine::plan::{Plan, PlanStep};
+    /// use latticework::core::ops::journal::OpId;
+    ///
+    /// let plan = Plan::new(OpId::new(), "test")
+    ///     .with_step(PlanStep::UpdateRefCas {
+    ///         refname: "refs/heads/feature".to_string(),
+    ///         old_oid: Some("abc".to_string()),
+    ///         new_oid: "def".to_string(),
+    ///         reason: "test".to_string(),
+    ///     });
+    ///
+    /// let branches = plan.touched_branches();
+    /// assert_eq!(branches.len(), 1);
+    /// assert_eq!(branches[0].as_str(), "feature");
+    /// ```
+    pub fn touched_branches(&self) -> Vec<BranchName> {
+        self.touched_refs
+            .iter()
+            .filter_map(|r| r.strip_prefix("refs/heads/"))
+            .filter_map(|name| BranchName::new(name).ok())
+            .collect()
+    }
+
+    /// Check if this plan touches any branch refs.
+    ///
+    /// Plans that only touch metadata refs don't need occupancy checks.
+    /// Per SPEC.md §4.6.8, metadata-only commands (track, freeze, etc.)
+    /// are NOT blocked by worktree occupancy.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use latticework::engine::plan::{Plan, PlanStep};
+    /// use latticework::core::ops::journal::OpId;
+    ///
+    /// // Plan with branch ref - needs occupancy check
+    /// let plan = Plan::new(OpId::new(), "test")
+    ///     .with_step(PlanStep::UpdateRefCas {
+    ///         refname: "refs/heads/feature".to_string(),
+    ///         old_oid: Some("abc".to_string()),
+    ///         new_oid: "def".to_string(),
+    ///         reason: "test".to_string(),
+    ///     });
+    /// assert!(plan.touches_branch_refs());
+    ///
+    /// // Plan with only checkpoint - no occupancy check needed
+    /// let plan = Plan::new(OpId::new(), "test")
+    ///     .with_step(PlanStep::Checkpoint { name: "start".to_string() });
+    /// assert!(!plan.touches_branch_refs());
+    /// ```
+    pub fn touches_branch_refs(&self) -> bool {
+        self.touched_refs
+            .iter()
+            .any(|r| r.starts_with("refs/heads/"))
     }
 
     /// Generate a preview string for user confirmation.
@@ -673,6 +1008,166 @@ mod tests {
             let refs = plan.touched_refs();
             assert!(refs.contains(&"refs/heads/a".to_string()));
             assert!(refs.contains(&"refs/heads/b".to_string()));
+        }
+
+        #[test]
+        fn touched_branches_extracts_branch_names() {
+            let plan = Plan::new(OpId::new(), "test")
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/heads/feature".to_string(),
+                    old_oid: Some("abc".to_string()),
+                    new_oid: "def".to_string(),
+                    reason: "test".to_string(),
+                })
+                .with_step(PlanStep::DeleteRefCas {
+                    refname: "refs/heads/other".to_string(),
+                    old_oid: "ghi".to_string(),
+                    reason: "test".to_string(),
+                });
+
+            let branches = plan.touched_branches();
+            assert_eq!(branches.len(), 2);
+            let names: Vec<&str> = branches.iter().map(|b| b.as_str()).collect();
+            assert!(names.contains(&"feature"));
+            assert!(names.contains(&"other"));
+        }
+
+        #[test]
+        fn touched_branches_ignores_non_branch_refs() {
+            let plan = Plan::new(OpId::new(), "test")
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/heads/feature".to_string(),
+                    old_oid: None,
+                    new_oid: "abc".to_string(),
+                    reason: "test".to_string(),
+                })
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/tags/v1.0".to_string(),
+                    old_oid: None,
+                    new_oid: "def".to_string(),
+                    reason: "test".to_string(),
+                });
+
+            let branches = plan.touched_branches();
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].as_str(), "feature");
+        }
+
+        #[test]
+        fn touches_branch_refs_true_when_has_branch() {
+            let plan = Plan::new(OpId::new(), "test").with_step(PlanStep::UpdateRefCas {
+                refname: "refs/heads/feature".to_string(),
+                old_oid: Some("abc".to_string()),
+                new_oid: "def".to_string(),
+                reason: "test".to_string(),
+            });
+
+            assert!(plan.touches_branch_refs());
+        }
+
+        #[test]
+        fn touches_branch_refs_false_for_checkpoint_only() {
+            let plan = Plan::new(OpId::new(), "test").with_step(PlanStep::Checkpoint {
+                name: "start".to_string(),
+            });
+
+            assert!(!plan.touches_branch_refs());
+        }
+
+        #[test]
+        fn touches_branch_refs_false_for_empty_plan() {
+            let plan = Plan::new(OpId::new(), "test");
+            assert!(!plan.touches_branch_refs());
+        }
+
+        #[test]
+        fn touched_refs_with_oids_extracts_cas_preconditions() {
+            let plan = Plan::new(OpId::new(), "test")
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/heads/feature".to_string(),
+                    old_oid: Some("abc123".to_string()),
+                    new_oid: "def456".to_string(),
+                    reason: "rebase".to_string(),
+                })
+                .with_step(PlanStep::DeleteRefCas {
+                    refname: "refs/heads/old-branch".to_string(),
+                    old_oid: "ghi789".to_string(),
+                    reason: "cleanup".to_string(),
+                })
+                .with_step(PlanStep::Checkpoint {
+                    name: "mid".to_string(),
+                });
+
+            let touched = plan.touched_refs_with_oids();
+            assert_eq!(touched.len(), 2);
+
+            // First: UpdateRefCas
+            assert_eq!(touched[0].refname, "refs/heads/feature");
+            assert_eq!(touched[0].expected_old, Some("abc123".to_string()));
+
+            // Second: DeleteRefCas
+            assert_eq!(touched[1].refname, "refs/heads/old-branch");
+            assert_eq!(touched[1].expected_old, Some("ghi789".to_string()));
+        }
+
+        #[test]
+        fn touched_refs_with_oids_deduplicates() {
+            let plan = Plan::new(OpId::new(), "test")
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/heads/feature".to_string(),
+                    old_oid: Some("first".to_string()),
+                    new_oid: "second".to_string(),
+                    reason: "first update".to_string(),
+                })
+                .with_step(PlanStep::UpdateRefCas {
+                    refname: "refs/heads/feature".to_string(),
+                    old_oid: Some("second".to_string()),
+                    new_oid: "third".to_string(),
+                    reason: "second update".to_string(),
+                });
+
+            let touched = plan.touched_refs_with_oids();
+            // Should only have one entry (first occurrence wins)
+            assert_eq!(touched.len(), 1);
+            assert_eq!(touched[0].refname, "refs/heads/feature");
+            assert_eq!(touched[0].expected_old, Some("first".to_string()));
+        }
+
+        #[test]
+        fn touched_refs_with_oids_includes_metadata_refs() {
+            use crate::core::metadata::schema::BranchMetadataV1;
+            use crate::core::types::{BranchName, Oid};
+
+            let meta = BranchMetadataV1::new(
+                BranchName::new("feature").unwrap(),
+                BranchName::new("main").unwrap(),
+                Oid::new("abc123abc123abc123abc123abc123abc123abc1").unwrap(),
+            );
+            let plan = Plan::new(OpId::new(), "track").with_step(PlanStep::WriteMetadataCas {
+                branch: "feature".to_string(),
+                old_ref_oid: None, // Creating new metadata
+                metadata: Box::new(meta),
+            });
+
+            let touched = plan.touched_refs_with_oids();
+            assert_eq!(touched.len(), 1);
+            assert_eq!(touched[0].refname, "refs/branch-metadata/feature");
+            assert!(touched[0].expected_old.is_none());
+        }
+
+        #[test]
+        fn touched_refs_with_oids_handles_new_refs() {
+            let plan = Plan::new(OpId::new(), "create").with_step(PlanStep::UpdateRefCas {
+                refname: "refs/heads/new-branch".to_string(),
+                old_oid: None, // Creating new ref
+                new_oid: "abc123".to_string(),
+                reason: "create branch".to_string(),
+            });
+
+            let touched = plan.touched_refs_with_oids();
+            assert_eq!(touched.len(), 1);
+            assert_eq!(touched[0].refname, "refs/heads/new-branch");
+            assert!(touched[0].expected_old.is_none());
         }
     }
 

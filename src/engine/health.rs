@@ -963,6 +963,47 @@ pub mod issues {
             context: format!("Open PR targeting trunk with head branch '{}'", branch),
         })
     }
+
+    // --- Rollback Issues ---
+
+    /// Create an issue for partial rollback failure.
+    ///
+    /// Per SPEC.md Section 4.2.2, when an abort cannot fully restore refs,
+    /// this issue surfaces the problem to the doctor for guided resolution.
+    ///
+    /// # Arguments
+    ///
+    /// * `op_id` - The operation ID that was being aborted
+    /// * `command` - The command that was being aborted
+    /// * `failed_refs` - List of (refname, error_message) pairs for refs that
+    ///   could not be rolled back
+    pub fn partial_rollback_failure(
+        op_id: &str,
+        command: &str,
+        failed_refs: Vec<(String, String)>,
+    ) -> Issue {
+        let failed_list: Vec<String> = failed_refs
+            .iter()
+            .map(|(refname, err)| format!("  - {}: {}", refname, err))
+            .collect();
+
+        Issue::new(
+            "partial-rollback-failure",
+            Severity::Blocking,
+            format!(
+                "Operation '{}' (id: {}) was partially rolled back.\n\
+                 The following refs could not be restored:\n{}\n\n\
+                 The repository may be in an inconsistent state.",
+                command,
+                &op_id[..8.min(op_id.len())],
+                failed_list.join("\n")
+            ),
+        )
+        .with_evidence(Evidence::Config {
+            key: format!("op.{}", op_id),
+            problem: format!("{} refs failed to roll back", failed_refs.len()),
+        })
+    }
 }
 
 #[cfg(test)]

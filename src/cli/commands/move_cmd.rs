@@ -13,21 +13,216 @@
 //! - Must never rewrite frozen branches
 //! - Metadata updated only after refs succeed
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
-use crate::cli::commands::phase3_helpers::{
-    check_freeze_affected_set, is_descendant_of, rebase_onto_with_journal, RebaseOutcome,
-};
+use crate::cli::commands::phase3_helpers::is_descendant_of;
 use crate::cli::commands::restack::{get_descendants_inclusive, get_parent_tip, topological_sort};
 use crate::core::metadata::schema::{BaseInfo, ParentInfo};
-use crate::core::metadata::store::MetadataStore;
-use crate::core::ops::journal::{Journal, OpState};
-use crate::core::ops::lock::RepoLock;
-use crate::core::paths::LatticePaths;
-use crate::core::types::BranchName;
+use crate::core::ops::journal::OpId;
+use crate::core::types::{BranchName, Oid, UtcTimestamp};
+use crate::engine::command::{Command, CommandOutput};
+use crate::engine::exec::ExecuteResult;
+use crate::engine::gate::{requirements, ReadyContext, RequirementSet};
+use crate::engine::plan::{Plan, PlanError, PlanStep};
+use crate::engine::runner::run_command;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
+
+/// Result of move command
+#[derive(Debug)]
+pub struct MoveResult {
+    /// The branch that was moved
+    pub source: BranchName,
+    /// The new parent branch
+    pub onto: BranchName,
+    /// Branches that were restacked
+    pub restacked: Vec<BranchName>,
+    /// Branches that were skipped (frozen)
+    pub skipped_frozen: Vec<BranchName>,
+}
+
+/// Pre-computed data for move command
+pub struct MovePrecomputed {
+    /// Source branch being moved
+    pub source: BranchName,
+    /// Target parent branch
+    pub onto: BranchName,
+    /// Whether onto is the trunk
+    pub onto_is_trunk: bool,
+    /// Source's current base OID
+    pub old_base: String,
+    /// Onto's current tip OID
+    pub onto_tip: String,
+    /// Source metadata ref OID for CAS
+    pub source_metadata_ref_oid: Oid,
+    /// Source's current metadata
+    pub source_metadata: crate::core::metadata::schema::BranchMetadataV1,
+    /// Descendants that need restacking
+    pub descendants_to_restack: Vec<DescendantRestackInfo>,
+    /// Frozen branches that will be skipped
+    pub frozen_to_skip: Vec<BranchName>,
+}
+
+/// Info needed to plan a descendant restack
+pub struct DescendantRestackInfo {
+    /// Branch name
+    pub branch: BranchName,
+    /// Current base OID
+    pub old_base: String,
+    /// Parent branch name
+    pub parent_branch: BranchName,
+    /// Current metadata ref OID for CAS
+    pub metadata_ref_oid: Oid,
+    /// Current metadata
+    pub metadata: crate::core::metadata::schema::BranchMetadataV1,
+}
+
+/// Move command implementing Command trait
+pub struct MoveCommand {
+    /// Precomputed data
+    precomputed: MovePrecomputed,
+    /// Whether to run git hooks
+    verify: bool,
+}
+
+impl Command for MoveCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::MUTATING;
+    type Output = MoveResult;
+
+    fn plan(&self, _ctx: &ReadyContext) -> Result<Plan, PlanError> {
+        let pre = &self.precomputed;
+
+        let mut plan = Plan::new(OpId::new(), "move");
+
+        // Step 1: Checkpoint before move
+        plan = plan.with_step(PlanStep::Checkpoint {
+            name: format!("before-move-{}", pre.source),
+        });
+
+        // Step 2: Rebase source onto new parent
+        let mut rebase_args = vec!["rebase".to_string()];
+        if !self.verify {
+            rebase_args.push("--no-verify".to_string());
+        }
+        rebase_args.extend([
+            "--onto".to_string(),
+            pre.onto_tip.clone(),
+            pre.old_base.clone(),
+            pre.source.to_string(),
+        ]);
+
+        plan = plan.with_step(PlanStep::RunGit {
+            args: rebase_args,
+            description: format!("Rebase {} onto {}", pre.source, pre.onto),
+            expected_effects: vec![format!("refs/heads/{}", pre.source)],
+        });
+
+        // Step 3: Potential conflict pause
+        plan = plan.with_step(PlanStep::PotentialConflictPause {
+            branch: pre.source.to_string(),
+            git_operation: "rebase".to_string(),
+        });
+
+        // Step 4: Update source metadata with new parent and base
+        let new_parent = if pre.onto_is_trunk {
+            ParentInfo::Trunk {
+                name: pre.onto.to_string(),
+            }
+        } else {
+            ParentInfo::Branch {
+                name: pre.onto.to_string(),
+            }
+        };
+
+        let mut updated_metadata = pre.source_metadata.clone();
+        updated_metadata.parent = new_parent;
+        updated_metadata.base = BaseInfo {
+            oid: pre.onto_tip.clone(),
+        };
+        updated_metadata.timestamps.updated_at = UtcTimestamp::now();
+
+        plan = plan.with_step(PlanStep::WriteMetadataCas {
+            branch: pre.source.to_string(),
+            old_ref_oid: Some(pre.source_metadata_ref_oid.to_string()),
+            metadata: Box::new(updated_metadata),
+        });
+
+        // Step 5: Restack descendants
+        for desc_info in &pre.descendants_to_restack {
+            plan = plan.with_step(PlanStep::Checkpoint {
+                name: format!("before-restack-{}", desc_info.branch),
+            });
+
+            let mut rebase_args = vec!["rebase".to_string()];
+            if !self.verify {
+                rebase_args.push("--no-verify".to_string());
+            }
+            rebase_args.extend([
+                "--onto".to_string(),
+                desc_info.parent_branch.to_string(),
+                desc_info.old_base.clone(),
+                desc_info.branch.to_string(),
+            ]);
+
+            plan = plan.with_step(PlanStep::RunGit {
+                args: rebase_args,
+                description: format!(
+                    "Rebase {} onto {}",
+                    desc_info.branch, desc_info.parent_branch
+                ),
+                expected_effects: vec![format!("refs/heads/{}", desc_info.branch)],
+            });
+
+            plan = plan.with_step(PlanStep::PotentialConflictPause {
+                branch: desc_info.branch.to_string(),
+                git_operation: "rebase".to_string(),
+            });
+
+            let mut updated_metadata = desc_info.metadata.clone();
+            updated_metadata.base = BaseInfo {
+                oid: desc_info.parent_branch.to_string(),
+            };
+            updated_metadata.timestamps.updated_at = UtcTimestamp::now();
+
+            plan = plan.with_step(PlanStep::WriteMetadataCas {
+                branch: desc_info.branch.to_string(),
+                old_ref_oid: Some(desc_info.metadata_ref_oid.to_string()),
+                metadata: Box::new(updated_metadata),
+            });
+        }
+
+        Ok(plan)
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(MoveResult {
+                source: self.precomputed.source.clone(),
+                onto: self.precomputed.onto.clone(),
+                restacked: self
+                    .precomputed
+                    .descendants_to_restack
+                    .iter()
+                    .map(|d| d.branch.clone())
+                    .collect(),
+                skipped_frozen: self.precomputed.frozen_to_skip.clone(),
+            }),
+            ExecuteResult::Paused {
+                branch, git_state, ..
+            } => CommandOutput::Paused {
+                message: format!(
+                    "Conflict while moving/restacking '{}' ({}).\n\
+                     Resolve conflicts, then run 'lattice continue'.\n\
+                     To abort, run 'lattice abort'.",
+                    branch,
+                    git_state.description()
+                ),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
+}
 
 /// Move (reparent) a branch onto another branch.
 ///
@@ -42,25 +237,18 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let info = git.info()?;
-    let paths = LatticePaths::from_repo_info(&info);
 
-    // Check for in-progress operation
-    if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
-            "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
-            op_state.command,
-            op_state.op_id
-        );
-    }
+    // =========================================================================
+    // PRE-PLAN: Scan and compute state needed for planning
+    // =========================================================================
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    // Ensure trunk is configured
     let trunk = snapshot
         .trunk
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?
+        .clone();
 
     // Resolve source branch
     let source_branch = if let Some(name) = source {
@@ -68,12 +256,11 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
     } else if let Some(ref current) = snapshot.current_branch {
         current.clone()
     } else {
-        bail!("Not on any branch and no source specified");
+        anyhow::bail!("Not on any branch and no source specified");
     };
 
-    // Check if source is tracked
     if !snapshot.metadata.contains_key(&source_branch) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             source_branch
         );
@@ -82,30 +269,23 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
     // Resolve onto branch
     let onto_branch = BranchName::new(onto).context("Invalid onto branch name")?;
 
-    // Check if onto exists
     if !snapshot.branches.contains_key(&onto_branch) {
-        bail!("Target branch '{}' does not exist", onto_branch);
+        anyhow::bail!("Target branch '{}' does not exist", onto_branch);
     }
 
     // Prevent self-move
     if source_branch == onto_branch {
-        bail!("Cannot move a branch onto itself");
+        anyhow::bail!("Cannot move a branch onto itself");
     }
 
-    // Cycle detection: ensure onto is not a descendant of source
+    // Cycle detection
     if is_descendant_of(&onto_branch, &source_branch, &snapshot) {
-        bail!(
+        anyhow::bail!(
             "Cannot move '{}' onto '{}': would create a cycle (target is a descendant)",
             source_branch,
             onto_branch
         );
     }
-
-    // Get descendants for freeze check
-    let descendants = get_descendants_inclusive(&source_branch, &snapshot);
-
-    // Check freeze policy on source and all descendants
-    check_freeze_affected_set(&descendants, &snapshot)?;
 
     // Get source metadata
     let source_meta = snapshot
@@ -113,17 +293,20 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
         .get(&source_branch)
         .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", source_branch))?;
 
-    // Get onto tip (new base for source)
+    // Check freeze on source
+    if source_meta.metadata.freeze.is_frozen() {
+        anyhow::bail!(
+            "Cannot move frozen branch '{}'. Use 'lattice unfreeze' first.",
+            source_branch
+        );
+    }
+
     let onto_tip = snapshot
         .branches
         .get(&onto_branch)
         .ok_or_else(|| anyhow::anyhow!("Branch '{}' not found", onto_branch))?;
 
-    // Get source's current base
-    let old_base = crate::core::types::Oid::new(&source_meta.metadata.base.oid)
-        .context("Invalid base OID in source metadata")?;
-
-    // If source is already a child of onto, check if already aligned
+    // Check if already a child and aligned
     let current_parent_name = source_meta.metadata.parent.name();
     if current_parent_name == onto_branch.as_str()
         && source_meta.metadata.base.oid == onto_tip.as_str()
@@ -144,224 +327,122 @@ pub fn move_branch(ctx: &Context, onto: &str, source: Option<&str>) -> Result<()
         );
     }
 
-    // Acquire lock
-    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
+    // Get descendants and check freeze
+    let descendants = get_descendants_inclusive(&source_branch, &snapshot);
 
-    // Create journal
-    let mut journal = Journal::new("move");
+    let mut descendants_to_restack = Vec::new();
+    let mut frozen_to_skip = Vec::new();
 
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
-    op_state.write(&paths)?;
-
-    // Rebase source onto new parent
-    let remaining_descendants: Vec<String> = descendants
-        .iter()
-        .filter(|b| *b != &source_branch)
-        .map(|b| b.to_string())
-        .collect();
-
-    let outcome = rebase_onto_with_journal(
-        &git,
-        &cwd,
-        &source_branch,
-        &old_base,
-        onto_tip,
-        &mut journal,
-        remaining_descendants.clone(),
-        &paths,
-        ctx,
-    )?;
-
-    match outcome {
-        RebaseOutcome::Success { new_tip: _ } => {
-            // Update source metadata with new parent and base
-            let store = MetadataStore::new(&git);
-
-            let new_parent = if &onto_branch == trunk {
-                ParentInfo::Trunk {
-                    name: onto_branch.to_string(),
-                }
-            } else {
-                ParentInfo::Branch {
-                    name: onto_branch.to_string(),
-                }
-            };
-
-            let mut updated = source_meta.metadata.clone();
-            updated.parent = new_parent;
-            updated.base = BaseInfo {
-                oid: onto_tip.to_string(),
-            };
-            updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-            let new_ref_oid = store
-                .write_cas(&source_branch, Some(&source_meta.ref_oid), &updated)
-                .with_context(|| format!("Failed to update metadata for '{}'", source_branch))?;
-
-            journal.record_metadata_write(
-                source_branch.as_str(),
-                Some(source_meta.ref_oid.to_string()),
-                new_ref_oid,
-            );
-
-            if !ctx.quiet {
-                println!("  Moved '{}'", source_branch);
-            }
-        }
-        RebaseOutcome::Conflict => {
-            println!();
-            println!("Conflict while moving '{}'.", source_branch);
-            println!("Resolve conflicts, then run 'lattice continue'.");
-            println!("To abort, run 'lattice abort'.");
-            return Ok(());
-        }
-        RebaseOutcome::NoOp => {
-            // Still need to update parent pointer even if no rebase needed
-            let store = MetadataStore::new(&git);
-
-            let new_parent = if &onto_branch == trunk {
-                ParentInfo::Trunk {
-                    name: onto_branch.to_string(),
-                }
-            } else {
-                ParentInfo::Branch {
-                    name: onto_branch.to_string(),
-                }
-            };
-
-            let mut updated = source_meta.metadata.clone();
-            updated.parent = new_parent;
-            updated.base = BaseInfo {
-                oid: onto_tip.to_string(),
-            };
-            updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-            let new_ref_oid = store
-                .write_cas(&source_branch, Some(&source_meta.ref_oid), &updated)
-                .with_context(|| format!("Failed to update metadata for '{}'", source_branch))?;
-
-            journal.record_metadata_write(
-                source_branch.as_str(),
-                Some(source_meta.ref_oid.to_string()),
-                new_ref_oid,
-            );
-        }
-    }
-
-    // Restack descendants if any
-    let descendants_to_restack: Vec<_> = descendants
+    let descendants_only: Vec<_> = descendants
         .iter()
         .filter(|b| *b != &source_branch)
         .cloned()
         .collect();
 
-    if !descendants_to_restack.is_empty() {
-        if !ctx.quiet {
-            println!(
-                "Restacking {} descendant(s)...",
-                descendants_to_restack.len()
-            );
+    let ordered = topological_sort(&descendants_only, &snapshot);
+
+    for branch in &ordered {
+        let branch_meta = snapshot
+            .metadata
+            .get(branch)
+            .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
+
+        if branch_meta.metadata.freeze.is_frozen() {
+            frozen_to_skip.push(branch.clone());
+            continue;
         }
 
-        let ordered = topological_sort(&descendants_to_restack, &snapshot);
+        let parent_branch = match &branch_meta.metadata.parent {
+            ParentInfo::Trunk { name } => BranchName::new(name)?,
+            ParentInfo::Branch { name } => BranchName::new(name)?,
+        };
 
-        // Re-scan to get updated state
-        let updated_snapshot = scan(&git).context("Failed to re-scan repository")?;
+        let parent_tip = get_parent_tip(branch, &snapshot, &trunk)?;
 
-        for (idx, branch) in ordered.iter().enumerate() {
-            let branch_meta = updated_snapshot
-                .metadata
-                .get(branch)
-                .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
-
-            // Skip frozen branches
-            if branch_meta.metadata.freeze.is_frozen() {
-                if !ctx.quiet {
-                    println!("  Skipping frozen branch '{}'", branch);
-                }
-                continue;
-            }
-
-            // Get parent tip
-            let parent_tip = get_parent_tip(branch, &updated_snapshot, trunk)?;
-
-            // Check if already aligned
-            if branch_meta.metadata.base.oid.as_str() == parent_tip.as_str() {
-                continue;
-            }
-
-            let branch_old_base = crate::core::types::Oid::new(&branch_meta.metadata.base.oid)
-                .context("Invalid base OID")?;
-
-            let remaining: Vec<String> = ordered
-                .iter()
-                .skip(idx + 1)
-                .map(|b| b.to_string())
-                .collect();
-
-            let outcome = rebase_onto_with_journal(
-                &git,
-                &cwd,
-                branch,
-                &branch_old_base,
-                &parent_tip,
-                &mut journal,
-                remaining,
-                &paths,
-                ctx,
-            )?;
-
-            match outcome {
-                RebaseOutcome::Success { new_tip: _ } => {
-                    // Update metadata
-                    let store = MetadataStore::new(&git);
-                    let fresh_snapshot = scan(&git)?;
-                    let fresh_meta = fresh_snapshot
-                        .metadata
-                        .get(branch)
-                        .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
-
-                    let mut updated = fresh_meta.metadata.clone();
-                    updated.base = BaseInfo {
-                        oid: parent_tip.to_string(),
-                    };
-                    updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-                    let new_ref_oid =
-                        store.write_cas(branch, Some(&fresh_meta.ref_oid), &updated)?;
-
-                    journal.record_metadata_write(
-                        branch.as_str(),
-                        Some(fresh_meta.ref_oid.to_string()),
-                        new_ref_oid,
-                    );
-
-                    if !ctx.quiet {
-                        println!("  Restacked '{}'", branch);
-                    }
-                }
-                RebaseOutcome::Conflict => {
-                    println!();
-                    println!("Conflict while restacking '{}'.", branch);
-                    println!("Resolve conflicts, then run 'lattice continue'.");
-                    println!("To abort, run 'lattice abort'.");
-                    return Ok(());
-                }
-                RebaseOutcome::NoOp => {}
-            }
+        // Check if already aligned
+        if branch_meta.metadata.base.oid.as_str() == parent_tip.to_string().as_str() {
+            continue;
         }
+
+        descendants_to_restack.push(DescendantRestackInfo {
+            branch: branch.clone(),
+            old_base: branch_meta.metadata.base.oid.clone(),
+            parent_branch,
+            metadata_ref_oid: branch_meta.ref_oid.clone(),
+            metadata: branch_meta.metadata.clone(),
+        });
     }
 
-    // Commit journal
-    journal.commit();
-    journal.write(&paths)?;
+    let onto_is_trunk = onto_branch == trunk;
 
-    // Clear op-state
-    OpState::remove(&paths)?;
+    let precomputed = MovePrecomputed {
+        source: source_branch.clone(),
+        onto: onto_branch.clone(),
+        onto_is_trunk,
+        old_base: source_meta.metadata.base.oid.clone(),
+        onto_tip: onto_tip.to_string(),
+        source_metadata_ref_oid: source_meta.ref_oid.clone(),
+        source_metadata: source_meta.metadata.clone(),
+        descendants_to_restack,
+        frozen_to_skip: frozen_to_skip.clone(),
+    };
 
-    if !ctx.quiet {
-        println!("Move complete.");
+    // =========================================================================
+    // EXECUTE: Run command through unified lifecycle
+    // =========================================================================
+
+    let cmd = MoveCommand {
+        precomputed,
+        verify: ctx.verify,
+    };
+
+    let output = run_command(&cmd, &git, ctx)?;
+
+    // =========================================================================
+    // POST-EXECUTE: Display results
+    // =========================================================================
+
+    match output {
+        CommandOutput::Success(result) => {
+            if !ctx.quiet {
+                println!("Moved '{}' onto '{}'", result.source, result.onto);
+
+                if !result.restacked.is_empty() {
+                    println!(
+                        "Restacked {} descendant(s): {}",
+                        result.restacked.len(),
+                        result
+                            .restacked
+                            .iter()
+                            .map(|b| b.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+
+                if !result.skipped_frozen.is_empty() {
+                    println!(
+                        "Skipped {} frozen branch(es): {}",
+                        result.skipped_frozen.len(),
+                        result
+                            .skipped_frozen
+                            .iter()
+                            .map(|b| b.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+
+                println!("Move complete.");
+            }
+        }
+        CommandOutput::Paused { message } => {
+            println!();
+            println!("{}", message);
+        }
+        CommandOutput::Failed { error } => {
+            anyhow::bail!("Move failed: {}", error);
+        }
     }
 
     Ok(())

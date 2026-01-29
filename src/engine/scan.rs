@@ -772,6 +772,8 @@ async fn create_forge_and_query(
     owner: &str,
     repo: &str,
 ) -> Result<RemotePrEvidence, crate::forge::ForgeError> {
+    use std::sync::Arc;
+
     use crate::auth::{GitHubAuthManager, TokenProvider};
     use crate::forge::github::GitHubForge;
     use crate::forge::{Forge, ListPullsOpts};
@@ -781,13 +783,9 @@ async fn create_forge_and_query(
         .map_err(|e| crate::forge::ForgeError::AuthFailed(e.to_string()))?;
     let auth_manager = GitHubAuthManager::new("github.com", store);
 
-    // Get the bearer token from the auth manager
-    let token = auth_manager
-        .bearer_token()
-        .await
-        .map_err(|e| crate::forge::ForgeError::AuthFailed(e.to_string()))?;
-
-    let forge = GitHubForge::new(token, owner, repo);
+    // Create forge with TokenProvider for automatic refresh
+    let provider: Arc<dyn TokenProvider> = Arc::new(auth_manager);
+    let forge = GitHubForge::new_with_provider(provider, owner, repo);
     let opts = ListPullsOpts::default(); // 200 limit
 
     let result = forge.list_open_prs(opts).await?;

@@ -1,4 +1,9 @@
 //! track command - Start tracking a branch
+//!
+//! # Gating
+//!
+//! Uses `requirements::MUTATING_METADATA_ONLY` - this command only creates
+//! metadata refs and does not require a working directory.
 
 use crate::core::metadata::schema::{
     BaseInfo, BranchInfo, BranchMetadataV1, FreezeScope, FreezeState, ParentInfo, PrState,
@@ -6,10 +11,12 @@ use crate::core::metadata::schema::{
 };
 use crate::core::metadata::store::MetadataStore;
 use crate::core::types::BranchName;
-use crate::engine::scan::scan;
+use crate::engine::gate::requirements;
+use crate::engine::runner::{run_gated, RunError};
+use crate::engine::scan::RepoSnapshot;
 use crate::engine::Context;
 use crate::git::Git;
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use std::io::{self, Write};
 
 /// Start tracking a branch.
@@ -21,6 +28,10 @@ use std::io::{self, Write};
 /// * `parent` - Set parent branch explicitly
 /// * `force` - Auto-select nearest tracked ancestor
 /// * `as_frozen` - Track as frozen
+///
+/// # Gating
+///
+/// Uses `requirements::MUTATING_METADATA_ONLY`.
 pub fn track(
     ctx: &Context,
     branch: Option<&str>,
@@ -33,183 +44,247 @@ pub fn track(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    // Ensure trunk is configured
-    let trunk = snapshot
-        .trunk
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?;
+    run_gated(&git, ctx, &requirements::MUTATING_METADATA_ONLY, |ready| {
+        let snapshot = &ready.snapshot;
 
-    // Resolve target branch
-    let target = if let Some(name) = branch {
-        BranchName::new(name).context("Invalid branch name")?
-    } else if let Some(ref current) = snapshot.current_branch {
-        current.clone()
-    } else {
-        bail!("Not on any branch and no branch specified");
-    };
-
-    // Check if branch exists
-    if !snapshot.branches.contains_key(&target) {
-        bail!("Branch '{}' does not exist", target);
-    }
-
-    // Check if already tracked
-    if snapshot.metadata.contains_key(&target) {
-        if !ctx.quiet {
-            println!("Branch '{}' is already tracked", target);
-        }
-        return Ok(());
-    }
-
-    // Can't track trunk
-    if &target == trunk {
-        bail!("Cannot track trunk branch '{}'", trunk);
-    }
-
-    // Determine parent
-    let parent_branch = if let Some(name) = parent {
-        let p = BranchName::new(name).context("Invalid parent branch name")?;
-        // Parent must be tracked or trunk
-        if &p != trunk && !snapshot.metadata.contains_key(&p) {
-            bail!(
-                "Parent '{}' is not tracked. Track it first or use trunk.",
-                p
-            );
-        }
-        p
-    } else if force {
-        // Find nearest tracked ancestor via git merge-base
-        find_nearest_tracked_ancestor(&git, &target, &snapshot)?
-    } else if ctx.interactive {
-        // Interactive selection
-        let mut candidates: Vec<_> = snapshot.metadata.keys().collect();
-        candidates.push(trunk);
-        candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        candidates.dedup();
-
-        println!("Select parent branch for '{}':", target);
-        for (i, b) in candidates.iter().enumerate() {
-            let trunk_marker = if *b == trunk { " (trunk)" } else { "" };
-            println!("  {}. {}{}", i + 1, b, trunk_marker);
-        }
-        print!("Enter number: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let idx = input
-            .trim()
-            .parse::<usize>()
-            .context("Invalid selection")?
-            .saturating_sub(1);
-
-        if idx >= candidates.len() {
-            bail!("Invalid selection");
-        }
-
-        candidates[idx].clone()
-    } else {
-        bail!("No parent specified. Use --parent, --force, or run interactively.");
-    };
-
-    // Get branch tip and parent tip
-    let branch_oid = snapshot
-        .branches
-        .get(&target)
-        .ok_or_else(|| anyhow::anyhow!("Branch '{}' not found", target))?;
-
-    let parent_oid = if &parent_branch == trunk {
-        snapshot
-            .branches
-            .get(trunk)
-            .ok_or_else(|| anyhow::anyhow!("Trunk branch '{}' not found", trunk))?
-    } else {
-        snapshot
-            .branches
-            .get(&parent_branch)
-            .ok_or_else(|| anyhow::anyhow!("Parent branch '{}' not found", parent_branch))?
-    };
-
-    // Compute base via merge-base (the point where branch diverged from parent)
-    // This is more correct than using parent tip directly, especially when
-    // parent has advanced past the divergence point.
-    let base_oid = git
-        .merge_base(branch_oid, parent_oid)
-        .context("Failed to compute merge-base")?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot track '{}': no common ancestor with parent '{}'. \
-                 The branch may have been created independently or from a different history.",
-                target,
-                parent_branch
-            )
+        // Ensure trunk is configured
+        let trunk = snapshot.trunk.as_ref().ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Trunk not configured. Run 'lattice init' first.".to_string(),
+            ))
         })?;
 
-    // Create parent ref
-    let parent_ref = if &parent_branch == trunk {
-        ParentInfo::Trunk {
-            name: parent_branch.to_string(),
+        // Resolve target branch
+        let target = if let Some(name) = branch {
+            BranchName::new(name).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Invalid branch name: {}",
+                    e
+                )))
+            })?
+        } else if let Some(ref current) = snapshot.current_branch {
+            current.clone()
+        } else {
+            return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Not on any branch and no branch specified".to_string(),
+            )));
+        };
+
+        // Check if branch exists
+        if !snapshot.branches.contains_key(&target) {
+            return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                format!("Branch '{}' does not exist", target),
+            )));
         }
-    } else {
-        ParentInfo::Branch {
-            name: parent_branch.to_string(),
+
+        // Check if already tracked
+        if snapshot.metadata.contains_key(&target) {
+            if !ctx.quiet {
+                println!("Branch '{}' is already tracked", target);
+            }
+            return Ok(());
         }
-    };
 
-    // Create metadata
-    let freeze_state = if as_frozen {
-        FreezeState::frozen(FreezeScope::Single, None)
-    } else {
-        FreezeState::Unfrozen
-    };
-
-    let now = crate::core::types::UtcTimestamp::now();
-    let metadata = BranchMetadataV1 {
-        kind: METADATA_KIND.to_string(),
-        schema_version: SCHEMA_VERSION,
-        branch: BranchInfo {
-            name: target.to_string(),
-        },
-        parent: parent_ref,
-        base: BaseInfo {
-            oid: base_oid.to_string(),
-        },
-        freeze: freeze_state,
-        pr: PrState::None,
-        timestamps: Timestamps {
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    };
-
-    // Write metadata (new branch, no expected old value)
-    let store = MetadataStore::new(&git);
-    store
-        .write_cas(&target, None, &metadata)
-        .context("Failed to write metadata")?;
-
-    if !ctx.quiet {
-        println!(
-            "Tracking '{}' with parent '{}' (base: {})",
-            target,
-            parent_branch,
-            &base_oid.as_str()[..7]
-        );
-        if as_frozen {
-            println!("  (frozen)");
+        // Can't track trunk
+        if &target == trunk {
+            return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                format!("Cannot track trunk branch '{}'", trunk),
+            )));
         }
-    }
 
-    Ok(())
+        // Determine parent
+        let parent_branch = if let Some(name) = parent {
+            let p = BranchName::new(name).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Invalid parent branch name: {}",
+                    e
+                )))
+            })?;
+            // Parent must be tracked or trunk
+            if &p != trunk && !snapshot.metadata.contains_key(&p) {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    format!(
+                        "Parent '{}' is not tracked. Track it first or use trunk.",
+                        p
+                    ),
+                )));
+            }
+            p
+        } else if force {
+            // Find nearest tracked ancestor via git merge-base
+            find_nearest_tracked_ancestor(&git, &target, snapshot).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to find nearest tracked ancestor: {}",
+                    e
+                )))
+            })?
+        } else if ctx.interactive {
+            // Interactive selection
+            let mut candidates: Vec<_> = snapshot.metadata.keys().collect();
+            candidates.push(trunk);
+            candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            candidates.dedup();
+
+            println!("Select parent branch for '{}':", target);
+            for (i, b) in candidates.iter().enumerate() {
+                let trunk_marker = if *b == trunk { " (trunk)" } else { "" };
+                println!("  {}. {}{}", i + 1, b, trunk_marker);
+            }
+            print!("Enter number: ");
+            io::stdout().flush().map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to flush stdout: {}",
+                    e
+                )))
+            })?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to read input: {}",
+                    e
+                )))
+            })?;
+            let idx = input
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| {
+                    RunError::Scan(crate::engine::scan::ScanError::Internal(
+                        "Invalid selection".to_string(),
+                    ))
+                })?
+                .saturating_sub(1);
+
+            if idx >= candidates.len() {
+                return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                    "Invalid selection".to_string(),
+                )));
+            }
+
+            candidates[idx].clone()
+        } else {
+            return Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "No parent specified. Use --parent, --force, or run interactively.".to_string(),
+            )));
+        };
+
+        // Get branch tip and parent tip
+        let branch_oid = snapshot.branches.get(&target).ok_or_else(|| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Branch '{}' not found",
+                target
+            )))
+        })?;
+
+        let parent_oid = if &parent_branch == trunk {
+            snapshot.branches.get(trunk).ok_or_else(|| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Trunk branch '{}' not found",
+                    trunk
+                )))
+            })?
+        } else {
+            snapshot.branches.get(&parent_branch).ok_or_else(|| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Parent branch '{}' not found",
+                    parent_branch
+                )))
+            })?
+        };
+
+        // Compute base via merge-base (the point where branch diverged from parent)
+        // This is more correct than using parent tip directly, especially when
+        // parent has advanced past the divergence point.
+        let base_oid = git
+            .merge_base(branch_oid, parent_oid)
+            .map_err(|e| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Failed to compute merge-base: {}",
+                    e
+                )))
+            })?
+            .ok_or_else(|| {
+                RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                    "Cannot track '{}': no common ancestor with parent '{}'. \
+                     The branch may have been created independently or from a different history.",
+                    target, parent_branch
+                )))
+            })?;
+
+        // Create parent ref
+        let parent_ref = if &parent_branch == trunk {
+            ParentInfo::Trunk {
+                name: parent_branch.to_string(),
+            }
+        } else {
+            ParentInfo::Branch {
+                name: parent_branch.to_string(),
+            }
+        };
+
+        // Create metadata
+        let freeze_state = if as_frozen {
+            FreezeState::frozen(FreezeScope::Single, None)
+        } else {
+            FreezeState::Unfrozen
+        };
+
+        let now = crate::core::types::UtcTimestamp::now();
+        let metadata = BranchMetadataV1 {
+            kind: METADATA_KIND.to_string(),
+            schema_version: SCHEMA_VERSION,
+            branch: BranchInfo {
+                name: target.to_string(),
+            },
+            parent: parent_ref,
+            base: BaseInfo {
+                oid: base_oid.to_string(),
+            },
+            freeze: freeze_state,
+            pr: PrState::None,
+            timestamps: Timestamps {
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        };
+
+        // Write metadata (new branch, no expected old value)
+        let store = MetadataStore::new(&git);
+        store.write_cas(&target, None, &metadata).map_err(|e| {
+            RunError::Scan(crate::engine::scan::ScanError::Internal(format!(
+                "Failed to write metadata: {}",
+                e
+            )))
+        })?;
+
+        if !ctx.quiet {
+            println!(
+                "Tracking '{}' with parent '{}' (base: {})",
+                target,
+                parent_branch,
+                &base_oid.as_str()[..7]
+            );
+            if as_frozen {
+                println!("  (frozen)");
+            }
+        }
+
+        Ok(())
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }
 
 /// Find the nearest tracked ancestor of a branch.
 pub fn find_nearest_tracked_ancestor(
     git: &Git,
     branch: &BranchName,
-    snapshot: &crate::engine::scan::RepoSnapshot,
+    snapshot: &RepoSnapshot,
 ) -> Result<BranchName> {
     let trunk = snapshot
         .trunk

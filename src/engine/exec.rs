@@ -54,7 +54,7 @@ use super::plan::{Plan, PlanStep};
 use super::scan::compute_fingerprint;
 use super::Context;
 use crate::core::metadata::store::{MetadataStore, StoreError};
-use crate::core::ops::journal::{Journal, JournalError, OpPhase, OpState};
+use crate::core::ops::journal::{AwaitingReason, Journal, JournalError, OpState};
 use crate::core::ops::lock::{LockError, RepoLock};
 use crate::core::paths::LatticePaths;
 use crate::core::types::{BranchName, Fingerprint, Oid};
@@ -110,6 +110,36 @@ pub enum ExecuteError {
     /// Internal error.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Branch is checked out in another worktree.
+    ///
+    /// Per SPEC.md §4.6.8, operations that would rewrite a branch checked out
+    /// in another worktree must be refused. This error occurs when the executor
+    /// revalidates occupancy under lock and finds a touched branch is checked
+    /// out elsewhere.
+    ///
+    /// The user should close the worktree, switch it to a different branch,
+    /// or run the command from that worktree instead.
+    #[error("branch '{branch}' is checked out in worktree at {worktree_path}")]
+    OccupancyViolation {
+        /// The branch that is checked out elsewhere.
+        branch: String,
+        /// Path to the worktree where it's checked out.
+        worktree_path: String,
+    },
+
+    /// Post-execution verification failed.
+    ///
+    /// Per ARCHITECTURE.md §6.2, the executor must verify invariants after
+    /// successful execution. This error occurs when verification fails.
+    /// The executor attempts rollback before returning this error.
+    #[error("post-execution verification failed: {message}")]
+    VerificationFailed {
+        /// Description of the verification failure.
+        message: String,
+        /// Whether rollback was successful.
+        rollback_succeeded: bool,
+    },
 }
 
 /// Result of executing a plan.
@@ -217,6 +247,13 @@ impl<'a> Executor<'a> {
         }
         let _lock = RepoLock::acquire(&paths)?;
 
+        // Revalidate occupancy under lock (per ARCHITECTURE.md §6.2)
+        // Worktree occupancy can change between scan and execution
+        if ctx.debug {
+            eprintln!("[debug] Revalidating worktree occupancy under lock");
+        }
+        self.revalidate_occupancy(plan)?;
+
         // Create journal
         let mut journal = Journal::new(&plan.command);
 
@@ -224,7 +261,13 @@ impl<'a> Executor<'a> {
         if ctx.debug {
             eprintln!("[debug] Writing op-state marker");
         }
-        let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
+        let op_state = OpState::from_journal(
+            &journal,
+            &paths,
+            info.work_dir.clone(),
+            plan.digest(),
+            plan.touched_refs_with_oids(),
+        );
         op_state.write(&paths)?;
 
         // Record IntentRecorded event
@@ -249,13 +292,10 @@ impl<'a> Executor<'a> {
                 eprintln!("[debug] Executing step {}: {:?}", i + 1, step.description());
             }
 
-            match self.execute_step(step, &mut journal)? {
+            match self.execute_step(step, &mut journal, &paths)? {
                 StepResult::Continue => {
                     applied_steps.push(step.clone());
-                    // Write journal after each mutation
-                    if step.is_mutation() {
-                        journal.write(&paths)?;
-                    }
+                    // Journal already persisted by append_* methods per SPEC.md §4.2.2
                 }
                 StepResult::Pause { branch, git_state } => {
                     // Record conflict in journal
@@ -271,19 +311,38 @@ impl<'a> Executor<'a> {
                         })
                         .collect();
 
-                    journal.record_conflict_paused(
+                    // Serialize remaining steps for continuation (Milestone 0.5)
+                    let remaining_steps_json = if remaining.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&remaining).map_err(|e| {
+                            ExecuteError::Internal(format!(
+                                "failed to serialize remaining steps: {}",
+                                e
+                            ))
+                        })?)
+                    };
+
+                    // Use append_* method per SPEC.md §4.2.2
+                    journal.append_conflict_paused(
+                        &paths,
                         &branch,
                         git_state.description(),
                         remaining_names,
-                    );
+                        remaining_steps_json,
+                    )?;
                     journal.pause();
-                    journal.write(&paths)?;
+                    journal.write(&paths)?; // Still need write() for phase change
 
-                    // Update op-state to paused
-                    let mut op_state =
-                        OpState::from_journal(&journal, &paths, info.work_dir.clone());
-                    op_state.phase = OpPhase::Paused;
-                    op_state.write(&paths)?;
+                    // Update op-state to paused with reason
+                    let mut op_state = OpState::from_journal(
+                        &journal,
+                        &paths,
+                        info.work_dir.clone(),
+                        plan.digest(),
+                        plan.touched_refs_with_oids(),
+                    );
+                    op_state.pause_with_reason(AwaitingReason::RebaseConflict, &paths)?;
 
                     return Ok(ExecuteResult::Paused {
                         branch,
@@ -305,6 +364,75 @@ impl<'a> Executor<'a> {
                     return Ok(ExecuteResult::Aborted {
                         error,
                         applied_steps,
+                    });
+                }
+            }
+        }
+
+        // Post-execution verification (per ARCHITECTURE.md §6.2)
+        // The executor MUST verify invariants after successful execution
+        // Use scoped verification to only check branches touched by this plan
+        let touched_branches = plan.touched_branches();
+        if ctx.debug {
+            eprintln!(
+                "[debug] Running post-execution verification for {} branches",
+                touched_branches.len()
+            );
+        }
+        if let Err(verify_error) = self.post_verify(&touched_branches) {
+            if ctx.debug {
+                eprintln!(
+                    "[debug] Verification failed: {}, attempting rollback",
+                    verify_error
+                );
+            }
+
+            // Attempt rollback
+            match self.attempt_rollback(&journal) {
+                Ok(()) => {
+                    // Rollback succeeded - record Aborted event and clear op-state
+                    let _ = ledger.append(Event::aborted(
+                        plan.op_id.as_str(),
+                        format!("verification failed, rolled back: {}", verify_error),
+                    ));
+                    journal.rollback();
+                    journal.write(&paths)?;
+                    OpState::remove(&paths)?;
+
+                    return Err(ExecuteError::VerificationFailed {
+                        message: verify_error.to_string(),
+                        rollback_succeeded: true,
+                    });
+                }
+                Err(rollback_error) => {
+                    // Rollback failed - transition to awaiting_user with reason
+                    if ctx.debug {
+                        eprintln!("[debug] Rollback failed: {}", rollback_error);
+                    }
+
+                    let mut op_state = OpState::from_journal(
+                        &journal,
+                        &paths,
+                        info.work_dir.clone(),
+                        plan.digest(),
+                        plan.touched_refs_with_oids(),
+                    );
+                    op_state.pause_with_reason(
+                        AwaitingReason::VerificationFailed {
+                            evidence: format!(
+                                "verification: {}, rollback: {}",
+                                verify_error, rollback_error
+                            ),
+                        },
+                        &paths,
+                    )?;
+
+                    return Err(ExecuteError::VerificationFailed {
+                        message: format!(
+                            "verification failed ({}) and rollback failed ({})",
+                            verify_error, rollback_error
+                        ),
+                        rollback_succeeded: false,
                     });
                 }
             }
@@ -339,6 +467,7 @@ impl<'a> Executor<'a> {
         &self,
         step: &PlanStep,
         journal: &mut Journal,
+        paths: &LatticePaths,
     ) -> Result<StepResult, ExecuteError> {
         match step {
             PlanStep::UpdateRefCas {
@@ -367,7 +496,8 @@ impl<'a> Executor<'a> {
                         other => ExecuteError::Git(other),
                     })?;
 
-                journal.record_ref_update(refname, old_oid.clone(), new_oid);
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_ref_update(paths, refname, old_oid.clone(), new_oid)?;
                 Ok(StepResult::Continue)
             }
 
@@ -391,7 +521,8 @@ impl<'a> Executor<'a> {
                         other => ExecuteError::Git(other),
                     })?;
 
-                journal.record_ref_update(refname, Some(old_oid.clone()), "");
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_ref_update(paths, refname, Some(old_oid.clone()), "")?;
                 Ok(StepResult::Continue)
             }
 
@@ -421,7 +552,13 @@ impl<'a> Executor<'a> {
                         other => ExecuteError::Metadata(other),
                     })?;
 
-                journal.record_metadata_write(branch, old_ref_oid.clone(), new_oid.to_string());
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_metadata_write(
+                    paths,
+                    branch,
+                    old_ref_oid.clone(),
+                    new_oid.to_string(),
+                )?;
                 Ok(StepResult::Continue)
             }
 
@@ -444,7 +581,8 @@ impl<'a> Executor<'a> {
                     other => ExecuteError::Metadata(other),
                 })?;
 
-                journal.record_metadata_delete(branch, old_ref_oid);
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_metadata_delete(paths, branch, old_ref_oid)?;
                 Ok(StepResult::Continue)
             }
 
@@ -453,24 +591,16 @@ impl<'a> Executor<'a> {
                 description,
                 expected_effects,
             } => {
-                // Record intent in journal before executing
-                journal.record_git_process(args.clone(), description);
+                // Record intent in journal before executing (append_* persists immediately)
+                journal.append_git_process(paths, args.clone(), description)?;
 
                 // Execute the git command
                 let result = self.git.run_command(args)?;
 
-                if !result.success {
-                    return Ok(StepResult::Abort {
-                        error: format!(
-                            "git {} failed (exit code {}): {}",
-                            args.first().unwrap_or(&String::new()),
-                            result.exit_code,
-                            result.stderr.trim()
-                        ),
-                    });
-                }
-
-                // Check for conflicts after git command (rebase/merge/cherry-pick)
+                // Check for conflicts BEFORE checking success status.
+                // Git rebase/merge/cherry-pick return non-zero exit codes when
+                // conflicts occur, but leave git in a special state we can detect.
+                // We want to pause for user resolution, not abort.
                 let git_state = self.git.state();
                 if git_state.is_in_progress() {
                     // Conflict occurred - need to pause for user resolution
@@ -480,6 +610,18 @@ impl<'a> Executor<'a> {
                         .unwrap_or("unknown")
                         .to_string();
                     return Ok(StepResult::Pause { branch, git_state });
+                }
+
+                // No conflict state, so non-zero exit is a real failure
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git {} failed (exit code {}): {}",
+                            args.first().unwrap_or(&String::new()),
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
                 }
 
                 // Verify expected effects (refs were created/updated as expected)
@@ -498,7 +640,8 @@ impl<'a> Executor<'a> {
             }
 
             PlanStep::Checkpoint { name } => {
-                journal.record_checkpoint(name);
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_checkpoint(paths, name)?;
                 Ok(StepResult::Continue)
             }
 
@@ -566,10 +709,236 @@ impl<'a> Executor<'a> {
                         other => ExecuteError::Git(other),
                     })?;
 
-                journal.record_ref_update(&refname, None, fetch_head.as_str());
+                // Use append_* per SPEC.md §4.2.2 - persists immediately with fsync
+                journal.append_ref_update(paths, &refname, None, fetch_head.as_str())?;
                 Ok(StepResult::Continue)
             }
+
+            PlanStep::Checkout { branch, reason } => {
+                // Execute git checkout via RunGit-style command execution
+                let args = vec!["checkout".to_string(), branch.clone()];
+
+                // Record intent in journal before executing
+                journal.append_git_process(paths, args.clone(), reason)?;
+
+                // Execute the checkout
+                let result = self.git.run_command(&args)?;
+
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git checkout '{}' failed (exit code {}): {}",
+                            branch,
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                Ok(StepResult::Continue)
+            }
+
+            // ================================================================
+            // Forge/Remote Steps (Phase 6)
+            //
+            // These steps interact with remote forges (GitHub, etc.) and
+            // require async execution. The synchronous executor cannot handle
+            // them - they must be executed through the async executor path.
+            //
+            // For now, we return an error if these steps reach the sync executor.
+            // The async command runner will handle these through a separate path.
+            // ================================================================
+            PlanStep::ForgeFetch { remote, .. } => {
+                // Fetch can be done synchronously via git
+                let mut args = vec!["fetch".to_string(), remote.clone()];
+                if let PlanStep::ForgeFetch {
+                    refspec: Some(ref spec),
+                    ..
+                } = step
+                {
+                    args.push(spec.clone());
+                }
+
+                journal.append_git_process(
+                    paths,
+                    args.clone(),
+                    format!("fetch from {}", remote),
+                )?;
+
+                let result = self.git.run_command(&args)?;
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git fetch from '{}' failed (exit code {}): {}",
+                            remote,
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                Ok(StepResult::Continue)
+            }
+
+            PlanStep::ForgePush {
+                branch,
+                force,
+                remote,
+                reason,
+            } => {
+                // Push can be done synchronously via git
+                let mut args = vec!["push".to_string()];
+                if *force {
+                    args.push("--force-with-lease".to_string());
+                }
+                args.push(remote.clone());
+                args.push(branch.clone());
+
+                journal.append_git_process(paths, args.clone(), reason)?;
+
+                let result = self.git.run_command(&args)?;
+                if !result.success {
+                    return Ok(StepResult::Abort {
+                        error: format!(
+                            "git push '{}' to '{}' failed (exit code {}): {}",
+                            branch,
+                            remote,
+                            result.exit_code,
+                            result.stderr.trim()
+                        ),
+                    });
+                }
+
+                Ok(StepResult::Continue)
+            }
+
+            // The following forge steps require async API calls and cannot
+            // be executed in the synchronous executor. They will be handled
+            // by a separate async execution path in the command runner.
+            PlanStep::ForgeCreatePr { .. }
+            | PlanStep::ForgeUpdatePr { .. }
+            | PlanStep::ForgeDraftToggle { .. }
+            | PlanStep::ForgeRequestReviewers { .. }
+            | PlanStep::ForgeMergePr { .. } => {
+                // These steps require async forge API calls.
+                // For now, return an error - these will be executed through
+                // the async runner which has access to the forge client.
+                Err(ExecuteError::Internal(
+                    "Forge API steps require async execution".to_string(),
+                ))
+            }
         }
+    }
+
+    /// Run post-execution verification.
+    ///
+    /// Per ARCHITECTURE.md Section 6.2, the executor MUST verify invariants
+    /// after successful execution. This is now self-enforcing - it cannot
+    /// be bypassed by callers.
+    ///
+    /// # Arguments
+    ///
+    /// * `touched_branches` - Branches that were modified by the plan. If provided,
+    ///   only these branches are verified (scoped verification). If empty, falls
+    ///   back to full repository verification.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if all invariants hold, `Err(VerifyError)` otherwise.
+    fn post_verify(
+        &self,
+        touched_branches: &[BranchName],
+    ) -> Result<(), super::verify::VerifyError> {
+        // Re-scan repository
+        let snapshot = super::scan::scan(self.git)
+            .map_err(|e| super::verify::VerifyError::ScanFailed(e.to_string()))?;
+
+        // Use scoped verification if branches were specified, otherwise full verify
+        if touched_branches.is_empty() {
+            super::verify::fast_verify(self.git, &snapshot)
+        } else {
+            super::verify::verify_branches(self.git, &snapshot, touched_branches)
+        }
+    }
+
+    /// Attempt to rollback changes using journal.
+    ///
+    /// This is called when post-verification fails. It attempts to restore
+    /// refs to their pre-operation state using the shared rollback module.
+    ///
+    /// Per ARCHITECTURE.md §6.2, if CAS preconditions fail during rollback,
+    /// we report the failure (the repository has changed out-of-band).
+    ///
+    /// # Arguments
+    ///
+    /// * `journal` - The journal with recorded steps
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if rollback succeeded completely, `Err` if any step failed.
+    fn attempt_rollback(&self, journal: &Journal) -> Result<(), ExecuteError> {
+        use super::rollback::rollback_journal;
+
+        let result = rollback_journal(self.git, journal);
+
+        if result.complete {
+            Ok(())
+        } else {
+            // Collect failure messages for error reporting
+            let failures: Vec<String> = result
+                .failed
+                .iter()
+                .map(|(refname, err)| format!("{}: {}", refname, err))
+                .collect();
+
+            Err(ExecuteError::Internal(format!(
+                "partial rollback - succeeded: [{}], failed: [{}]",
+                result.rolled_back.join(", "),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Revalidate worktree occupancy for touched branches.
+    ///
+    /// Per ARCHITECTURE.md Section 6.2, this MUST be called after acquiring
+    /// the lock and before any ref-mutating steps. Worktree occupancy can
+    /// change out-of-band between scan and execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - The plan to check
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if no conflicts, or `ExecuteError::OccupancyViolation` if
+    /// any touched branch is checked out in another worktree.
+    fn revalidate_occupancy(&self, plan: &Plan) -> Result<(), ExecuteError> {
+        // Skip if plan doesn't touch branch refs (e.g., metadata-only operations)
+        if !plan.touches_branch_refs() {
+            return Ok(());
+        }
+
+        let touched = plan.touched_branches();
+        if touched.is_empty() {
+            return Ok(());
+        }
+
+        // Check each touched branch
+        for branch in &touched {
+            if let Some(worktree_path) =
+                self.git.branch_checked_out_elsewhere(branch).map_err(|e| {
+                    ExecuteError::Internal(format!("failed to check worktree occupancy: {}", e))
+                })?
+            {
+                return Err(ExecuteError::OccupancyViolation {
+                    branch: branch.to_string(),
+                    worktree_path: worktree_path.display().to_string(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Compute current fingerprint from repository state.
@@ -705,6 +1074,40 @@ mod tests {
             let err = ExecuteError::InvalidPlan("missing steps".to_string());
             let msg = err.to_string();
             assert!(msg.contains("invalid plan"));
+        }
+
+        #[test]
+        fn display_occupancy_violation() {
+            let err = ExecuteError::OccupancyViolation {
+                branch: "feature".to_string(),
+                worktree_path: "/worktrees/feature".to_string(),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("feature"));
+            assert!(msg.contains("/worktrees/feature"));
+            assert!(msg.contains("checked out"));
+        }
+
+        #[test]
+        fn display_verification_failed() {
+            let err = ExecuteError::VerificationFailed {
+                message: "graph invalid".to_string(),
+                rollback_succeeded: true,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("verification failed"));
+            assert!(msg.contains("graph invalid"));
+        }
+
+        #[test]
+        fn display_verification_failed_rollback_info() {
+            let err = ExecuteError::VerificationFailed {
+                message: "test".to_string(),
+                rollback_succeeded: false,
+            };
+            // The error message doesn't include rollback info in the Display,
+            // that's metadata for the caller
+            assert!(!err.to_string().is_empty());
         }
     }
 

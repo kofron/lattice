@@ -83,6 +83,7 @@ impl TestRepo {
             interactive: false,
             quiet,
             debug: false,
+            verify: true,
         }
     }
 }

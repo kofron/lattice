@@ -1,19 +1,39 @@
 //! create command - Create a new tracked branch
+//!
+//! This command implements the `Command` trait for the unified lifecycle.
+//!
+//! # Gating
+//!
+//! Uses `requirements::MUTATING` - requires working directory, trunk known,
+//! no ops in progress, frozen policy satisfied.
+//!
+//! # Plan Generation
+//!
+//! 1. RunGit: checkout -b <branch>
+//! 2. (If staged + message) RunGit: commit -m <message>
+//! 3. WriteMetadataCas: Create metadata for new branch
+//! 4. (If insert) WriteMetadataCas: Update child's parent reference
+//!
+//! Note: Interactive prompts and staging happen BEFORE the plan phase.
+
+use std::io::{self, Write as IoWrite};
+use std::process::Command as StdCommand;
+
+use anyhow::{Context as _, Result};
 
 use crate::core::metadata::schema::{
     BaseInfo, BranchInfo, BranchMetadataV1, FreezeState, ParentInfo, PrState, Timestamps,
     METADATA_KIND, SCHEMA_VERSION,
 };
-use crate::core::metadata::store::MetadataStore;
-use crate::core::ops::journal::OpState;
-use crate::core::paths::LatticePaths;
+use crate::core::ops::journal::OpId;
 use crate::core::types::BranchName;
-use crate::engine::scan::scan;
+use crate::engine::command::{Command, CommandOutput, SimpleCommand};
+use crate::engine::exec::ExecuteResult;
+use crate::engine::gate::{requirements, ReadyContext, RequirementSet};
+use crate::engine::plan::{Plan, PlanError, PlanStep};
+use crate::engine::runner::run_command;
 use crate::engine::Context;
 use crate::git::Git;
-use anyhow::{bail, Context as _, Result};
-use std::io::{self, Write};
-use std::process::Command;
 
 /// Create a new tracked branch.
 ///
@@ -40,40 +60,30 @@ pub fn create(
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
-    let info = git.info()?;
-    let paths = LatticePaths::from_repo_info(&info);
 
-    // Check for in-progress operation
-    if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
-            "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
-            op_state.command,
-            op_state.op_id
-        );
-    }
+    // Do preliminary scan for interactive prompts and pre-command validation
+    let preliminary_snapshot =
+        crate::engine::scan::scan(&git).context("Failed to scan repository")?;
 
-    let snapshot = scan(&git).context("Failed to scan repository")?;
-
-    // Ensure trunk is configured
-    let trunk = snapshot
+    let trunk = preliminary_snapshot
         .trunk
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?;
 
     // Get current branch (will be the parent)
-    let parent = snapshot
+    let parent = preliminary_snapshot
         .current_branch
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?
         .clone();
 
-    // Determine branch name
+    // Determine branch name (interactive prompt if needed - BEFORE plan)
     let branch_name = if let Some(n) = name {
-        BranchName::new(n).context("Invalid branch name")?
+        BranchName::new(n)?
     } else if let Some(msg) = message {
         // Derive from message
         let slug = slugify(msg);
-        BranchName::new(&slug).context("Could not derive valid branch name from message")?
+        BranchName::new(&slug)?
     } else if ctx.interactive {
         // Prompt for name
         print!("Branch name: ");
@@ -82,29 +92,24 @@ pub fn create(
         io::stdin().read_line(&mut input)?;
         let input = input.trim();
         if input.is_empty() {
-            bail!("Branch name required");
+            anyhow::bail!("Branch name required");
         }
-        BranchName::new(input).context("Invalid branch name")?
+        BranchName::new(input)?
     } else {
-        bail!("Branch name required. Use --message to derive from commit message.");
+        anyhow::bail!("Branch name required. Use --message to derive from commit message.");
     };
 
     // Check if branch already exists
-    if snapshot.branches.contains_key(&branch_name) {
-        bail!("Branch '{}' already exists", branch_name);
+    if preliminary_snapshot.branches.contains_key(&branch_name) {
+        anyhow::bail!("Branch '{}' already exists", branch_name);
     }
 
-    // Handle insert mode
+    // Handle insert mode - determine child to reparent (interactive if needed - BEFORE plan)
     let child_to_reparent = if insert {
-        // Find child of current branch
-        let children = snapshot.graph.children(&parent);
+        let children = preliminary_snapshot.graph.children(&parent);
         match children {
-            None => {
-                bail!("No child branch to insert before");
-            }
-            Some(kids) if kids.is_empty() => {
-                bail!("No child branch to insert before");
-            }
+            None => anyhow::bail!("No child branch to insert before"),
+            Some(kids) if kids.is_empty() => anyhow::bail!("No child branch to insert before"),
             Some(kids) if kids.len() == 1 => Some(kids.iter().next().unwrap().clone()),
             Some(kids) if ctx.interactive => {
                 // Prompt for selection
@@ -118,20 +123,20 @@ pub fn create(
 
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
-                let idx = input
+                let idx: usize = input
                     .trim()
-                    .parse::<usize>()
-                    .context("Invalid selection")?
-                    .saturating_sub(1);
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Invalid selection"))?;
+                let idx = idx.saturating_sub(1);
 
                 if idx >= kids_vec.len() {
-                    bail!("Invalid selection");
+                    anyhow::bail!("Invalid selection");
                 }
 
                 Some(kids_vec[idx].clone())
             }
             Some(kids) => {
-                bail!(
+                anyhow::bail!(
                     "Multiple children. Run interactively to select: {}",
                     kids.iter()
                         .map(|b| b.to_string())
@@ -144,181 +149,101 @@ pub fn create(
         None
     };
 
-    // Stage changes if requested
+    // Stage changes if requested (BEFORE plan - not transactional)
     if all {
-        let status = Command::new("git")
+        let status = StdCommand::new("git")
             .args(["add", "-A"])
             .current_dir(&cwd)
             .status()
             .context("Failed to run git add")?;
 
         if !status.success() {
-            bail!("git add failed");
+            anyhow::bail!("git add failed");
         }
     } else if update {
-        let status = Command::new("git")
+        let status = StdCommand::new("git")
             .args(["add", "-u"])
             .current_dir(&cwd)
             .status()
             .context("Failed to run git add")?;
 
         if !status.success() {
-            bail!("git add failed");
+            anyhow::bail!("git add failed");
         }
     } else if patch {
-        let status = Command::new("git")
+        let status = StdCommand::new("git")
             .args(["add", "-p"])
             .current_dir(&cwd)
             .status()
             .context("Failed to run git add")?;
 
         if !status.success() {
-            bail!("git add failed");
+            anyhow::bail!("git add failed");
         }
     }
 
     // Check for staged changes
-    let has_staged = Command::new("git")
+    let has_staged = StdCommand::new("git")
         .args(["diff", "--cached", "--quiet"])
         .current_dir(&cwd)
         .status()
         .map(|s| !s.success())
         .unwrap_or(false);
 
-    // Create branch
-    let status = Command::new("git")
-        .args(["checkout", "-b", branch_name.as_str()])
-        .current_dir(&cwd)
-        .status()
-        .context("Failed to create branch")?;
+    // Determine if we should create a commit
+    let should_commit = has_staged && message.is_some();
 
-    if !status.success() {
-        bail!("git checkout -b failed");
+    // If staged but no message in non-interactive mode, warn
+    if has_staged && message.is_none() && !ctx.interactive && !ctx.quiet {
+        println!("Staged changes exist. Use --message or run interactively to commit.");
     }
 
-    // Create commit if we have staged changes and a message
-    if has_staged {
-        if let Some(msg) = message {
-            let status = Command::new("git")
-                .args(["commit", "-m", msg])
-                .current_dir(&cwd)
-                .status()
-                .context("Failed to create commit")?;
+    // If interactive with staged changes but no message, we'll do interactive commit
+    let interactive_commit = has_staged && message.is_none() && ctx.interactive;
 
-            if !status.success() {
-                bail!("git commit failed");
-            }
-        } else if ctx.interactive {
-            // Open editor for commit message
-            let status = Command::new("git")
-                .args(["commit"])
-                .current_dir(&cwd)
-                .status()
-                .context("Failed to create commit")?;
+    let cmd = CreateCommand {
+        branch_name: branch_name.clone(),
+        parent: parent.clone(),
+        parent_is_trunk: &parent == trunk,
+        message: message.map(String::from),
+        should_commit,
+        interactive_commit,
+        child_to_reparent: child_to_reparent.clone(),
+        verify: ctx.verify,
+    };
 
-            if !status.success() {
-                // User may have aborted
-                if !ctx.quiet {
-                    println!("Commit aborted. Branch created but empty.");
+    let output = run_command(&cmd, &git, ctx).map_err(|e| match e {
+        crate::engine::runner::RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })?;
+
+    match output {
+        CommandOutput::Success(()) => {
+            if !ctx.quiet {
+                // Get parent tip for display
+                let parent_tip = preliminary_snapshot
+                    .branches
+                    .get(&parent)
+                    .map(|o| &o.as_str()[..7])
+                    .unwrap_or("unknown");
+                println!(
+                    "Created '{}' with parent '{}' (base: {})",
+                    branch_name, parent, parent_tip
+                );
+                if let Some(child) = child_to_reparent {
+                    println!("Reparented '{}' under '{}'", child, branch_name);
                 }
             }
-        } else if !ctx.quiet {
-            println!("Staged changes exist. Use --message or run interactively to commit.");
+            Ok(())
         }
+        CommandOutput::Paused { message } => {
+            println!("{}", message);
+            Ok(())
+        }
+        CommandOutput::Failed { error } => Err(anyhow::anyhow!("{}", error)),
     }
-
-    // Get parent tip for base
-    let parent_oid = snapshot
-        .branches
-        .get(&parent)
-        .ok_or_else(|| anyhow::anyhow!("Parent branch '{}' not found", parent))?
-        .clone();
-
-    // Create parent ref
-    let parent_ref = if &parent == trunk {
-        ParentInfo::Trunk {
-            name: parent.to_string(),
-        }
-    } else {
-        ParentInfo::Branch {
-            name: parent.to_string(),
-        }
-    };
-
-    // Create metadata
-    let now = crate::core::types::UtcTimestamp::now();
-    let metadata = BranchMetadataV1 {
-        kind: METADATA_KIND.to_string(),
-        schema_version: SCHEMA_VERSION,
-        branch: BranchInfo {
-            name: branch_name.to_string(),
-        },
-        parent: parent_ref,
-        base: BaseInfo {
-            oid: parent_oid.to_string(),
-        },
-        freeze: FreezeState::Unfrozen,
-        pr: PrState::None,
-        timestamps: Timestamps {
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    };
-
-    // Write metadata (create new - no old ref expected)
-    let store = MetadataStore::new(&git);
-    store
-        .write_cas(&branch_name, None, &metadata)
-        .context("Failed to write metadata")?;
-
-    if !ctx.quiet {
-        println!(
-            "Created '{}' with parent '{}' (base: {})",
-            branch_name,
-            parent,
-            &parent_oid.as_str()[..7]
-        );
-    }
-
-    // Handle insert mode - reparent child
-    if let Some(child) = child_to_reparent {
-        // Get child's current metadata
-        let child_scanned = snapshot
-            .metadata
-            .get(&child)
-            .ok_or_else(|| anyhow::anyhow!("Child '{}' metadata not found", child))?;
-
-        // Get new branch tip as new base for child
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&cwd)
-            .output()
-            .context("Failed to get HEAD")?;
-
-        let new_base = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let new_base_oid =
-            crate::core::types::Oid::new(&new_base).context("Invalid OID from HEAD")?;
-
-        // Update child's metadata
-        let mut updated_child = child_scanned.metadata.clone();
-        updated_child.parent = ParentInfo::Branch {
-            name: branch_name.to_string(),
-        };
-        updated_child.base = BaseInfo {
-            oid: new_base_oid.to_string(),
-        };
-        updated_child.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-        store
-            .write_cas(&child, Some(&child_scanned.ref_oid), &updated_child)
-            .with_context(|| format!("Failed to update child '{}' metadata", child))?;
-
-        if !ctx.quiet {
-            println!("Reparented '{}' under '{}'", child, branch_name);
-        }
-    }
-
-    Ok(())
 }
 
 /// Convert a string to a branch-name-safe slug.
@@ -338,3 +263,152 @@ pub fn slugify(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
 }
+
+/// Command struct for create operation.
+pub struct CreateCommand {
+    /// Name for the new branch.
+    branch_name: BranchName,
+    /// Parent branch name.
+    parent: BranchName,
+    /// Whether parent is trunk.
+    parent_is_trunk: bool,
+    /// Commit message (if creating a commit).
+    message: Option<String>,
+    /// Whether to create a commit with message.
+    should_commit: bool,
+    /// Whether to do interactive commit (editor).
+    interactive_commit: bool,
+    /// Child to reparent (for insert mode).
+    child_to_reparent: Option<BranchName>,
+    /// Whether to run git hooks.
+    verify: bool,
+}
+
+impl Command for CreateCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::MUTATING;
+    type Output = ();
+
+    fn plan(&self, ctx: &ReadyContext) -> Result<Plan, PlanError> {
+        let snapshot = &ctx.snapshot;
+
+        // Verify parent still exists
+        let parent_oid = snapshot.branches.get(&self.parent).ok_or_else(|| {
+            PlanError::MissingData(format!("Parent branch '{}' not found", self.parent))
+        })?;
+
+        // Verify branch doesn't exist
+        if snapshot.branches.contains_key(&self.branch_name) {
+            return Err(PlanError::InvalidState(format!(
+                "Branch '{}' already exists",
+                self.branch_name
+            )));
+        }
+
+        // Build plan
+        let mut plan = Plan::new(OpId::new(), "create");
+
+        // Step 1: Create branch
+        plan = plan.with_step(PlanStep::RunGit {
+            args: vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                self.branch_name.to_string(),
+            ],
+            description: format!("Create branch '{}'", self.branch_name),
+            expected_effects: vec![format!("refs/heads/{}", self.branch_name)],
+        });
+
+        // Step 2: Create commit if needed
+        if self.should_commit {
+            if let Some(ref msg) = self.message {
+                let mut commit_args = vec!["commit".to_string()];
+                if !self.verify {
+                    commit_args.push("--no-verify".to_string());
+                }
+                commit_args.extend(["-m".to_string(), msg.clone()]);
+
+                plan = plan.with_step(PlanStep::RunGit {
+                    args: commit_args,
+                    description: "Create initial commit".to_string(),
+                    expected_effects: vec![format!("refs/heads/{}", self.branch_name)],
+                });
+            }
+        } else if self.interactive_commit {
+            // Interactive commit with editor
+            let mut commit_args = vec!["commit".to_string()];
+            if !self.verify {
+                commit_args.push("--no-verify".to_string());
+            }
+
+            plan = plan.with_step(PlanStep::RunGit {
+                args: commit_args,
+                description: "Create initial commit (interactive)".to_string(),
+                expected_effects: vec![format!("refs/heads/{}", self.branch_name)],
+            });
+        }
+
+        // Step 3: Create metadata
+        let parent_ref = if self.parent_is_trunk {
+            ParentInfo::Trunk {
+                name: self.parent.to_string(),
+            }
+        } else {
+            ParentInfo::Branch {
+                name: self.parent.to_string(),
+            }
+        };
+
+        let now = crate::core::types::UtcTimestamp::now();
+        let metadata = BranchMetadataV1 {
+            kind: METADATA_KIND.to_string(),
+            schema_version: SCHEMA_VERSION,
+            branch: BranchInfo {
+                name: self.branch_name.to_string(),
+            },
+            parent: parent_ref,
+            base: BaseInfo {
+                oid: parent_oid.to_string(),
+            },
+            freeze: FreezeState::Unfrozen,
+            pr: PrState::None,
+            timestamps: Timestamps {
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        };
+
+        plan = plan.with_step(PlanStep::WriteMetadataCas {
+            branch: self.branch_name.to_string(),
+            old_ref_oid: None, // Creating new
+            metadata: Box::new(metadata),
+        });
+
+        // Step 4: Reparent child if in insert mode
+        if let Some(ref child) = self.child_to_reparent {
+            let child_scanned = snapshot.metadata.get(child).ok_or_else(|| {
+                PlanError::MissingData(format!("Child '{}' metadata not found", child))
+            })?;
+
+            let mut updated_child = child_scanned.metadata.clone();
+            updated_child.parent = ParentInfo::Branch {
+                name: self.branch_name.to_string(),
+            };
+            // Note: base stays the same for now - child will need restack
+            updated_child.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
+
+            plan = plan.with_step(PlanStep::WriteMetadataCas {
+                branch: child.to_string(),
+                old_ref_oid: Some(child_scanned.ref_oid.to_string()),
+                metadata: Box::new(updated_child),
+            });
+        }
+
+        Ok(plan)
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        self.simple_finish(result)
+    }
+}
+
+impl SimpleCommand for CreateCommand {}

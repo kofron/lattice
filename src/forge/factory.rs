@@ -250,6 +250,10 @@ fn is_known_but_disabled(name: &str) -> bool {
 }
 
 /// Create a forge for a specific provider.
+///
+/// Note: This function uses static tokens. For automatic token refresh,
+/// callers should use `GitHubForge::new_with_provider()` directly.
+#[allow(deprecated)] // Uses static token constructor for backwards compatibility
 fn create_forge_for_provider(
     provider: ForgeProvider,
     remote_url: &str,

@@ -1,6 +1,11 @@
 //! trunk command - Display or set the trunk branch
+//!
+//! # Gating
+//!
+//! This is a read-only command that uses `requirements::READ_ONLY`.
 
-use crate::engine::scan::scan;
+use crate::engine::gate::requirements;
+use crate::engine::runner::{run_gated, RunError};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
@@ -11,6 +16,10 @@ use anyhow::{bail, Context as _, Result};
 ///
 /// * `ctx` - Execution context
 /// * `set` - If provided, set trunk to this branch
+///
+/// # Gating
+///
+/// Uses `requirements::READ_ONLY` for display mode.
 pub fn trunk(ctx: &Context, set: Option<&str>) -> Result<()> {
     let cwd = ctx
         .cwd
@@ -28,14 +37,24 @@ pub fn trunk(ctx: &Context, set: Option<&str>) -> Result<()> {
         );
     }
 
-    // Display current trunk
-    let snapshot = scan(&git).context("Failed to scan repository")?;
+    // Display current trunk - run through gating
+    run_gated(&git, ctx, &requirements::READ_ONLY, |ready| {
+        let snapshot = &ready.snapshot;
 
-    if let Some(ref trunk) = snapshot.trunk {
-        println!("{}", trunk);
-    } else {
-        bail!("Trunk not configured. Run 'lattice init --trunk <branch>' to configure.");
-    }
-
-    Ok(())
+        if let Some(ref trunk) = snapshot.trunk {
+            println!("{}", trunk);
+            Ok(())
+        } else {
+            Err(RunError::Scan(crate::engine::scan::ScanError::Internal(
+                "Trunk not configured. Run 'lattice init --trunk <branch>' to configure."
+                    .to_string(),
+            )))
+        }
+    })
+    .map_err(|e| match e {
+        RunError::NeedsRepair(bundle) => {
+            anyhow::anyhow!("Repository needs repair: {}", bundle)
+        }
+        other => anyhow::anyhow!("{}", other),
+    })
 }

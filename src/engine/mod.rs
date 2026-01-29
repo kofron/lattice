@@ -52,21 +52,42 @@
 //! ```
 
 pub mod capabilities;
+pub mod command;
 pub mod exec;
 pub mod gate;
 pub mod health;
 pub mod ledger;
+pub mod modes;
 pub mod plan;
+pub mod rollback;
+pub mod runner;
 pub mod scan;
 pub mod verify;
 
+// Test-only hooks for fault injection and drift testing.
+// Per ROADMAP.md Anti-Drift Mechanisms item 5: "Test-only pause hook in Engine"
+// Available under: cfg(test) for unit tests, or feature = "test_hooks"/"fault_injection" for integration tests
+#[cfg(any(test, feature = "fault_injection", feature = "test_hooks"))]
+pub mod engine_hooks;
+
 // Re-exports for convenience
 pub use capabilities::{Capability, CapabilitySet};
+pub use command::{Command, CommandOutput, ReadOnlyCommand, SimpleCommand};
 pub use exec::{ExecuteError, ExecuteResult, Executor};
-pub use gate::{gate, GateResult, ReadyContext, RepairBundle, RequirementSet, ValidatedData};
+pub use gate::{
+    check_frozen_policy, compute_freeze_scope, compute_stack_scope, gate, GateResult, ReadyContext,
+    RepairBundle, RequirementSet, ValidatedData,
+};
 pub use health::{Issue, IssueId, RepoHealthReport, Severity};
 pub use ledger::{Event, EventLedger, LedgerError};
+pub use modes::{GetMode, ModeError, SubmitMode, SyncMode};
 pub use plan::{Plan, PlanError, PlanStep};
+pub use rollback::{rollback_journal, RollbackError, RollbackResult};
+pub use runner::{
+    check_requirements, run_command, run_command_with_requirements,
+    run_command_with_requirements_and_scope, run_command_with_scope, run_gated,
+    run_readonly_command, RunError,
+};
 pub use scan::{scan, DivergenceInfo, RepoSnapshot, ScanError, ScannedMetadata};
 pub use verify::{fast_verify, VerifyError};
 
@@ -89,6 +110,9 @@ pub struct Context {
     pub quiet: bool,
     /// Interactive mode enabled.
     pub interactive: bool,
+    /// Git hook verification enabled.
+    /// When false, git commands are invoked with --no-verify.
+    pub verify: bool,
 }
 
 impl Default for Context {
@@ -98,6 +122,7 @@ impl Default for Context {
             debug: false,
             quiet: false,
             interactive: true,
+            verify: true,
         }
     }
 }
@@ -209,6 +234,7 @@ mod tests {
             assert!(!ctx.debug);
             assert!(!ctx.quiet);
             assert!(ctx.interactive);
+            assert!(ctx.verify);
         }
 
         #[test]
@@ -218,11 +244,13 @@ mod tests {
                 debug: true,
                 quiet: true,
                 interactive: false,
+                verify: false,
             };
             assert_eq!(ctx.cwd, Some(PathBuf::from("/custom")));
             assert!(ctx.debug);
             assert!(ctx.quiet);
             assert!(!ctx.interactive);
+            assert!(!ctx.verify);
         }
     }
 

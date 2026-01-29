@@ -10,23 +10,33 @@
 //!
 //! # Authentication
 //!
-//! All API calls require a Personal Access Token (PAT) with appropriate scopes:
-//! - `repo` scope for private repositories
-//! - `public_repo` scope for public repositories
+//! The preferred authentication method is via [`TokenProvider`] which handles
+//! automatic token refresh. Legacy static token authentication is also supported
+//! for backwards compatibility.
+//!
+//! Per SPEC.md §4.4 and ARCHITECTURE.md §11.3:
+//! - Tokens are refreshed automatically when near expiry
+//! - Auth lock prevents concurrent refresh races
+//! - 401/403 errors trigger one retry with fresh token
 //!
 //! # Rate Limiting
 //!
 //! GitHub has rate limits. This implementation:
 //! - Returns `ForgeError::RateLimited` when limits are hit
-//! - Does not implement automatic retry (caller's responsibility)
+//! - Does not implement automatic retry for rate limits (caller's responsibility)
 //!
 //! # Example
 //!
 //! ```ignore
 //! use latticework::forge::github::GitHubForge;
 //! use latticework::forge::{Forge, CreatePrRequest};
+//! use latticework::auth::{GitHubAuthManager, TokenProvider};
+//! use std::sync::Arc;
 //!
-//! let forge = GitHubForge::new("ghp_token123", "owner", "repo");
+//! // Preferred: Use TokenProvider for automatic refresh
+//! let auth_manager = Arc::new(GitHubAuthManager::new("github.com", store));
+//! let forge = GitHubForge::new_with_provider(auth_manager, "owner", "repo");
+//!
 //! let pr = forge.create_pr(CreatePrRequest {
 //!     head: "feature".to_string(),
 //!     base: "main".to_string(),
@@ -35,6 +45,10 @@
 //!     draft: false,
 //! }).await?;
 //! ```
+//!
+//! [`TokenProvider`]: crate::auth::TokenProvider
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -45,6 +59,7 @@ use super::traits::{
     CreatePrRequest, Forge, ForgeError, ListPullsOpts, ListPullsResult, MergeMethod, PrState,
     PullRequest, PullRequestSummary, Reviewers, UpdatePrRequest,
 };
+use crate::auth::TokenProvider;
 
 /// Default GitHub API base URL.
 const DEFAULT_API_BASE: &str = "https://api.github.com";
@@ -58,12 +73,26 @@ const USER_AGENT_VALUE: &str = "lattice-cli";
 /// GitHub forge implementation.
 ///
 /// Implements the `Forge` trait for GitHub using REST and GraphQL APIs.
-#[derive(Debug, Clone)]
+///
+/// # Authentication
+///
+/// Two authentication modes are supported:
+///
+/// 1. **TokenProvider (preferred)**: Use [`new_with_provider`] for automatic token refresh.
+///    The provider is called for each API request, ensuring tokens are always fresh.
+///
+/// 2. **Static token (deprecated)**: Use [`new`] for backwards compatibility.
+///    The token is stored directly and never refreshed.
+///
+/// [`new_with_provider`]: GitHubForge::new_with_provider
+/// [`new`]: GitHubForge::new
 pub struct GitHubForge {
     /// HTTP client for making requests
     client: Client,
-    /// Personal access token for authentication
-    token: String,
+    /// Token provider for automatic refresh (preferred)
+    token_provider: Option<Arc<dyn TokenProvider>>,
+    /// Static token for backwards compatibility (deprecated)
+    static_token: Option<String>,
     /// Repository owner (user or organization)
     owner: String,
     /// Repository name
@@ -72,20 +101,112 @@ pub struct GitHubForge {
     api_base: String,
 }
 
+// Custom Debug to avoid exposing static_token
+impl std::fmt::Debug for GitHubForge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubForge")
+            .field("has_token_provider", &self.token_provider.is_some())
+            .field("has_static_token", &self.static_token.is_some())
+            .field("owner", &self.owner)
+            .field("repo", &self.repo)
+            .field("api_base", &self.api_base)
+            .finish()
+    }
+}
+
 impl GitHubForge {
-    /// Create a new GitHub forge.
+    /// Create a new GitHub forge with a TokenProvider for automatic token refresh.
+    ///
+    /// This is the **preferred constructor** for production use. The TokenProvider
+    /// is called for each API request, ensuring tokens are always fresh. If a
+    /// 401 or 403 error occurs, the request is retried once with a refreshed token.
     ///
     /// # Arguments
     ///
-    /// * `token` - Personal access token
+    /// * `provider` - Token provider for automatic refresh
     /// * `owner` - Repository owner
     /// * `repo` - Repository name
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use latticework::auth::{GitHubAuthManager, TokenProvider};
+    /// use std::sync::Arc;
+    ///
+    /// let store = secrets::create_store(secrets::DEFAULT_PROVIDER)?;
+    /// let provider: Arc<dyn TokenProvider> = Arc::new(GitHubAuthManager::new("github.com", store));
+    /// let forge = GitHubForge::new_with_provider(provider, "octocat", "hello-world");
+    /// ```
+    pub fn new_with_provider(
+        provider: Arc<dyn TokenProvider>,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            token_provider: Some(provider),
+            static_token: None,
+            owner: owner.into(),
+            repo: repo.into(),
+            api_base: DEFAULT_API_BASE.to_string(),
+        }
+    }
+
+    /// Create a new GitHub forge with a TokenProvider and custom API base URL.
+    ///
+    /// Use this for GitHub Enterprise installations with automatic token refresh.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - Token provider for automatic refresh
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `api_base` - Custom API base URL (e.g., `https://github.example.com/api/v3`)
+    pub fn new_with_provider_and_api_base(
+        provider: Arc<dyn TokenProvider>,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Client::new(),
+            token_provider: Some(provider),
+            static_token: None,
+            owner: owner.into(),
+            repo: repo.into(),
+            api_base: api_base.into(),
+        }
+    }
+
+    /// Create a new GitHub forge with a static token.
+    ///
+    /// # Deprecated
+    ///
+    /// This constructor is deprecated. Use [`new_with_provider`] for production
+    /// to enable automatic token refresh and retry on auth failures.
+    ///
+    /// This method is retained for:
+    /// - Tests that don't need token refresh
+    /// - Backwards compatibility during migration
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Personal access token or GitHub App token
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[allow(deprecated)]
     /// let forge = GitHubForge::new("ghp_xxx", "octocat", "hello-world");
     /// ```
+    ///
+    /// [`new_with_provider`]: GitHubForge::new_with_provider
+    #[deprecated(
+        since = "0.7.0",
+        note = "Use new_with_provider for automatic token refresh"
+    )]
     pub fn new(
         token: impl Into<String>,
         owner: impl Into<String>,
@@ -93,23 +214,26 @@ impl GitHubForge {
     ) -> Self {
         Self {
             client: Client::new(),
-            token: token.into(),
+            token_provider: None,
+            static_token: Some(token.into()),
             owner: owner.into(),
             repo: repo.into(),
             api_base: DEFAULT_API_BASE.to_string(),
         }
     }
 
-    /// Create a GitHub forge with a custom API base URL.
+    /// Create a GitHub forge with a static token and custom API base URL.
     ///
-    /// Use this for GitHub Enterprise installations.
+    /// # Deprecated
     ///
-    /// # Arguments
+    /// Use [`new_with_provider_and_api_base`] for GitHub Enterprise with automatic
+    /// token refresh.
     ///
-    /// * `token` - Personal access token
-    /// * `owner` - Repository owner
-    /// * `repo` - Repository name
-    /// * `api_base` - Custom API base URL (e.g., `https://github.example.com/api/v3`)
+    /// [`new_with_provider_and_api_base`]: GitHubForge::new_with_provider_and_api_base
+    #[deprecated(
+        since = "0.7.0",
+        note = "Use new_with_provider_and_api_base for automatic token refresh"
+    )]
     pub fn with_api_base(
         token: impl Into<String>,
         owner: impl Into<String>,
@@ -118,21 +242,22 @@ impl GitHubForge {
     ) -> Self {
         Self {
             client: Client::new(),
-            token: token.into(),
+            token_provider: None,
+            static_token: Some(token.into()),
             owner: owner.into(),
             repo: repo.into(),
             api_base: api_base.into(),
         }
     }
 
-    /// Create a GitHub forge from a remote URL.
+    /// Create a GitHub forge from a remote URL with a TokenProvider.
     ///
     /// Parses the remote URL to extract owner and repo.
     ///
     /// # Arguments
     ///
     /// * `url` - Git remote URL (SSH or HTTPS format)
-    /// * `token` - Personal access token
+    /// * `provider` - Token provider for automatic refresh
     ///
     /// # Returns
     ///
@@ -140,21 +265,48 @@ impl GitHubForge {
     ///
     /// # Example
     ///
+    /// ```ignore
+    /// use latticework::forge::github::GitHubForge;
+    /// use latticework::auth::{GitHubAuthManager, TokenProvider};
+    /// use std::sync::Arc;
+    ///
+    /// let provider: Arc<dyn TokenProvider> = Arc::new(auth_manager);
+    /// let forge = GitHubForge::from_remote_url_with_provider(
+    ///     "git@github.com:owner/repo.git",
+    ///     provider,
+    /// );
+    /// ```
+    pub fn from_remote_url_with_provider(
+        url: &str,
+        provider: Arc<dyn TokenProvider>,
+    ) -> Option<Self> {
+        let (owner, repo) = parse_github_url(url)?;
+        Some(Self::new_with_provider(provider, owner, repo))
+    }
+
+    /// Create a GitHub forge from a remote URL with a static token.
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`from_remote_url_with_provider`] for automatic token refresh.
+    ///
+    /// [`from_remote_url_with_provider`]: GitHubForge::from_remote_url_with_provider
+    ///
+    /// # Example
+    ///
     /// ```
     /// use latticework::forge::github::GitHubForge;
     ///
     /// // SSH format
+    /// #[allow(deprecated)]
     /// let forge = GitHubForge::from_remote_url("git@github.com:owner/repo.git", "token");
     /// assert!(forge.is_some());
-    ///
-    /// // HTTPS format
-    /// let forge = GitHubForge::from_remote_url("https://github.com/owner/repo.git", "token");
-    /// assert!(forge.is_some());
-    ///
-    /// // Invalid URL
-    /// let forge = GitHubForge::from_remote_url("https://gitlab.com/owner/repo", "token");
-    /// assert!(forge.is_none());
     /// ```
+    #[deprecated(
+        since = "0.7.0",
+        note = "Use from_remote_url_with_provider for automatic token refresh"
+    )]
+    #[allow(deprecated)]
     pub fn from_remote_url(url: &str, token: impl Into<String>) -> Option<Self> {
         let (owner, repo) = parse_github_url(url)?;
         Some(Self::new(token, owner, repo))
@@ -170,12 +322,40 @@ impl GitHubForge {
         &self.repo
     }
 
-    /// Build common headers for API requests.
-    fn headers(&self) -> HeaderMap {
+    /// Check if this forge has a TokenProvider (enables retry on auth failure).
+    pub fn has_token_provider(&self) -> bool {
+        self.token_provider.is_some()
+    }
+
+    /// Get the current bearer token, refreshing if needed.
+    ///
+    /// If a TokenProvider is configured, calls `bearer_token()` which may
+    /// refresh the token if near expiry. Otherwise, returns the static token.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ForgeError::AuthRequired` if no token source is configured.
+    /// Returns `ForgeError::AuthFailed` if the TokenProvider fails.
+    async fn get_bearer_token(&self) -> Result<String, ForgeError> {
+        if let Some(ref provider) = self.token_provider {
+            provider
+                .bearer_token()
+                .await
+                .map_err(|e| ForgeError::AuthFailed(e.to_string()))
+        } else if let Some(ref token) = self.static_token {
+            Ok(token.clone())
+        } else {
+            Err(ForgeError::AuthRequired)
+        }
+    }
+
+    /// Build common headers for API requests (async to allow token refresh).
+    async fn headers(&self) -> Result<HeaderMap, ForgeError> {
+        let token = self.get_bearer_token().await?;
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token)).expect("Invalid token format"),
+            HeaderValue::from_str(&format!("Bearer {}", token)).expect("Invalid token format"),
         );
         headers.insert(
             ACCEPT,
@@ -186,7 +366,12 @@ impl GitHubForge {
             "X-GitHub-Api-Version",
             HeaderValue::from_static("2022-11-28"),
         );
-        headers
+        Ok(headers)
+    }
+
+    /// Check if an error is an auth failure that might be resolved by token refresh.
+    fn is_retryable_auth_error(err: &ForgeError) -> bool {
+        matches!(err, ForgeError::AuthFailed(_))
     }
 
     /// Build URL for a repository endpoint.
@@ -303,36 +488,72 @@ impl GitHubForge {
             "variables": { "id": node_id }
         });
 
-        let response = self
-            .client
-            .post(GRAPHQL_ENDPOINT)
-            .headers(self.headers())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+        // Helper to execute graphql and handle response
+        let execute_graphql = |headers: HeaderMap| {
+            let client = &self.client;
+            let body = &body;
+            async move {
+                let response = client
+                    .post(GRAPHQL_ENDPOINT)
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        let status = response.status();
-        if status.is_success() {
-            // Check for GraphQL errors in response
-            let result: GraphQLResponse =
-                response.json().await.map_err(|e| ForgeError::ApiError {
-                    status: status.as_u16(),
-                    message: format!("Failed to parse GraphQL response: {}", e),
-                })?;
+                let status = response.status();
+                if status.is_success() {
+                    let result: GraphQLResponse =
+                        response.json().await.map_err(|e| ForgeError::ApiError {
+                            status: status.as_u16(),
+                            message: format!("Failed to parse GraphQL response: {}", e),
+                        })?;
 
-            if let Some(errors) = result.errors {
-                if !errors.is_empty() {
-                    return Err(ForgeError::ApiError {
-                        status: 200,
-                        message: errors[0].message.clone(),
-                    });
+                    if let Some(errors) = result.errors {
+                        if !errors.is_empty() {
+                            return Err(ForgeError::ApiError {
+                                status: 200,
+                                message: errors[0].message.clone(),
+                            });
+                        }
+                    }
+                    Ok(())
+                } else {
+                    // For non-success, we need to parse the error
+                    // Since we can't call self.handle_error_response in the closure,
+                    // return a special error that we can retry
+                    match status {
+                        StatusCode::UNAUTHORIZED => {
+                            Err(ForgeError::AuthFailed("Invalid or expired token".into()))
+                        }
+                        StatusCode::FORBIDDEN => {
+                            Err(ForgeError::AuthFailed("Permission denied".into()))
+                        }
+                        _ => {
+                            let message = response
+                                .json::<GitHubErrorResponse>()
+                                .await
+                                .map(|e| e.message)
+                                .unwrap_or_else(|_| "Unknown error".to_string());
+                            Err(ForgeError::ApiError {
+                                status: status.as_u16(),
+                                message,
+                            })
+                        }
+                    }
                 }
             }
+        };
 
-            Ok(())
-        } else {
-            self.handle_error_response(response, status).await
+        // First attempt
+        let result = execute_graphql(self.headers().await?).await;
+
+        // Retry once on auth failure if we have a TokenProvider
+        match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                execute_graphql(self.headers().await?).await
+            }
+            other => other,
         }
     }
 }
@@ -354,16 +575,34 @@ impl Forge for GitHubForge {
             draft: request.draft,
         };
 
+        // First attempt
         let response = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .json(&body)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        let pr: GitHubPullRequest = self.handle_response(response).await?;
+        let result: Result<GitHubPullRequest, ForgeError> = self.handle_response(response).await;
+
+        // Retry once on auth failure if we have a TokenProvider
+        let pr: GitHubPullRequest = match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .post(&url)
+                    .headers(self.headers().await?)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                self.handle_response(response).await?
+            }
+            other => other?,
+        };
+
         Ok(pr.into())
     }
 
@@ -376,31 +615,66 @@ impl Forge for GitHubForge {
             base: request.base.as_deref(),
         };
 
+        // First attempt
         let response = self
             .client
             .patch(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .json(&body)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        let pr: GitHubPullRequest = self.handle_response(response).await?;
+        let result: Result<GitHubPullRequest, ForgeError> = self.handle_response(response).await;
+
+        // Retry once on auth failure if we have a TokenProvider
+        let pr: GitHubPullRequest = match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .patch(&url)
+                    .headers(self.headers().await?)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                self.handle_response(response).await?
+            }
+            other => other?,
+        };
+
         Ok(pr.into())
     }
 
     async fn get_pr(&self, number: u64) -> Result<PullRequest, ForgeError> {
         let url = self.repo_url(&format!("pulls/{}", number));
 
+        // First attempt
         let response = self
             .client
             .get(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        let pr: GitHubPullRequest = self.handle_response(response).await?;
+        let result: Result<GitHubPullRequest, ForgeError> = self.handle_response(response).await;
+
+        // Retry once on auth failure if we have a TokenProvider
+        let pr: GitHubPullRequest = match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .get(&url)
+                    .headers(self.headers().await?)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                self.handle_response(response).await?
+            }
+            other => other?,
+        };
+
         Ok(pr.into())
     }
 
@@ -418,15 +692,32 @@ impl Forge for GitHubForge {
             self.api_base, self.owner, self.repo, head_param
         );
 
+        // First attempt
         let response = self
             .client
             .get(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-        let prs: Vec<GitHubPullRequest> = self.handle_response(response).await?;
+        let result: Result<Vec<GitHubPullRequest>, ForgeError> =
+            self.handle_response(response).await;
+
+        // Retry once on auth failure if we have a TokenProvider
+        let prs: Vec<GitHubPullRequest> = match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .get(&url)
+                    .headers(self.headers().await?)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                self.handle_response(response).await?
+            }
+            other => other?,
+        };
 
         Ok(prs.into_iter().next().map(Into::into))
     }
@@ -456,20 +747,42 @@ impl Forge for GitHubForge {
             team_reviewers: &reviewers.teams,
         };
 
+        // First attempt
         let response = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .json(&body)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
         let status = response.status();
-        if status.is_success() {
+        let result: Result<(), ForgeError> = if status.is_success() {
             Ok(())
         } else {
             self.handle_error_response(response, status).await
+        };
+
+        // Retry once on auth failure if we have a TokenProvider
+        match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .post(&url)
+                    .headers(self.headers().await?)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                let status = response.status();
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    self.handle_error_response(response, status).await
+                }
+            }
+            other => other,
         }
     }
 
@@ -484,20 +797,42 @@ impl Forge for GitHubForge {
 
         let body = MergePrBody { merge_method };
 
+        // First attempt
         let response = self
             .client
             .put(&url)
-            .headers(self.headers())
+            .headers(self.headers().await?)
             .json(&body)
             .send()
             .await
             .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
         let status = response.status();
-        if status.is_success() {
+        let result: Result<(), ForgeError> = if status.is_success() {
             Ok(())
         } else {
             self.handle_error_response(response, status).await
+        };
+
+        // Retry once on auth failure if we have a TokenProvider
+        match result {
+            Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                let response = self
+                    .client
+                    .put(&url)
+                    .headers(self.headers().await?)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                let status = response.status();
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    self.handle_error_response(response, status).await
+                }
+            }
+            other => other,
         }
     }
 
@@ -516,15 +851,33 @@ impl Forge for GitHubForge {
                 self.api_base, self.owner, self.repo, per_page, page
             );
 
+            // First attempt
             let response = self
                 .client
                 .get(&url)
-                .headers(self.headers())
+                .headers(self.headers().await?)
                 .send()
                 .await
                 .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-            let page_prs: Vec<GitHubPullRequestListItem> = self.handle_response(response).await?;
+            let result: Result<Vec<GitHubPullRequestListItem>, ForgeError> =
+                self.handle_response(response).await;
+
+            // Retry once on auth failure if we have a TokenProvider
+            let page_prs: Vec<GitHubPullRequestListItem> = match result {
+                Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                    let response = self
+                        .client
+                        .get(&url)
+                        .headers(self.headers().await?)
+                        .send()
+                        .await
+                        .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                    self.handle_response(response).await?
+                }
+                other => other?,
+            };
+
             let page_count = page_prs.len();
 
             for pr in page_prs {
@@ -581,15 +934,33 @@ impl Forge for GitHubForge {
                 page
             );
 
+            // First attempt
             let response = self
                 .client
                 .get(&url)
-                .headers(self.headers())
+                .headers(self.headers().await?)
                 .send()
                 .await
                 .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
 
-            let page_prs: Vec<GitHubPullRequestListItem> = self.handle_response(response).await?;
+            let result: Result<Vec<GitHubPullRequestListItem>, ForgeError> =
+                self.handle_response(response).await;
+
+            // Retry once on auth failure if we have a TokenProvider
+            let page_prs: Vec<GitHubPullRequestListItem> = match result {
+                Err(ref e) if Self::is_retryable_auth_error(e) && self.has_token_provider() => {
+                    let response = self
+                        .client
+                        .get(&url)
+                        .headers(self.headers().await?)
+                        .send()
+                        .await
+                        .map_err(|e| ForgeError::NetworkError(e.to_string()))?;
+                    self.handle_response(response).await?
+                }
+                other => other?,
+            };
+
             let page_count = page_prs.len();
 
             for pr in page_prs {
@@ -903,23 +1274,28 @@ mod tests {
         use super::*;
 
         #[test]
+        #[allow(deprecated)]
         fn new_creates_forge() {
             let forge = GitHubForge::new("token", "owner", "repo");
             assert_eq!(forge.name(), "github");
             assert_eq!(forge.owner(), "owner");
             assert_eq!(forge.repo(), "repo");
+            assert!(!forge.has_token_provider());
         }
 
         #[test]
+        #[allow(deprecated)]
         fn from_remote_url_ssh() {
             let forge = GitHubForge::from_remote_url("git@github.com:owner/repo.git", "token");
             assert!(forge.is_some());
             let forge = forge.unwrap();
             assert_eq!(forge.owner(), "owner");
             assert_eq!(forge.repo(), "repo");
+            assert!(!forge.has_token_provider());
         }
 
         #[test]
+        #[allow(deprecated)]
         fn from_remote_url_https() {
             let forge = GitHubForge::from_remote_url("https://github.com/owner/repo.git", "token");
             assert!(forge.is_some());
@@ -929,12 +1305,14 @@ mod tests {
         }
 
         #[test]
+        #[allow(deprecated)]
         fn from_remote_url_invalid() {
             let forge = GitHubForge::from_remote_url("https://gitlab.com/owner/repo", "token");
             assert!(forge.is_none());
         }
 
         #[test]
+        #[allow(deprecated)]
         fn with_api_base() {
             let forge = GitHubForge::with_api_base(
                 "token",
@@ -943,9 +1321,11 @@ mod tests {
                 "https://github.example.com/api/v3",
             );
             assert_eq!(forge.api_base, "https://github.example.com/api/v3");
+            assert!(!forge.has_token_provider());
         }
 
         #[test]
+        #[allow(deprecated)]
         fn repo_url_format() {
             let forge = GitHubForge::new("token", "octocat", "hello-world");
             assert_eq!(
@@ -956,6 +1336,162 @@ mod tests {
                 forge.repo_url("pulls/123"),
                 "https://api.github.com/repos/octocat/hello-world/pulls/123"
             );
+        }
+
+        #[test]
+        #[allow(deprecated)]
+        fn debug_redacts_static_token() {
+            let forge = GitHubForge::new("secret_token_abc123", "owner", "repo");
+            let debug_output = format!("{:?}", forge);
+            assert!(!debug_output.contains("secret_token_abc123"));
+            assert!(debug_output.contains("has_static_token"));
+            assert!(debug_output.contains("owner"));
+        }
+    }
+
+    mod github_forge_with_provider {
+        use super::*;
+        use std::sync::Arc;
+
+        /// Mock TokenProvider for testing
+        struct MockTokenProvider {
+            token: String,
+            host: String,
+        }
+
+        impl MockTokenProvider {
+            fn new(token: &str, host: &str) -> Self {
+                Self {
+                    token: token.to_string(),
+                    host: host.to_string(),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl crate::auth::TokenProvider for MockTokenProvider {
+            async fn bearer_token(&self) -> Result<String, crate::auth::AuthError> {
+                Ok(self.token.clone())
+            }
+
+            fn is_authenticated(&self) -> bool {
+                true
+            }
+
+            fn host(&self) -> &str {
+                &self.host
+            }
+        }
+
+        #[test]
+        fn new_with_provider_creates_forge() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("test_token", "github.com"));
+            let forge = GitHubForge::new_with_provider(provider, "owner", "repo");
+
+            assert_eq!(forge.name(), "github");
+            assert_eq!(forge.owner(), "owner");
+            assert_eq!(forge.repo(), "repo");
+            assert!(forge.has_token_provider());
+        }
+
+        #[test]
+        fn new_with_provider_and_api_base() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("test_token", "github.example.com"));
+            let forge = GitHubForge::new_with_provider_and_api_base(
+                provider,
+                "owner",
+                "repo",
+                "https://github.example.com/api/v3",
+            );
+
+            assert_eq!(forge.api_base, "https://github.example.com/api/v3");
+            assert!(forge.has_token_provider());
+        }
+
+        #[test]
+        fn from_remote_url_with_provider() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("test_token", "github.com"));
+            let forge = GitHubForge::from_remote_url_with_provider(
+                "git@github.com:owner/repo.git",
+                provider,
+            );
+
+            assert!(forge.is_some());
+            let forge = forge.unwrap();
+            assert_eq!(forge.owner(), "owner");
+            assert_eq!(forge.repo(), "repo");
+            assert!(forge.has_token_provider());
+        }
+
+        #[test]
+        fn from_remote_url_with_provider_invalid_url() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("test_token", "github.com"));
+            let forge = GitHubForge::from_remote_url_with_provider(
+                "https://gitlab.com/owner/repo",
+                provider,
+            );
+
+            assert!(forge.is_none());
+        }
+
+        #[test]
+        fn debug_does_not_expose_token_provider() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("secret_token_xyz", "github.com"));
+            let forge = GitHubForge::new_with_provider(provider, "owner", "repo");
+
+            let debug_output = format!("{:?}", forge);
+            assert!(!debug_output.contains("secret_token_xyz"));
+            assert!(debug_output.contains("has_token_provider"));
+            assert!(debug_output.contains("owner"));
+        }
+
+        #[tokio::test]
+        async fn get_bearer_token_uses_provider() {
+            let provider: Arc<dyn crate::auth::TokenProvider> =
+                Arc::new(MockTokenProvider::new("my_test_token", "github.com"));
+            let forge = GitHubForge::new_with_provider(provider, "owner", "repo");
+
+            let token = forge.get_bearer_token().await.unwrap();
+            assert_eq!(token, "my_test_token");
+        }
+
+        #[tokio::test]
+        #[allow(deprecated)]
+        async fn get_bearer_token_uses_static_token() {
+            let forge = GitHubForge::new("static_token_123", "owner", "repo");
+
+            let token = forge.get_bearer_token().await.unwrap();
+            assert_eq!(token, "static_token_123");
+        }
+
+        #[test]
+        fn is_retryable_auth_error_returns_true_for_auth_failed() {
+            let err = ForgeError::AuthFailed("token expired".into());
+            assert!(GitHubForge::is_retryable_auth_error(&err));
+        }
+
+        #[test]
+        fn is_retryable_auth_error_returns_false_for_other_errors() {
+            assert!(!GitHubForge::is_retryable_auth_error(
+                &ForgeError::RateLimited
+            ));
+            assert!(!GitHubForge::is_retryable_auth_error(
+                &ForgeError::NotFound("PR not found".into())
+            ));
+            assert!(!GitHubForge::is_retryable_auth_error(
+                &ForgeError::NetworkError("connection failed".into())
+            ));
+            assert!(!GitHubForge::is_retryable_auth_error(
+                &ForgeError::ApiError {
+                    status: 500,
+                    message: "server error".into(),
+                }
+            ));
         }
     }
 

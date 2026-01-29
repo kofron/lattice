@@ -1,5 +1,6 @@
 //! config command - Get, set, or list configuration values
 
+use crate::engine::gate::requirements;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
@@ -12,6 +13,11 @@ pub fn get(ctx: &Context, key: &str) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    // Pre-flight gating check (READ_ONLY - just reading config)
+    crate::engine::runner::check_requirements(&git, &requirements::READ_ONLY)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
     let value = match key {
@@ -85,6 +91,11 @@ pub fn list(ctx: &Context) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
+
+    // Pre-flight gating check (READ_ONLY - just reading config)
+    crate::engine::runner::check_requirements(&git, &requirements::READ_ONLY)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
+
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
     println!("# Repository Configuration");

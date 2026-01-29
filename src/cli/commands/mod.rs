@@ -390,6 +390,9 @@ fn perform_deep_synthetic_analysis(
 ///
 /// Returns None if forge cannot be created (no auth, no remote, etc.)
 fn create_forge_for_deep_analysis(git: &Git) -> Option<Box<dyn crate::forge::Forge>> {
+    use std::sync::Arc;
+
+    use crate::auth::TokenProvider;
     use crate::forge::github::GitHubForge;
 
     // Get remote URL
@@ -403,20 +406,14 @@ fn create_forge_for_deep_analysis(git: &Git) -> Option<Box<dyn crate::forge::For
         return None;
     }
 
-    // Create auth manager and get token synchronously
+    // Create auth manager with TokenProvider for automatic refresh
     let store = crate::secrets::create_store(crate::secrets::DEFAULT_PROVIDER).ok()?;
     let auth_manager = crate::auth::GitHubAuthManager::new("github.com", store);
+    let provider: Arc<dyn TokenProvider> = Arc::new(auth_manager);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-
-    let token = rt
-        .block_on(crate::auth::TokenProvider::bearer_token(&auth_manager))
-        .ok()?;
-
-    Some(Box::new(GitHubForge::new(token, owner, repo)))
+    Some(Box::new(GitHubForge::new_with_provider(
+        provider, owner, repo,
+    )))
 }
 
 /// Doctor command - diagnose and repair repository issues.

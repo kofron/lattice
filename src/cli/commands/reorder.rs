@@ -17,23 +17,153 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::Command as ProcessCommand;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 
-use crate::cli::commands::phase3_helpers::{
-    check_freeze_affected_set, rebase_onto_with_journal, RebaseOutcome,
-};
 use crate::cli::commands::restack::get_ancestors_inclusive;
 use crate::core::metadata::schema::{BaseInfo, ParentInfo};
-use crate::core::metadata::store::MetadataStore;
-use crate::core::ops::journal::{Journal, OpState};
-use crate::core::ops::lock::RepoLock;
-use crate::core::paths::LatticePaths;
-use crate::core::types::BranchName;
+use crate::core::ops::journal::OpId;
+use crate::core::types::{BranchName, Oid, UtcTimestamp};
+use crate::engine::command::{Command, CommandOutput};
+use crate::engine::exec::ExecuteResult;
+use crate::engine::gate::{requirements, ReadyContext, RequirementSet};
+use crate::engine::plan::{Plan, PlanError, PlanStep};
+use crate::engine::runner::run_command;
 use crate::engine::scan::scan;
 use crate::engine::Context;
 use crate::git::Git;
+
+/// Result of reorder command
+#[derive(Debug)]
+pub struct ReorderResult {
+    /// Number of branches reordered
+    pub branches_reordered: usize,
+}
+
+/// Info for reordering a single branch
+pub struct BranchReorderInfo {
+    /// Branch being reordered
+    pub branch: BranchName,
+    /// New parent branch
+    pub new_parent: BranchName,
+    /// Whether new parent is trunk
+    pub parent_is_trunk: bool,
+    /// Current base OID
+    pub old_base: String,
+    /// Current metadata ref OID for CAS
+    pub metadata_ref_oid: Oid,
+    /// Current metadata
+    pub metadata: crate::core::metadata::schema::BranchMetadataV1,
+}
+
+/// Pre-computed data for reorder command
+pub struct ReorderPrecomputed {
+    /// Branches to reorder with their rebase info
+    pub branches_to_reorder: Vec<BranchReorderInfo>,
+}
+
+/// Reorder command implementing Command trait
+pub struct ReorderCommand {
+    /// Precomputed data
+    precomputed: ReorderPrecomputed,
+    /// Whether to run git hooks
+    verify: bool,
+}
+
+impl Command for ReorderCommand {
+    const REQUIREMENTS: &'static RequirementSet = &requirements::MUTATING;
+    type Output = ReorderResult;
+
+    fn plan(&self, _ctx: &ReadyContext) -> Result<Plan, PlanError> {
+        let mut plan = Plan::new(OpId::new(), "reorder");
+
+        for (i, info) in self.precomputed.branches_to_reorder.iter().enumerate() {
+            // Checkpoint before each branch
+            plan = plan.with_step(PlanStep::Checkpoint {
+                name: format!("before-reorder-{}", info.branch),
+            });
+
+            // Rebase onto new parent
+            let mut rebase_args = vec!["rebase".to_string()];
+            if !self.verify {
+                rebase_args.push("--no-verify".to_string());
+            }
+
+            // Use new_parent branch name (not tip OID) so git resolves at runtime
+            // This handles cascading rebases correctly
+            rebase_args.extend([
+                "--onto".to_string(),
+                info.new_parent.to_string(),
+                info.old_base.clone(),
+                info.branch.to_string(),
+            ]);
+
+            plan = plan.with_step(PlanStep::RunGit {
+                args: rebase_args,
+                description: format!("Rebase {} onto {}", info.branch, info.new_parent),
+                expected_effects: vec![format!("refs/heads/{}", info.branch)],
+            });
+
+            // Potential conflict pause
+            plan = plan.with_step(PlanStep::PotentialConflictPause {
+                branch: info.branch.to_string(),
+                git_operation: "rebase".to_string(),
+            });
+
+            // Update metadata with new parent and base
+            let new_parent_ref = if info.parent_is_trunk {
+                ParentInfo::Trunk {
+                    name: info.new_parent.to_string(),
+                }
+            } else {
+                ParentInfo::Branch {
+                    name: info.new_parent.to_string(),
+                }
+            };
+
+            let mut updated_metadata = info.metadata.clone();
+            updated_metadata.parent = new_parent_ref;
+            updated_metadata.base = BaseInfo {
+                oid: info.new_parent.to_string(), // Use branch name, resolved at write time
+            };
+            updated_metadata.timestamps.updated_at = UtcTimestamp::now();
+
+            plan = plan.with_step(PlanStep::WriteMetadataCas {
+                branch: info.branch.to_string(),
+                old_ref_oid: Some(info.metadata_ref_oid.to_string()),
+                metadata: Box::new(updated_metadata),
+            });
+
+            // For debugging: show remaining branches
+            if i < self.precomputed.branches_to_reorder.len() - 1 {
+                let _ = i; // Silence unused warning
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn finish(&self, result: ExecuteResult) -> CommandOutput<Self::Output> {
+        match result {
+            ExecuteResult::Success { .. } => CommandOutput::Success(ReorderResult {
+                branches_reordered: self.precomputed.branches_to_reorder.len(),
+            }),
+            ExecuteResult::Paused {
+                branch, git_state, ..
+            } => CommandOutput::Paused {
+                message: format!(
+                    "Conflict while reordering '{}' ({}).\n\
+                     Resolve conflicts, then run 'lattice continue'.\n\
+                     To abort, run 'lattice abort'.",
+                    branch,
+                    git_state.description()
+                ),
+            },
+            ExecuteResult::Aborted { error, .. } => CommandOutput::Failed { error },
+        }
+    }
+}
 
 /// Reorder branches in current stack using editor.
 ///
@@ -47,35 +177,28 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let git = Git::open(&cwd).context("Failed to open repository")?;
     let info = git.info()?;
-    let paths = LatticePaths::from_repo_info(&info);
+    let paths = crate::core::paths::LatticePaths::from_repo_info(&info);
 
-    // Check for in-progress operation
-    if let Some(op_state) = OpState::read(&paths)? {
-        bail!(
-            "Another operation is in progress: {} ({}). Use 'lattice continue' or 'lattice abort'.",
-            op_state.command,
-            op_state.op_id
-        );
-    }
+    // =========================================================================
+    // PRE-PLAN: Editor interaction (must happen before unified lifecycle)
+    // =========================================================================
 
     let snapshot = scan(&git).context("Failed to scan repository")?;
 
-    // Ensure trunk is configured
     let trunk = snapshot
         .trunk
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Trunk not configured. Run 'lattice init' first."))?
+        .clone();
 
-    // Get current branch
     let current = snapshot
         .current_branch
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Not on any branch"))?
         .clone();
 
-    // Check if tracked
     if !snapshot.metadata.contains_key(&current) {
-        bail!(
+        anyhow::bail!(
             "Branch '{}' is not tracked. Use 'lattice track' first.",
             current
         );
@@ -83,7 +206,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Get stack from trunk to current (ancestors including current, excluding trunk)
     let ancestors = get_ancestors_inclusive(&current, &snapshot);
-    let stack: Vec<_> = ancestors.into_iter().filter(|b| b != trunk).collect();
+    let stack: Vec<_> = ancestors.into_iter().filter(|b| b != &trunk).collect();
 
     if stack.len() < 2 {
         if !ctx.quiet {
@@ -95,8 +218,19 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    // Check freeze policy
-    check_freeze_affected_set(&stack, &snapshot)?;
+    // Check freeze policy on all branches
+    for branch in &stack {
+        let meta = snapshot
+            .metadata
+            .get(branch)
+            .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
+        if meta.metadata.freeze.is_frozen() {
+            anyhow::bail!(
+                "Cannot reorder: branch '{}' is frozen. Use 'lattice unfreeze' first.",
+                branch
+            );
+        }
+    }
 
     // Create temp file with branch list
     let temp_file = paths.git_dir.join("REORDER_BRANCHES");
@@ -126,14 +260,14 @@ pub fn reorder(ctx: &Context) -> Result<()> {
     }
 
     // Open editor
-    let status = Command::new(&editor)
+    let status = ProcessCommand::new(&editor)
         .arg(&temp_file)
         .status()
         .with_context(|| format!("Failed to open editor '{}'", editor))?;
 
     if !status.success() {
         fs::remove_file(&temp_file).ok();
-        bail!("Editor exited with error");
+        anyhow::bail!("Editor exited with error");
     }
 
     // Read edited file
@@ -150,7 +284,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     // Validate: same set, no duplicates
     if new_order.len() != stack.len() {
-        bail!(
+        anyhow::bail!(
             "Invalid edit: expected {} branches, got {}. Do not add or remove branches.",
             stack.len(),
             new_order.len()
@@ -159,7 +293,7 @@ pub fn reorder(ctx: &Context) -> Result<()> {
 
     let new_set: std::collections::HashSet<_> = new_order.iter().collect();
     if new_set.len() != new_order.len() {
-        bail!("Invalid edit: duplicate branch names detected");
+        anyhow::bail!("Invalid edit: duplicate branch names detected");
     }
 
     let old_set: std::collections::HashSet<_> = stack.iter().collect();
@@ -168,10 +302,10 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         let added: Vec<_> = new_set.difference(&old_set).collect();
 
         if !missing.is_empty() {
-            bail!("Invalid edit: missing branches: {:?}", missing);
+            anyhow::bail!("Invalid edit: missing branches: {:?}", missing);
         }
         if !added.is_empty() {
-            bail!("Invalid edit: unknown branches: {:?}", added);
+            anyhow::bail!("Invalid edit: unknown branches: {:?}", added);
         }
     }
 
@@ -210,19 +344,11 @@ pub fn reorder(ctx: &Context) -> Result<()> {
         }
     }
 
-    // Acquire lock
-    let _lock = RepoLock::acquire(&paths).context("Failed to acquire repository lock")?;
+    // =========================================================================
+    // PRE-PLAN: Compute rebase sequence
+    // =========================================================================
 
-    // Create journal
-    let mut journal = Journal::new("reorder");
-
-    // Write op-state
-    let op_state = OpState::from_journal(&journal, &paths, info.work_dir.clone());
-    op_state.write(&paths)?;
-
-    // Execute rebase sequence
-    // We need to rebase each branch onto its new parent
-    let store = MetadataStore::new(&git);
+    let mut branches_to_reorder = Vec::new();
 
     for (i, branch) in new_order.iter().enumerate() {
         let new_parent = if i == 0 {
@@ -231,142 +357,79 @@ pub fn reorder(ctx: &Context) -> Result<()> {
             new_order[i - 1].clone()
         };
 
-        // Re-scan to get current state
-        let current_snapshot = scan(&git).context("Failed to re-scan")?;
-
-        let branch_meta = current_snapshot
+        let branch_meta = snapshot
             .metadata
             .get(branch)
             .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
 
-        // Get new parent tip
-        let new_parent_tip = current_snapshot
+        let new_parent_tip = snapshot
             .branches
             .get(&new_parent)
             .ok_or_else(|| anyhow::anyhow!("Parent '{}' not found", new_parent))?;
 
-        // Check if branch is already in correct position
+        // Check if already in correct position
         let current_parent_name = branch_meta.metadata.parent.name();
         if current_parent_name == new_parent.as_str()
             && branch_meta.metadata.base.oid == new_parent_tip.as_str()
         {
-            if ctx.debug {
-                eprintln!("[debug] '{}' is already in position", branch);
-            }
+            // Skip - already in position
             continue;
         }
 
-        if !ctx.quiet {
-            println!("  Rebasing '{}' onto '{}'...", branch, new_parent);
-        }
+        let parent_is_trunk = new_parent == trunk;
 
-        let old_base =
-            crate::core::types::Oid::new(&branch_meta.metadata.base.oid).context("Invalid base")?;
-
-        let remaining: Vec<String> = new_order
-            .iter()
-            .skip(i + 1)
-            .map(|b| b.to_string())
-            .collect();
-
-        let outcome = rebase_onto_with_journal(
-            &git,
-            &cwd,
-            branch,
-            &old_base,
-            new_parent_tip,
-            &mut journal,
-            remaining,
-            &paths,
-            ctx,
-        )?;
-
-        match outcome {
-            RebaseOutcome::Success { new_tip: _ } => {
-                // Update metadata
-                let fresh_snapshot = scan(&git)?;
-                let fresh_meta = fresh_snapshot
-                    .metadata
-                    .get(branch)
-                    .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
-
-                let new_parent_ref = if &new_parent == trunk {
-                    ParentInfo::Trunk {
-                        name: new_parent.to_string(),
-                    }
-                } else {
-                    ParentInfo::Branch {
-                        name: new_parent.to_string(),
-                    }
-                };
-
-                let mut updated = fresh_meta.metadata.clone();
-                updated.parent = new_parent_ref;
-                updated.base = BaseInfo {
-                    oid: new_parent_tip.to_string(),
-                };
-                updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-                let new_ref_oid = store.write_cas(branch, Some(&fresh_meta.ref_oid), &updated)?;
-
-                journal.record_metadata_write(
-                    branch.as_str(),
-                    Some(fresh_meta.ref_oid.to_string()),
-                    new_ref_oid,
-                );
-            }
-            RebaseOutcome::Conflict => {
-                println!();
-                println!("Conflict while reordering '{}'.", branch);
-                println!("Resolve conflicts, then run 'lattice continue'.");
-                println!("To abort, run 'lattice abort'.");
-                return Ok(());
-            }
-            RebaseOutcome::NoOp => {
-                // Still update parent pointer
-                let fresh_snapshot = scan(&git)?;
-                let fresh_meta = fresh_snapshot
-                    .metadata
-                    .get(branch)
-                    .ok_or_else(|| anyhow::anyhow!("Metadata not found for '{}'", branch))?;
-
-                let new_parent_ref = if &new_parent == trunk {
-                    ParentInfo::Trunk {
-                        name: new_parent.to_string(),
-                    }
-                } else {
-                    ParentInfo::Branch {
-                        name: new_parent.to_string(),
-                    }
-                };
-
-                let mut updated = fresh_meta.metadata.clone();
-                updated.parent = new_parent_ref;
-                updated.base = BaseInfo {
-                    oid: new_parent_tip.to_string(),
-                };
-                updated.timestamps.updated_at = crate::core::types::UtcTimestamp::now();
-
-                let new_ref_oid = store.write_cas(branch, Some(&fresh_meta.ref_oid), &updated)?;
-
-                journal.record_metadata_write(
-                    branch.as_str(),
-                    Some(fresh_meta.ref_oid.to_string()),
-                    new_ref_oid,
-                );
-            }
-        }
+        branches_to_reorder.push(BranchReorderInfo {
+            branch: branch.clone(),
+            new_parent: new_parent.clone(),
+            parent_is_trunk,
+            old_base: branch_meta.metadata.base.oid.clone(),
+            metadata_ref_oid: branch_meta.ref_oid.clone(),
+            metadata: branch_meta.metadata.clone(),
+        });
     }
 
-    // Commit journal
-    journal.commit();
-    journal.write(&paths)?;
+    if branches_to_reorder.is_empty() {
+        if !ctx.quiet {
+            println!("All branches already in correct position.");
+        }
+        return Ok(());
+    }
 
-    // Clear op-state
-    OpState::remove(&paths)?;
+    let precomputed = ReorderPrecomputed {
+        branches_to_reorder,
+    };
 
-    if !ctx.quiet {
-        println!("Reorder complete.");
+    // =========================================================================
+    // EXECUTE: Run command through unified lifecycle
+    // =========================================================================
+
+    let cmd = ReorderCommand {
+        precomputed,
+        verify: ctx.verify,
+    };
+
+    let output = run_command(&cmd, &git, ctx)?;
+
+    // =========================================================================
+    // POST-EXECUTE: Display results
+    // =========================================================================
+
+    match output {
+        CommandOutput::Success(result) => {
+            if !ctx.quiet {
+                println!(
+                    "Reordered {} branch(es). Reorder complete.",
+                    result.branches_reordered
+                );
+            }
+        }
+        CommandOutput::Paused { message } => {
+            println!();
+            println!("{}", message);
+        }
+        CommandOutput::Failed { error } => {
+            anyhow::bail!("Reorder failed: {}", error);
+        }
     }
 
     Ok(())

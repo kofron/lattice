@@ -1,12 +1,55 @@
 //! undo command - Undo the last completed operation
+//!
+//! Per SPEC.md §8F.3, undo reverses the most recent committed Lattice operation:
+//! - Ref moves are restored to their previous values
+//! - Metadata changes are reverted
+//!
+//! # Limitations
+//!
+//! - Cannot undo remote operations (push, PR creation)
+//! - Metadata updates where the old content wasn't stored may not be fully restorable
+//! - Cannot undo while another operation is in progress (use `abort` first)
+//!
+//! # Remote Operation Warnings
+//!
+//! When undoing an operation that included remote changes (pushes, fetches),
+//! the undo command displays a warning listing the remote operations. Local refs
+//! are restored, but remote branches remain as-is and may require manual cleanup
+//! (e.g., force-push to revert remote state).
+//!
+//! # Implementation Notes
+//!
+//! Undo uses force ref updates (`Git::update_ref_force`) rather than CAS updates
+//! because the repository state may have changed since the operation was recorded.
+//! The goal is unconditional restoration to the known good state from the journal.
+//!
+//! # Ledger Integration (Phase 7)
+//!
+//! After a successful undo, an `UndoApplied` event is recorded in the event ledger
+//! for audit purposes. This includes the operation ID that was undone and the number
+//! of refs that were restored.
 
 use crate::core::ops::journal::{Journal, OpPhase, OpState, StepKind};
 use crate::core::paths::LatticePaths;
+use crate::core::types::Oid;
+use crate::engine::gate::requirements;
+use crate::engine::ledger::{Event, EventLedger};
 use crate::engine::Context;
 use crate::git::Git;
 use anyhow::{bail, Context as _, Result};
 
 /// Undo the last completed operation.
+///
+/// Per SPEC.md §8F.3:
+/// - Undoes the most recent committed Lattice operation
+/// - Cannot undo remote PR creation or pushes
+/// - Uses stored journal snapshots for ref restoration
+///
+/// # Phase 7 Improvements
+///
+/// - Records `UndoApplied` event in ledger
+/// - Warns about remote operations that cannot be undone
+/// - Uses Git interface instead of raw commands
 pub fn undo(ctx: &Context) -> Result<()> {
     let cwd = ctx
         .cwd
@@ -15,6 +58,14 @@ pub fn undo(ctx: &Context) -> Result<()> {
     let git = Git::open(&cwd).context("Failed to open repository")?;
     let info = git.info()?;
     let paths = LatticePaths::from_repo_info(&info);
+
+    if ctx.debug {
+        eprintln!("[debug] undo: opening repository at {:?}", cwd);
+    }
+
+    // Pre-flight gating check (RECOVERY is minimal - just RepoOpen)
+    crate::engine::runner::check_requirements(&git, &requirements::RECOVERY)
+        .map_err(|bundle| anyhow::anyhow!("Repository needs repair: {}", bundle))?;
 
     // Check for in-progress operation
     if let Some(op_state) = OpState::read(&paths)? {
@@ -72,9 +123,21 @@ pub fn undo(ctx: &Context) -> Result<()> {
         println!("Undoing: {} ({})", journal.command, journal.op_id);
     }
 
-    // Check if operation is undoable (local refs only)
-    // For now, we assume all operations are undoable
-    // A full implementation would check journal.has_remote_operations()
+    // Warn about remote operations that cannot be undone (Phase 7)
+    if journal.has_remote_operations() {
+        let remote_ops = journal.remote_operation_descriptions();
+        if !remote_ops.is_empty() {
+            eprintln!();
+            eprintln!("Warning: This operation included remote changes that cannot be undone:");
+            for desc in &remote_ops {
+                eprintln!("  - {}", desc);
+            }
+            eprintln!();
+            eprintln!("Local refs will be restored, but remote branches remain as-is.");
+            eprintln!("You may need to force-push or manually revert changes on the remote.");
+            eprintln!();
+        }
+    }
 
     // Get rollback operations from journal
     let rollbacks = journal.ref_updates_for_rollback();
@@ -86,7 +149,14 @@ pub fn undo(ctx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    // Apply rollbacks
+    if ctx.debug {
+        eprintln!("[debug] undo: {} ref changes to restore", rollbacks.len());
+    }
+
+    // Track successful restorations for ledger event
+    let mut refs_restored: usize = 0;
+
+    // Apply rollbacks using Git interface (Phase 7 improvement)
     for step in &rollbacks {
         match step {
             StepKind::RefUpdate {
@@ -95,35 +165,32 @@ pub fn undo(ctx: &Context) -> Result<()> {
                 new_oid: _,
             } => {
                 if let Some(old) = old_oid {
-                    // Restore old value
-                    let status = std::process::Command::new("git")
-                        .args(["update-ref", refname, old])
-                        .current_dir(&cwd)
-                        .status()
-                        .with_context(|| format!("Failed to restore ref {}", refname))?;
+                    // Restore old value using Git interface
+                    let old_oid_obj = Oid::new(old).context("Invalid old OID in journal")?;
 
-                    if !status.success() {
-                        bail!("Failed to restore ref {}", refname);
-                    }
+                    // For undo, we use force update since the repo may have changed
+                    // and we want to restore to the known good state unconditionally.
+                    git.update_ref_force(
+                        refname,
+                        &old_oid_obj,
+                        &format!("undo: restore {}", refname),
+                    )
+                    .with_context(|| format!("Failed to restore ref {}", refname))?;
 
                     if ctx.debug {
                         eprintln!("[debug] Restored {} to {}", refname, old);
                     }
+                    refs_restored += 1;
                 } else {
                     // Delete ref (was created by the operation)
-                    let status = std::process::Command::new("git")
-                        .args(["update-ref", "-d", refname])
-                        .current_dir(&cwd)
-                        .status()
+                    // Use force delete since CAS may fail if ref changed
+                    git.delete_ref_force(refname)
                         .with_context(|| format!("Failed to delete ref {}", refname))?;
-
-                    if !status.success() {
-                        eprintln!("Warning: Failed to delete ref {}", refname);
-                    }
 
                     if ctx.debug {
                         eprintln!("[debug] Deleted {}", refname);
                     }
+                    refs_restored += 1;
                 }
             }
             StepKind::MetadataWrite {
@@ -131,28 +198,31 @@ pub fn undo(ctx: &Context) -> Result<()> {
                 old_ref_oid,
                 new_ref_oid: _,
             } => {
-                // For metadata, we need to restore the old ref or delete if it was created
-                let refname = format!("refs/lattice/metadata/{}", branch);
+                // For metadata, restore the old ref or delete if it was created
+                let refname = format!("refs/branch-metadata/{}", branch);
                 if let Some(old) = old_ref_oid {
-                    let status = std::process::Command::new("git")
-                        .args(["update-ref", &refname, old])
-                        .current_dir(&cwd)
-                        .status()
-                        .with_context(|| format!("Failed to restore metadata ref {}", refname))?;
+                    let old_oid_obj = Oid::new(old).context("Invalid old metadata OID")?;
 
-                    if !status.success() {
-                        eprintln!("Warning: Failed to restore metadata ref {}", refname);
+                    git.update_ref_force(
+                        &refname,
+                        &old_oid_obj,
+                        &format!("undo: restore metadata for {}", branch),
+                    )
+                    .with_context(|| format!("Failed to restore metadata ref {}", refname))?;
+
+                    if ctx.debug {
+                        eprintln!("[debug] Restored metadata for {}", branch);
                     }
+                    refs_restored += 1;
                 } else {
-                    let status = std::process::Command::new("git")
-                        .args(["update-ref", "-d", &refname])
-                        .current_dir(&cwd)
-                        .status()
+                    // Delete metadata ref (was created by the operation)
+                    git.delete_ref_force(&refname)
                         .with_context(|| format!("Failed to delete metadata ref {}", refname))?;
 
-                    if !status.success() {
-                        eprintln!("Warning: Failed to delete metadata ref {}", refname);
+                    if ctx.debug {
+                        eprintln!("[debug] Deleted metadata for {}", branch);
                     }
+                    refs_restored += 1;
                 }
             }
             StepKind::MetadataDelete {
@@ -160,16 +230,20 @@ pub fn undo(ctx: &Context) -> Result<()> {
                 old_ref_oid,
             } => {
                 // Restore the deleted metadata ref
-                let refname = format!("refs/lattice/metadata/{}", branch);
-                let status = std::process::Command::new("git")
-                    .args(["update-ref", &refname, old_ref_oid])
-                    .current_dir(&cwd)
-                    .status()
-                    .with_context(|| format!("Failed to restore metadata ref {}", refname))?;
+                let refname = format!("refs/branch-metadata/{}", branch);
+                let old_oid_obj = Oid::new(old_ref_oid).context("Invalid old metadata OID")?;
 
-                if !status.success() {
-                    eprintln!("Warning: Failed to restore metadata ref {}", refname);
+                git.update_ref_force(
+                    &refname,
+                    &old_oid_obj,
+                    &format!("undo: restore deleted metadata for {}", branch),
+                )
+                .with_context(|| format!("Failed to restore metadata ref {}", refname))?;
+
+                if ctx.debug {
+                    eprintln!("[debug] Restored deleted metadata for {}", branch);
                 }
+                refs_restored += 1;
             }
             _ => {
                 // Skip other step kinds (checkpoints, conflict paused, etc.)
@@ -177,8 +251,21 @@ pub fn undo(ctx: &Context) -> Result<()> {
         }
     }
 
+    // Record UndoApplied event in ledger (Phase 7)
+    let ledger = EventLedger::new(&git);
+    let event = Event::undo_applied(journal.op_id.as_str(), refs_restored);
+    if let Err(e) = ledger.append(event) {
+        if ctx.debug {
+            eprintln!(
+                "[debug] Warning: Could not record undo event in ledger: {}",
+                e
+            );
+        }
+        // Don't fail the undo just because ledger append failed
+    }
+
     if !ctx.quiet {
-        println!("Undo complete. {} ref(s) restored.", rollbacks.len());
+        println!("Undo complete. {} ref(s) restored.", refs_restored);
     }
 
     Ok(())
